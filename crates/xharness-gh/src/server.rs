@@ -32,6 +32,8 @@ pub struct GhHostState {
     pub gh: Option<GhToolConfig>,
     /// 每个任务的 workspace 根目录;session 工作目录为 workspace_root/{session_id}。
     pub workspace_root: PathBuf,
+    /// 设置后 POST /tasks 必须携带 `Authorization: Bearer <secret>`。
+    pub task_secret: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,8 +63,19 @@ pub fn session_id_for(repo: &str, issue: u64) -> String {
 
 async fn submit_task(
     State(state): State<GhHostState>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<TaskPayload>,
 ) -> impl IntoResponse {
+    if let Some(secret) = &state.task_secret {
+        let provided = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default();
+        if provided != secret {
+            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "鉴权失败"})));
+        }
+    }
     if let Some(gh) = &state.gh {
         if payload.repo != gh.repo {
             return (

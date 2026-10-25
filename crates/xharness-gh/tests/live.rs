@@ -67,6 +67,7 @@ async fn live_endpoint_completes_a_turn() {
         results: Default::default(),
         gh: None,
         workspace_root: dir.join("workspaces"),
+        task_secret: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

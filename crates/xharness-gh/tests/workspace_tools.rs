@@ -49,6 +49,7 @@ async fn bash_output_flows_into_gh_comment_without_approval() {
         results: Default::default(),
         gh: None,
         workspace_root: dir.join("workspaces"),
+        task_secret: None,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

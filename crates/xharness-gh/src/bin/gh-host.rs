@@ -36,6 +36,9 @@ async fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(131_072);
     let state_dir = std::env::var("XH_GH_STATE_DIR").unwrap_or_else(|_| "./gh-state".to_owned());
+    let task_secret = std::env::var("XH_TASK_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let bind = std::env::var("XH_GH_BIND").unwrap_or_else(|_| "127.0.0.1:3081".to_owned());
 
     let gh = match (std::env::var("XH_GH_TOKEN"), std::env::var("XH_GH_REPO")) {
@@ -120,6 +123,7 @@ async fn main() {
         results: Default::default(),
         gh,
         workspace_root: std::path::Path::new(&state_dir).join("workspaces"),
+        task_secret,
     });
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await

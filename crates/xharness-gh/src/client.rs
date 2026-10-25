@@ -25,6 +25,32 @@ pub struct Comment {
     pub body: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RepoComment {
+    pub id: u64,
+    pub body: String,
+    pub issue_url: String,
+    pub user: User,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct User {
+    pub login: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Issue {
+    pub number: u64,
+    pub title: String,
+    pub body: Option<String>,
+}
+
+impl RepoComment {
+    pub fn issue_number(&self) -> Option<u64> {
+        self.issue_url.rsplit('/').next()?.parse().ok()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpsertOutcome {
     Created { id: u64 },
@@ -59,6 +85,46 @@ impl GhClient {
             .request(method, format!("{}{path}", self.root))
             .bearer_auth(&self.token)
             .header("Accept", "application/vnd.github+json")
+    }
+
+    /// 仓库级最近评论(触发器轮询用):id、body、所属 issue 号、作者。
+    pub async fn list_repo_comments(&self, repo: &str) -> Result<Vec<RepoComment>, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/repos/{repo}/issues/comments?per_page=30&sort=created&direction=desc"),
+            )
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("list repo comments 失败: {status}"));
+        }
+        response
+            .json::<Vec<RepoComment>>()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// 单个 issue 的标题/正文(触发器组装任务用)。
+    pub async fn get_issue(&self, repo: &str, issue: u64) -> Result<Issue, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/repos/{repo}/issues/{issue}"),
+            )
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("get issue 失败: {status}"));
+        }
+        response
+            .json::<Issue>()
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn list_issue_comments(&self, repo: &str, issue: u64) -> Result<Vec<Comment>, String> {

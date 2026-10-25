@@ -116,15 +116,27 @@ async fn main() {
         }
     };
 
-    let bind_addr = bind.clone();
-    let app = router(GhHostState {
+    let poll_secs: u64 = std::env::var("XH_GH_POLL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    let app_state = GhHostState {
         runtime,
         route,
         results: Default::default(),
-        gh,
+        gh: gh.clone(),
         workspace_root: std::path::Path::new(&state_dir).join("workspaces"),
         task_secret,
-    });
+        seen_comments: Default::default(),
+    };
+    if gh.is_some() {
+        tokio::spawn(xharness_gh::server::run_poller(
+            app_state.clone(),
+            std::time::Duration::from_secs(poll_secs),
+        ));
+    }
+    let bind_addr = bind.clone();
+    let app = router(app_state);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .unwrap_or_else(|error| panic!("绑定 {bind_addr} 失败: {error}"));

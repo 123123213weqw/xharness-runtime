@@ -57,7 +57,10 @@ cargo test --workspace
 
 剩余:真实 provider 接线(OpenAiProviderConfig)、真实 gh client + marker 评论 upsert、`resume_session` 重启恢复路径、steering(`admit_steering`)、部署配置。
 
-## 已知 flake
+## 已知 flake 与环境差异
+
+- `xharness-web` 的 SSRF 拒绝测试(`shared_download_transport_denies_private_fake_and_cleartext_targets`)在本机有系统代理(127.0.0.1:7897)时,IPv4-mapped IPv6 目标会被代理转发导致断言失败;CI 干净环境通过。
+- `swarm_coordinator_review_rejects_forged_reference_and_ignores_unrelated_latest_turn`(host,30s 边界)对负载敏感:全套件并发下偶发超时,隔离复跑稳定通过。上游同步代码,不改动,以 CI 环境仲裁。
 
 `swarm_coordinator_review_rejects_forged_reference_and_ignores_unrelated_latest_turn`(host,30s 边界)对负载敏感:全套件并发下偶发超时,隔离复跑 1.2s 稳定通过。上游同步代码,不改动,以 CI 环境仲裁。
 

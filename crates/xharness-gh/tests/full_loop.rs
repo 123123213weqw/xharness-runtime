@@ -30,6 +30,7 @@ async fn task_post_runs_turn_and_records_tool_call() {
     let factory = Arc::new(GhToolFactory {
         gh: None,
         calls: Arc::clone(&calls),
+        ..Default::default()
     });
     let runtime = Arc::new(DurableLoopAgentRuntime::new(
         "mock",
@@ -46,6 +47,7 @@ async fn task_post_runs_turn_and_records_tool_call() {
         route: ModelRoute::new("mock", "scripted"),
         results: Default::default(),
         gh: None,
+        workspace_root: dir.join("workspaces"),
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

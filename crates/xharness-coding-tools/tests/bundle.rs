@@ -1,0 +1,739 @@
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+
+use async_trait::async_trait;
+use serde_json::Value;
+use xharness_coding_tools::{CodingToolBundle, STANDARD_TOOL_COUNT};
+use xharness_jobs::JobRegistry;
+use xharness_platform::{NativePlatform, PlatformConfig};
+use xharness_tools::{
+    ApprovalDecision, ApprovalProvider, ApprovalRequest, MiddlewareError, ToolExecutor, ToolRequest,
+};
+#[cfg(target_os = "linux")]
+use xharness_tools::{ToolBatchRequest, ToolFailureKind};
+use xharness_web::WebRuntime;
+
+struct TempWorkspace(PathBuf);
+
+static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
+
+impl TempWorkspace {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "xharness-coding-tools-{}-{}",
+            std::process::id(),
+            NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Self(fs::canonicalize(path).unwrap())
+    }
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct ApproveAll;
+
+#[async_trait]
+impl ApprovalProvider for ApproveAll {
+    async fn request_approval(
+        &self,
+        _request: ApprovalRequest,
+    ) -> Result<ApprovalDecision, MiddlewareError> {
+        Ok(ApprovalDecision::Approved)
+    }
+}
+
+async fn executor(workspace: &TempWorkspace) -> ToolExecutor {
+    let platform =
+        Arc::new(NativePlatform::new(PlatformConfig::new(&workspace.0).full_access()).unwrap());
+    let bundle = CodingToolBundle::new(
+        platform,
+        Arc::new(JobRegistry::default()),
+        Arc::new(WebRuntime::default()),
+        "session",
+        "owner",
+    );
+    let registry = bundle.registry().await.unwrap();
+    assert_eq!(registry.len().await, STANDARD_TOOL_COUNT);
+    assert!(registry.get("write").await.unwrap().requires_approval);
+    let names: Vec<String> = registry
+        .definitions()
+        .await
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    let shell = if cfg!(windows) { "pwsh" } else { "bash" };
+    let mut expected = vec![
+        shell.to_owned(),
+        "edit".to_owned(),
+        "glob".to_owned(),
+        "grep".to_owned(),
+        "job_kill".to_owned(),
+        "job_list".to_owned(),
+        "job_output".to_owned(),
+        "read".to_owned(),
+        "web_fetch".to_owned(),
+        "web_search".to_owned(),
+        "write".to_owned(),
+    ];
+    expected.sort();
+    assert_eq!(names, expected);
+    ToolExecutor::new(registry).with_approval_provider(Arc::new(ApproveAll))
+}
+
+#[tokio::test]
+async fn copied_history_arguments_cannot_create_overwrite_or_edit_files() {
+    let workspace = TempWorkspace::new();
+    fs::write(workspace.0.join("existing.txt"), "original contents").unwrap();
+    let approvals = Arc::new(AtomicU64::new(0));
+    struct CountApprovals(Arc<AtomicU64>);
+    #[async_trait]
+    impl ApprovalProvider for CountApprovals {
+        async fn request_approval(
+            &self,
+            _request: ApprovalRequest,
+        ) -> Result<ApprovalDecision, MiddlewareError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(ApprovalDecision::Approved)
+        }
+    }
+    let executor = executor(&workspace)
+        .await
+        .with_approval_provider(Arc::new(CountApprovals(Arc::clone(&approvals))));
+    let read = executor
+        .execute(ToolRequest::new("read", r#"{"path":"existing.txt"}"#))
+        .await;
+    assert!(read.is_ok(), "{read:?}");
+    let marker = format!("[xharness history projection: successful write.content omitted; chars=2048; utf8_bytes=2048; sha256={}; re-read the file if content is needed]", "b".repeat(64));
+    let metadata = serde_json::json!({"format":"tool_arguments_pruned/v1","successful":true});
+    for path in ["new.txt", "existing.txt"] {
+        for (tool, args) in [
+            (
+                "write",
+                serde_json::json!({"path":path,"content":marker,"_xharness_history_projection":metadata}),
+            ),
+            ("write", serde_json::json!({"path":path,"content":marker})),
+            (
+                "write",
+                serde_json::json!({"path":path,"content":"real","_xharness_history_projection":metadata}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path":path,"old":"original contents","new":marker}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path":path,"old":marker,"new":"replacement"}),
+            ),
+        ] {
+            let result = executor
+                .execute(ToolRequest::new(tool, args.to_string()))
+                .await;
+            let failure = result
+                .failure
+                .expect("copied projection must fail before mutation");
+            assert_eq!(
+                failure.kind,
+                xharness_tools::ToolFailureKind::InvalidArguments
+            );
+            assert!(failure.message.contains("Use read"), "{}", failure.message);
+            assert!(
+                !failure.retryable,
+                "never automatically retry a projected mutation"
+            );
+            assert!(!workspace.0.join("new.txt").exists());
+            assert_eq!(
+                fs::read_to_string(workspace.0.join("existing.txt")).unwrap(),
+                "original contents"
+            );
+        }
+    }
+    assert_eq!(
+        approvals.load(Ordering::Relaxed),
+        0,
+        "invalid calls must not request approval"
+    );
+    let unrelated = executor
+        .execute(ToolRequest::new(
+            "write",
+            r#"{"path":"new.txt","content":"real","extra":true}"#,
+        ))
+        .await;
+    assert!(unrelated
+        .failure
+        .unwrap()
+        .message
+        .contains("additional property is not allowed"));
+
+    // A fresh real call can recover, and documenting the old marker is allowed.
+    let document = format!("Example of an obsolete marker (do not execute):\n{marker}\n");
+    let write = executor
+        .execute(ToolRequest::new(
+            "write",
+            serde_json::json!({"path":"new.txt","content":document}).to_string(),
+        ))
+        .await;
+    assert!(write.is_ok(), "{write:?}");
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("new.txt")).unwrap(),
+        document
+    );
+    let edit = executor
+        .execute(ToolRequest::new(
+            "edit",
+            r#"{"path":"existing.txt","old":"original contents","new":"real updated contents"}"#,
+        ))
+        .await;
+    assert!(edit.is_ok(), "{edit:?}");
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("existing.txt")).unwrap(),
+        "real updated contents"
+    );
+    assert_eq!(approvals.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn standard_tools_register_and_basic_file_shell_flow_runs() {
+    let workspace = TempWorkspace::new();
+    let executor = executor(&workspace).await;
+
+    let write = executor
+        .execute(ToolRequest::new(
+            "write",
+            r#"{"path":"sample.txt","content":"alpha beta\n"}"#,
+        ))
+        .await;
+    assert!(write.is_ok(), "{write:?}");
+
+    let read = executor
+        .execute(ToolRequest::new("read", r#"{"path":"sample.txt"}"#))
+        .await;
+    assert!(read.is_ok(), "{read:?}");
+    assert!(read.output.unwrap().content.contains("alpha beta"));
+
+    fs::write(workspace.0.join("pages.txt"), "one\ntwo\nthree\n").unwrap();
+    let first_page = executor
+        .execute(ToolRequest::new(
+            "read",
+            r#"{"path":"pages.txt","line_limit":1}"#,
+        ))
+        .await;
+    assert!(first_page.is_ok(), "{first_page:?}");
+    let first_page: Value = serde_json::from_str(&first_page.output.unwrap().content).unwrap();
+    assert_eq!(first_page["content"], "one\n");
+    let cursor = first_page["next_cursor"].as_str().unwrap();
+    let second_page = executor
+        .execute(ToolRequest::new(
+            "read",
+            serde_json::json!({"path":"pages.txt", "cursor":cursor}).to_string(),
+        ))
+        .await;
+    assert!(second_page.is_ok(), "{second_page:?}");
+    let second_page: Value = serde_json::from_str(&second_page.output.unwrap().content).unwrap();
+    assert_eq!(second_page["content"], "two\n");
+    let mut forged = cursor.split(':').collect::<Vec<_>>();
+    forged[2] = "999999999";
+    let forged_page = executor
+        .execute(ToolRequest::new(
+            "read",
+            serde_json::json!({"path":"pages.txt", "cursor":forged.join(":")}).to_string(),
+        ))
+        .await;
+    assert!(!forged_page.is_ok());
+
+    let edit = executor
+        .execute(ToolRequest::new(
+            "edit",
+            r#"{"path":"sample.txt","old":"beta","new":"BETA"}"#,
+        ))
+        .await;
+    assert!(edit.is_ok(), "{edit:?}");
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("sample.txt")).unwrap(),
+        "alpha BETA\n"
+    );
+
+    let (shell, command) = if cfg!(windows) {
+        ("pwsh", "[Console]::Out.Write('shell-ok')")
+    } else {
+        ("bash", "printf shell-ok")
+    };
+    let shell = executor
+        .execute(ToolRequest::new(
+            shell,
+            serde_json::json!({"command": command}).to_string(),
+        ))
+        .await;
+    assert!(shell.is_ok(), "{shell:?}");
+    assert!(shell.output.unwrap().content.contains("shell-ok"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_propagates_pipeline_failures_and_allows_explicit_recovery() {
+    let workspace = TempWorkspace::new();
+    let executor = executor(&workspace).await;
+
+    let failed = executor
+        .execute(ToolRequest::new(
+            "bash",
+            r#"{"command":"(echo 'fatal: push failed' >&2; false) 2>&1 | tail -n 4"}"#,
+        ))
+        .await;
+    assert!(!failed.is_ok(), "nonzero exit must fail: {failed:?}");
+    assert_eq!(
+        failed.failure_kind(),
+        Some(xharness_tools::ToolFailureKind::CommandFailed)
+    );
+    let failed: Value = serde_json::from_str(&failed.output.unwrap().content).unwrap();
+    assert_eq!(failed["success"], false);
+    assert_eq!(failed["exit_code"], 1);
+    assert_eq!(failed["stdout"], "fatal: push failed\n");
+
+    let recovered = executor
+        .execute(ToolRequest::new(
+            "bash",
+            r#"{"command":"false | true || true"}"#,
+        ))
+        .await;
+    assert!(
+        recovered.is_ok(),
+        "the bash handler itself should settle: {recovered:?}"
+    );
+    let recovered: Value = serde_json::from_str(&recovered.output.unwrap().content).unwrap();
+    assert_eq!(recovered["success"], true);
+    assert_eq!(recovered["exit_code"], 0);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pwsh_propagates_errors_and_allows_explicit_recovery() {
+    let workspace = TempWorkspace::new();
+    let executor = executor(&workspace).await;
+
+    let failed = executor
+        .execute(ToolRequest::new(
+            "pwsh",
+            r#"{"command":"throw 'fatal: PowerShell failure'"}"#,
+        ))
+        .await;
+    assert!(!failed.is_ok(), "nonzero exit must fail: {failed:?}");
+    assert_eq!(
+        failed.failure_kind(),
+        Some(xharness_tools::ToolFailureKind::CommandFailed)
+    );
+    let failed: Value = serde_json::from_str(&failed.output.unwrap().content).unwrap();
+    assert_eq!(failed["success"], false);
+    assert_ne!(failed["exit_code"], 0);
+    assert!(failed["stderr"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("fatal: PowerShell failure"));
+
+    let recovered = executor
+        .execute(ToolRequest::new(
+            "pwsh",
+            r#"{"command":"try { throw 'bad' } catch { Write-Output 'recovered' }"}"#,
+        ))
+        .await;
+    assert!(
+        recovered.is_ok(),
+        "the pwsh handler must settle: {recovered:?}"
+    );
+    let recovered: Value = serde_json::from_str(&recovered.output.unwrap().content).unwrap();
+    assert_eq!(recovered["success"], true);
+    assert_eq!(recovered["exit_code"], 0);
+    assert_eq!(recovered["stdout"], "recovered\r\n");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pwsh_can_invoke_an_installed_git_bash_for_explicit_unix_commands() {
+    let git_bash = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+        .join("Git")
+        .join("bin")
+        .join("bash.exe");
+    if !git_bash.is_file() {
+        return;
+    }
+
+    let workspace = TempWorkspace::new();
+    let executor = executor(&workspace).await;
+    let escaped = git_bash.to_string_lossy().replace('\'', "''");
+    let command = format!("& '{escaped}' -lc 'printf git-bash-ok'");
+    let result = executor
+        .execute(ToolRequest::new(
+            "pwsh",
+            serde_json::json!({"command": command}).to_string(),
+        ))
+        .await;
+    assert!(result.is_ok(), "the pwsh handler must settle: {result:?}");
+    let result: Value = serde_json::from_str(&result.output.unwrap().content).unwrap();
+    assert_eq!(result["success"], true);
+    assert_eq!(result["stdout"], "git-bash-ok");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn background_bash_streams_to_job_output_and_preserves_nonzero_exit_status() {
+    let workspace = TempWorkspace::new();
+    let executor = executor(&workspace).await;
+
+    let started = executor
+        .execute(ToolRequest::new(
+            "bash",
+            r#"{"command":"printf first; sleep 0.05; printf last; printf warn >&2; exit 7","run_in_background":true}"#,
+        ))
+        .await;
+    assert!(started.is_ok(), "{started:?}");
+    let started: Value = serde_json::from_str(&started.output.unwrap().content).unwrap();
+    assert_eq!(started["kind"], "background");
+    let job_id = started["job_id"].as_str().unwrap();
+
+    let collected = executor
+        .execute(ToolRequest::new(
+            "job_output",
+            serde_json::json!({"job_id": job_id, "wait": true, "timeout_ms": 2_000}).to_string(),
+        ))
+        .await;
+    assert!(collected.is_ok(), "{collected:?}");
+    let collected: Value = serde_json::from_str(&collected.output.unwrap().content).unwrap();
+    assert_eq!(collected["stdout"], "firstlast");
+    assert_eq!(collected["stderr"], "warn");
+    assert_eq!(collected["snapshot"]["status"], "failed");
+    assert_eq!(collected["snapshot"]["detail"], "exit code: 7");
+    assert!(collected["snapshot"].get("owner").is_none());
+    assert!(collected["snapshot"].get("reported").is_none());
+    assert!(collected["snapshot"].get("output_limit_bytes").is_none());
+    assert!(collected["snapshot"].get("pid").is_none());
+
+    let replayed = executor
+        .execute(ToolRequest::new(
+            "job_output",
+            serde_json::json!({"job_id": job_id}).to_string(),
+        ))
+        .await;
+    assert!(replayed.is_ok(), "{replayed:?}");
+    let replayed: Value = serde_json::from_str(&replayed.output.unwrap().content).unwrap();
+    assert_eq!(replayed["stdout"], "firstlast");
+    assert_eq!(replayed["stderr"], "warn");
+
+    let consumed = executor
+        .execute(ToolRequest::new(
+            "job_output",
+            serde_json::json!({"job_id": job_id, "cursor": collected["next_cursor"]}).to_string(),
+        ))
+        .await;
+    assert!(consumed.is_ok(), "{consumed:?}");
+    let consumed: Value = serde_json::from_str(&consumed.output.unwrap().content).unwrap();
+    assert_eq!(consumed["stdout"], "");
+    assert_eq!(consumed["stderr"], "");
+
+    let listed = executor.execute(ToolRequest::new("job_list", "{}")).await;
+    assert!(listed.is_ok(), "{listed:?}");
+    let listed: Value = serde_json::from_str(&listed.output.unwrap().content).unwrap();
+    assert_eq!(listed["jobs"][0]["id"], job_id);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn background_pwsh_streams_output_and_preserves_nonzero_exit_status() {
+    let workspace = TempWorkspace::new();
+    let executor = executor(&workspace).await;
+
+    let started = executor
+        .execute(ToolRequest::new(
+            "pwsh",
+            serde_json::json!({
+                "command": "[Console]::Out.Write('first'); Start-Sleep -Milliseconds 50; [Console]::Out.Write('last'); [Console]::Error.Write('warn'); exit 7",
+                "run_in_background": true
+            })
+            .to_string(),
+        ))
+        .await;
+    assert!(started.is_ok(), "{started:?}");
+    let started: Value = serde_json::from_str(&started.output.unwrap().content).unwrap();
+    let job_id = started["job_id"].as_str().unwrap();
+
+    // A successful wait may time out with a still-running snapshot. Await the
+    // terminal state instead of assuming that PowerShell plus process cleanup
+    // always completes within one five-second window on a loaded CI runner.
+    let collected = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let result = executor
+                .execute(ToolRequest::new(
+                    "job_output",
+                    serde_json::json!({"job_id": job_id, "wait": true, "timeout_ms": 1_000})
+                        .to_string(),
+                ))
+                .await;
+            assert!(result.is_ok(), "{result:?}");
+            let snapshot: Value = serde_json::from_str(&result.output.unwrap().content).unwrap();
+            if !matches!(
+                snapshot["snapshot"]["status"].as_str(),
+                Some("running" | "stopping")
+            ) {
+                break snapshot;
+            }
+        }
+    })
+    .await
+    .expect("background PowerShell job did not settle within 30 seconds");
+    assert_eq!(collected["stdout"], "firstlast");
+    assert_eq!(collected["stderr"], "warn");
+    assert_eq!(collected["snapshot"]["status"], "failed");
+    assert_eq!(collected["snapshot"]["detail"], "exit code: 7");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn background_bash_kill_settles_and_invalid_option_combinations_fail_before_spawn() {
+    let workspace = TempWorkspace::new();
+    let executor = executor(&workspace).await;
+
+    let invalid = executor
+        .execute(ToolRequest::new(
+            "bash",
+            r#"{"command":"sleep 30","run_in_background":true,"timeout_ms":100}"#,
+        ))
+        .await;
+    assert!(!invalid.is_ok());
+    let listed = executor.execute(ToolRequest::new("job_list", "{}")).await;
+    let listed: Value = serde_json::from_str(&listed.output.unwrap().content).unwrap();
+    assert_eq!(listed["jobs"].as_array().unwrap().len(), 0);
+
+    let started = executor
+        .execute(ToolRequest::new(
+            "bash",
+            r#"{"command":"trap '' TERM; sleep 30","run_in_background":true}"#,
+        ))
+        .await;
+    assert!(started.is_ok(), "{started:?}");
+    let started: Value = serde_json::from_str(&started.output.unwrap().content).unwrap();
+    let job_id = started["job_id"].as_str().unwrap();
+
+    let killed = executor
+        .execute(ToolRequest::new(
+            "job_kill",
+            serde_json::json!({"job_id": job_id, "reason": "test complete"}).to_string(),
+        ))
+        .await;
+    assert!(killed.is_ok(), "{killed:?}");
+    let killed: Value = serde_json::from_str(&killed.output.unwrap().content).unwrap();
+    assert_eq!(killed["result"], "requested");
+    assert_eq!(killed["job"]["status"], "stopping");
+
+    let final_read = executor
+        .execute(ToolRequest::new(
+            "job_output",
+            serde_json::json!({"job_id": job_id, "wait": true, "timeout_ms": 5_000}).to_string(),
+        ))
+        .await;
+    assert!(final_read.is_ok(), "{final_read:?}");
+    let final_read: Value = serde_json::from_str(&final_read.output.unwrap().content).unwrap();
+    assert_eq!(final_read["snapshot"]["status"], "killed");
+
+    let killed_again = executor
+        .execute(ToolRequest::new(
+            "job_kill",
+            serde_json::json!({"job_id": job_id}).to_string(),
+        ))
+        .await;
+    assert!(killed_again.is_ok(), "{killed_again:?}");
+    let killed_again: Value = serde_json::from_str(&killed_again.output.unwrap().content).unwrap();
+    assert_eq!(killed_again["result"], "already_finished");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn background_pwsh_kill_settles_without_surviving_processes() {
+    let workspace = TempWorkspace::new();
+    let executor = executor(&workspace).await;
+    let started = executor
+        .execute(ToolRequest::new(
+            "pwsh",
+            r#"{"command":"Start-Sleep -Seconds 30","run_in_background":true}"#,
+        ))
+        .await;
+    assert!(started.is_ok(), "{started:?}");
+    let started: Value = serde_json::from_str(&started.output.unwrap().content).unwrap();
+    let job_id = started["job_id"].as_str().unwrap();
+    let killed = executor
+        .execute(ToolRequest::new(
+            "job_kill",
+            serde_json::json!({"job_id": job_id, "reason": "test complete"}).to_string(),
+        ))
+        .await;
+    assert!(killed.is_ok(), "{killed:?}");
+    let final_read = executor
+        .execute(ToolRequest::new(
+            "job_output",
+            serde_json::json!({"job_id": job_id, "wait": true, "timeout_ms": 5_000}).to_string(),
+        ))
+        .await;
+    assert!(final_read.is_ok(), "{final_read:?}");
+    let final_read: Value = serde_json::from_str(&final_read.output.unwrap().content).unwrap();
+    assert_eq!(final_read["snapshot"]["status"], "killed");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cancelled_bash_result_is_published_only_after_the_process_tree_is_dead() {
+    let workspace = TempWorkspace::new();
+    let executor = executor(&workspace).await;
+    let pid_file = workspace.0.join("cancelled-bash.pids");
+    let command = format!(
+        "trap '' TERM; /bin/sleep 30 & child=$!; printf '%s %s' \"$$\" \"$child\" > {}; wait \"$child\"",
+        pid_file.display()
+    );
+    let request = ToolRequest::new("bash", serde_json::json!({"command": command}).to_string())
+        .with_execution_id("cancelled-bash")
+        .unwrap();
+    let mut batch = executor
+        .start_batch(vec![ToolBatchRequest::new(0, request)], 1)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let pids = loop {
+        if let Ok(contents) = fs::read_to_string(&pid_file) {
+            let pids = contents
+                .split_whitespace()
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            if pids.len() == 2 {
+                break pids;
+            }
+        }
+        assert!(Instant::now() < deadline, "bash did not publish its pids");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(pids
+        .iter()
+        .all(|pid| linux_process_state(*pid).is_some_and(|state| state != 'Z')));
+
+    batch.cancel();
+    while batch.next_event().await.is_some() {}
+    let results = batch.result().await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].result.failure_kind(),
+        Some(ToolFailureKind::Cancelled)
+    );
+    let states = pids
+        .iter()
+        .map(|pid| linux_process_state(*pid))
+        .collect::<Vec<_>>();
+    assert_eq!(states[0], None, "the owned root must already be reaped");
+    assert!(
+        states.iter().all(|state| matches!(state, None | Some('Z'))),
+        "tool batch settled while a managed process was running: {pids:?}; states={states:?}"
+    );
+    // An orphaned grandchild can be dead before PID 1 reaps its zombie. Do
+    // not confuse that kernel bookkeeping with a live process. Still require
+    // every PID to disappear, separately from the immediate liveness check.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while pids.iter().any(|pid| linux_process_state(*pid).is_some()) {
+        assert!(
+            Instant::now() < deadline,
+            "dead process was not reaped: {pids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state(pid: u32) -> Option<char> {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => Some(
+            stat.rsplit_once(") ")
+                .expect("process stat has a command name")
+                .1
+                .chars()
+                .next()
+                .expect("process stat has a state"),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("cannot inspect managed pid {pid}: {error}"),
+    }
+}
+
+#[tokio::test]
+async fn search_tools_distinguish_no_matches_and_real_errors() {
+    let workspace = TempWorkspace::new();
+    fs::write(workspace.0.join("sample.txt"), "needle\n").unwrap();
+    let e = executor(&workspace).await;
+    for (name, args, ok) in [
+        ("glob", r#"{"pattern":"*.txt"}"#, true),
+        ("glob", r#"{"pattern":"*.absent"}"#, true),
+        ("grep", r#"{"pattern":"needle"}"#, true),
+        ("grep", r#"{"pattern":"unmatchable-123456"}"#, true),
+        ("grep", r#"{"pattern":"["}"#, false),
+        (
+            "grep",
+            r#"{"pattern":"needle","path":"missing-directory-123456"}"#,
+            false,
+        ),
+    ] {
+        let result = e.execute(ToolRequest::new(name, args)).await;
+        assert_eq!(result.is_ok(), ok, "{name} {args}: {result:?}");
+        if !ok {
+            assert!(result.failure.unwrap().message.contains("stderr"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn log_filter_no_match_does_not_replace_the_producer_exit_status() {
+    let workspace = TempWorkspace::new();
+    let executor = executor(&workspace).await;
+    let no_match = executor
+        .execute(ToolRequest::new(
+            "bash",
+            serde_json::json!({"command":"printf 'Build complete\\n' | grep '^error'"}).to_string(),
+        ))
+        .await;
+    assert_eq!(
+        no_match.failure_kind(),
+        Some(xharness_tools::ToolFailureKind::CommandFailed)
+    );
+    let value: Value = serde_json::from_str(&no_match.output.unwrap().content).unwrap();
+    assert_eq!(
+        value["exit_code"], 1,
+        "no-match must not be silently reclassified"
+    );
+
+    for code in [0, 7] {
+        // Synthetic producers, not Rust compilation. Capturing the status before
+        // displaying a log preserves success and failure without blanket recovery.
+        let command = format!(
+            "(printf 'Build fixture\\n'; exit {code}) > build.log 2>&1; producer_status=$?; sed -n '1,8p' build.log; exit \"$producer_status\""
+        );
+        let result = executor
+            .execute(ToolRequest::new(
+                "bash",
+                serde_json::json!({"command":command}).to_string(),
+            ))
+            .await;
+        assert_eq!(result.is_ok(), code == 0);
+        let value: Value = serde_json::from_str(&result.output.unwrap().content).unwrap();
+        assert_eq!(value["exit_code"], code);
+        assert!(value["stdout"].as_str().unwrap().contains("Build fixture"));
+    }
+}

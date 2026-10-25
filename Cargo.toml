@@ -3,6 +3,7 @@ members = [
     "crates/xharness-agent",
     "crates/xharness-api",
     "crates/xharness-attachments",
+    "crates/xharness-coding-tools",
     "crates/xharness-compaction",
     "crates/xharness-context",
     "crates/xharness-control",
@@ -10,6 +11,7 @@ members = [
     "crates/xharness-debug",
     "crates/xharness-diagnostics",
     "crates/xharness-fs",
+    "crates/xharness-gh",
     "crates/xharness-goal",
     "crates/xharness-host",
     "crates/xharness-interaction",
@@ -26,8 +28,9 @@ members = [
     "crates/xharness-session-jsonl",
     "crates/xharness-token",
     "crates/xharness-tools",
+    "crates/xharness-web",
     "crates/xharness-win32",
-    "crates/xharness-gh",
+
 
 
 ]

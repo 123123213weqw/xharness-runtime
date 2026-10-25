@@ -20,6 +20,10 @@ xharness-tools = { path = "../xharness-tools" }
 xharness-context = { path = "../xharness-context" }
 xharness-provider-openai = { path = "../xharness-provider-openai" }
 xharness-token = { path = "../xharness-token" }
+xharness-coding-tools = { path = "../xharness-coding-tools" }
+xharness-jobs = { path = "../xharness-jobs" }
+xharness-platform = { path = "../xharness-platform" }
+xharness-web = { path = "../xharness-web", default-features = false }
 async-trait.workspace = true
 async-stream.workspace = true
 axum.workspace = true

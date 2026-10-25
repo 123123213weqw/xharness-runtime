@@ -3,6 +3,7 @@
 //! 结果 upsert 到该会话的评论槽并打 xh:done。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -29,6 +30,8 @@ pub struct GhHostState {
     pub route: ModelRoute,
     pub results: Arc<Mutex<HashMap<String, TaskOutcome>>>,
     pub gh: Option<GhToolConfig>,
+    /// 每个任务的 workspace 根目录;session 工作目录为 workspace_root/{session_id}。
+    pub workspace_root: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -72,18 +75,21 @@ async fn submit_task(
         }
     }
     let session_id = session_id_for(&payload.repo, payload.issue);
+    let workspace = state.workspace_root.join(&session_id);
+    std::fs::create_dir_all(&workspace).expect("创建 workspace 目录");
     let request = AgentTurnRequest {
         session_id: session_id.clone(),
-        cwd: std::env::temp_dir().to_string_lossy().to_string(),
+        cwd: workspace.to_string_lossy().to_string(),
         route: state.route.clone(),
-        permission: PermissionPreset::WorkspaceWrite,
+        permission: PermissionPreset::DangerFullAccess,
         prompt: None,
         messages: vec![Message {
             id: Some(format!("gh-{}/{}/v1", payload.repo, payload.issue)),
             role: MessageRole::User,
             content: format!(
-                "仓库 {} issue #{}: {}\n\n{}",
-                payload.repo, payload.issue, payload.title, payload.body
+                "仓库 {} issue #{}: {}\n\n{}\n\n你的工作目录(已存在,可用 bash/read/write 等工具直接操作,无审批):{}",
+                payload.repo, payload.issue, payload.title, payload.body,
+                workspace.to_string_lossy()
             ),
             ..Default::default()
         }],
@@ -113,7 +119,11 @@ async fn submit_task(
     let gh = state.gh.clone();
     let issue = payload.issue;
     tokio::spawn(async move {
-        while turn.next_event().await.is_some() {}
+        while let Some(event) = turn.next_event().await {
+            if std::env::var_os("XH_GH_TRACE").is_some() {
+                eprintln!("[xh-gh][event] {:?}", event.kind);
+            }
+        }
         let result = turn.result().await;
         let status = match result.status {
             LoopStatus::Completed => "done",

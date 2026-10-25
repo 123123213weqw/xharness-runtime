@@ -19,7 +19,7 @@ use xharness_context::ToolResultPruningContextPolicy;
 use xharness_gh::client::GhClient;
 use xharness_gh::deployment::{build_registry, SingleModelDeployment};
 use xharness_gh::factory::{GhToolConfig, GhToolFactory};
-use xharness_gh::provider_mock::ScriptedProvider;
+use xharness_gh::provider_mock::WorkspaceScriptedProvider;
 use xharness_gh::server::{router, GhHostState};
 use xharness_host::{DurableLoopAgentRuntime, ModelRoute};
 use xharness_provider_openai::OpenAiProtocol;
@@ -94,12 +94,12 @@ async fn main() {
             (Arc::new(runtime), route)
         }
         _ => {
-            eprintln!("[xh-gh] 未设置 XH_GH_API_KEY,模型降级为 mock(ScriptedProvider)");
+            eprintln!("[xh-gh] 未设置 XH_GH_API_KEY,模型降级为 mock(WorkspaceScriptedProvider)");
             let route = ModelRoute::new("mock", "scripted");
             let runtime = DurableLoopAgentRuntime::new(
                 "mock",
                 "scripted",
-                Some(Arc::new(ScriptedProvider)),
+                Some(Arc::new(WorkspaceScriptedProvider)),
                 Arc::new(GhToolFactory {
                     gh: gh.clone(),
                     ..Default::default()
@@ -119,6 +119,7 @@ async fn main() {
         route,
         results: Default::default(),
         gh,
+        workspace_root: std::path::Path::new(&state_dir).join("workspaces"),
     });
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await

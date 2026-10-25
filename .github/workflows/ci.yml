@@ -4,9 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  rust:
     strategy:
       fail-fast: false
       matrix:
@@ -14,9 +22,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo test --workspace --locked
+      - run: cargo fmt --check --all
+      - run: cargo check --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace --all-targets
+      # 进程组回收测试依赖真实子进程生命周期,必须单线程跑(沿袭上游纪律)
+      - run: cargo test --locked -p xharness-process --test process dropping_ -- --test-threads=1

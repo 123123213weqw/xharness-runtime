@@ -1,0 +1,37 @@
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "0 21 * * *" # 每日 UTC 21:00(北京时间 05:00)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - id: sync
+        env:
+          UPSTREAM_REPO: 123123213weqw/x-harness-rs
+        run: bash scripts/sync-upstream.sh
+      - if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.sha }}
+          UPSTREAM_REPO: 123123213weqw/x-harness-rs
+        run: |
+          BR="sync/upstream-${UPSTREAM_SHA::7}"
+          git config user.name "sync-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BR"
+          git add -A
+          git commit -m "chore: 同步上游 x-harness-rs@${UPSTREAM_SHA}"
+          git push -f origin "$BR"
+          gh pr create --title "chore: 同步上游 x-harness-rs@${UPSTREAM_SHA::7}" \
+            --body "自动同步自 https://github.com/${UPSTREAM_REPO} 。基线 ${UPSTREAM_SHA} 。闭包重新抽取、cargo check 通过;等 CI(cargo fmt/test)绿后人工合并。" || true

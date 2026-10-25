@@ -2280,8 +2280,10 @@ dependencies = [
  "xharness-context",
  "xharness-core",
  "xharness-host",
+ "xharness-provider-openai",
  "xharness-session",
  "xharness-session-jsonl",
+ "xharness-token",
  "xharness-tools",
 ]
 

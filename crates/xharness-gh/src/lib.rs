@@ -7,6 +7,7 @@
 //! 实验范围:验证 runtime admission/tool 执行/多步 loop 全链路,不含真实
 //! gh HTTP 与部署配置。
 
+pub mod deployment;
 pub mod factory;
 pub mod provider_mock;
 pub mod server;

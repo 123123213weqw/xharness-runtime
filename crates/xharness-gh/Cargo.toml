@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "GitHub-triggered headless agent jobs over xharness-host"
 
+[[bin]]
+name = "gh-host"
+path = "src/bin/gh-host.rs"
+
 [dependencies]
 xharness-host = { path = "../xharness-host" }
 xharness-core = { path = "../xharness-core" }
@@ -14,6 +18,8 @@ xharness-session = { path = "../xharness-session" }
 xharness-session-jsonl = { path = "../xharness-session-jsonl" }
 xharness-tools = { path = "../xharness-tools" }
 xharness-context = { path = "../xharness-context" }
+xharness-provider-openai = { path = "../xharness-provider-openai" }
+xharness-token = { path = "../xharness-token" }
 async-trait.workspace = true
 async-stream.workspace = true
 axum.workspace = true

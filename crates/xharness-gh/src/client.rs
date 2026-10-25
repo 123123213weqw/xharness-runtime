@@ -43,6 +43,25 @@ pub struct Issue {
     pub number: u64,
     pub title: String,
     pub body: Option<String>,
+    /// 存在即表示该 issue 是 Pull Request。
+    #[serde(default)]
+    pub pull_request: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PullRef {
+    pub sha: String,
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Pull {
+    pub number: u64,
+    pub title: String,
+    pub body: Option<String>,
+    pub head: PullRef,
+    pub base: PullRef,
 }
 
 impl RepoComment {
@@ -123,6 +142,26 @@ impl GhClient {
         }
         response
             .json::<Issue>()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Pull Request 详情(head/base SHA);issue 号对非 PR 返回 404。
+    pub async fn get_pull(&self, repo: &str, number: u64) -> Result<Pull, String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/repos/{repo}/pulls/{number}"),
+            )
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("get pull 失败: {status}"));
+        }
+        response
+            .json::<Pull>()
             .await
             .map_err(|error| error.to_string())
     }

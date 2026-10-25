@@ -10,5 +10,6 @@
 pub mod client;
 pub mod deployment;
 pub mod factory;
+pub mod gitprep;
 pub mod provider_mock;
 pub mod server;

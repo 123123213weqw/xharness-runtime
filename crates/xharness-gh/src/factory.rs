@@ -24,6 +24,8 @@ use crate::client::{session_marker, GhClient, UpsertOutcome};
 pub struct GhToolConfig {
     pub client: Arc<GhClient>,
     pub repo: String,
+    /// clone 用的 origin(URL 或本地路径);None 时用 https://github.com/{repo}.git。
+    pub origin: Option<String>,
 }
 
 pub struct GhToolFactory {

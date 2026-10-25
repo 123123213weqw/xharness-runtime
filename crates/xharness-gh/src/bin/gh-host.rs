@@ -46,6 +46,7 @@ async fn main() {
             Some(GhToolConfig {
                 client: Arc::new(GhClient::new(token)),
                 repo: repo.trim().to_owned(),
+                origin: std::env::var("XH_GH_ORIGIN").ok(),
             })
         }
         _ => {
@@ -120,6 +121,16 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(20);
+    let mut route = route;
+    if let Ok(effort) = std::env::var("XH_GH_REASONING") {
+        if !effort.trim().is_empty() {
+            route.reasoning_effort = Some(effort.trim().to_owned());
+            eprintln!(
+                "[xh-gh] 思考强度: {}(评审质量与推理深度相关;端点需支持该参数)",
+                effort.trim()
+            );
+        }
+    }
     let app_state = GhHostState {
         runtime,
         route,
@@ -129,6 +140,8 @@ async fn main() {
         task_secret,
         seen_comments: Default::default(),
     };
+    // 崩溃恢复:重放 task.json,durable inbox 去重,只续跑未完成的输入。
+    xharness_gh::server::recover_pending(&app_state).await;
     if gh.is_some() {
         tokio::spawn(xharness_gh::server::run_poller(
             app_state.clone(),

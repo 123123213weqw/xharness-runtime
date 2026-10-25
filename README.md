@@ -40,6 +40,15 @@ Apache-2.0。状态:**拆分验证中,尚未发布。**
 
 例外:上游若修复闭包内 crate 的安全类问题(session/沙箱/鉴权),值得手动同步一次;常规功能迭代不追。
 
+## Review 模式(PR)
+
+`/xh` 评论落在 PR 上时自动进入 review 模式:host clone 仓库、checkout PR head、生成 diff.patch 与 diff.stat 注入任务;评审输出按 **P0 必须修复 / P1 建议修复 / P2 可选** 分级,每条 finding 强制 `path:line` 引用与验证方式;结果评论附 host 生成的**复现信息块**(repo/PR/head/base SHA/diff stat/session id)。label:`xh:reviewed`,出现 P0 加 `xh:review-p0`。
+
+- 思考强度:`XH_GH_REASONING`(如 high),进 ModelRoute.reasoning_effort;端点需支持。
+- 可复现:task.json 记录任务与 PR SHA;评审轨迹在 durable session(append-only JSONL);同 PR 新 `/xh` 评论即刷新评审。
+- 崩溃恢复:启动时 `recover_pending` 重放 task.json;已完成(done.marker)跳过,未完成的以重试 tag 重跑(at-least-once,回写 upsert 幂等)。
+- 私有仓/本地 origin:`XH_GH_ORIGIN` 覆盖 clone 源。
+
 ## 部署依赖
 
 - `ripgrep`(rg):coding-tools 的 glob/grep 真实调用宿主 rg,V100/CI 需安装(apt/brew)。CI 已显式安装。

@@ -49,6 +49,18 @@ cargo test --workspace
 
 已在本仓库拆分时于 macOS (aarch64, Rust 1.99) 全量通过。
 
+## gh 接入实验(M0 进行中)
+
+`crates/xharness-gh` 已打通 headless 全链路(离线):POST /tasks → `admit_turn` 持久落账(要求用户消息带稳定 id)→ `start_turn` 启动 durable turn → mock provider 两步(gh_comment 工具调用 → 终止文本)→ 工具执行被记录 → 结果可查询。测试 `tests/full_loop.rs` 0.3s 内闭环。
+
+架构:GitHub Actions 触发 → POST /tasks(host 的 Axum 端点)→ 每 (repo, issue) 一个持久 durable session;Actions 只做转发,重活在 host。宿主推荐与自托管 runner 同机,零公网暴露。
+
+剩余:真实 provider 接线(OpenAiProviderConfig)、真实 gh client + marker 评论 upsert、`resume_session` 重启恢复路径、steering(`admit_steering`)、部署配置。
+
+## 已知 flake
+
+`swarm_coordinator_review_rejects_forged_reference_and_ignores_unrelated_latest_turn`(host,30s 边界)对负载敏感:全套件并发下偶发超时,隔离复跑 1.2s 稳定通过。上游同步代码,不改动,以 CI 环境仲裁。
+
 ## 下一步
 
 1. gh-adapter:轮询/租约认领/评论 upsert,事件 → durable inbox 的单向映射;

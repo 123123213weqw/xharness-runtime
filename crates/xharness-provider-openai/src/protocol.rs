@@ -1,0 +1,768 @@
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use xharness_core::{
+    AgentMessage, FinishReason, ProviderError, ProviderEvent, ProviderRequest, Role, TokenUsage,
+    ToolCall, ToolDefinition,
+};
+
+use crate::SseEvent;
+
+pub const CHAT_COMPLETIONS: &str = "chat_completions";
+pub const RESPONSES: &str = "responses";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiProtocol {
+    ChatCompletions,
+    Responses,
+}
+
+impl OpenAiProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => CHAT_COMPLETIONS,
+            Self::Responses => RESPONSES,
+        }
+    }
+}
+
+/// Meaning of input counts returned by an OpenAI-compatible gateway, not its
+/// model vendor. Explicit configuration wins over response-shape detection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputUsageSemantics {
+    #[default]
+    Auto,
+    TotalIncludesCache,
+    UncachedInput,
+}
+
+pub fn build_openai_request(
+    protocol: OpenAiProtocol,
+    model: &str,
+    request: &ProviderRequest,
+) -> Value {
+    // Resolve results by the provider replay ID, not by a lookalike JSON shape.
+    // An orphan or an ID reused by different tools must keep its diagnostics.
+    let mut tool_names = HashMap::new();
+    for message in request
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+    {
+        for call in &message.tool_calls {
+            if !call.provider_id().is_empty() {
+                tool_names
+                    .entry(call.provider_id())
+                    .and_modify(|name| {
+                        if *name != Some(call.name.as_str()) {
+                            *name = None;
+                        }
+                    })
+                    .or_insert(Some(call.name.as_str()));
+            }
+        }
+    }
+    let tool_name = |message: &AgentMessage| {
+        message
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| tool_names.get(id).copied().flatten())
+    };
+    let tools = request
+        .tools
+        .iter()
+        .map(|tool| encode_tool(protocol, tool))
+        .collect::<Vec<_>>();
+
+    match protocol {
+        OpenAiProtocol::ChatCompletions => {
+            let mut root = json!({
+                "model": model,
+                "stream": true,
+                "stream_options": { "include_usage": true },
+                "messages": request.messages.iter().map(|m| encode_chat_message(m, tool_name(m))).collect::<Vec<_>>(),
+            });
+            if !tools.is_empty() {
+                root["tools"] = Value::Array(tools);
+            }
+            if let Some(max_output_tokens) = request.max_output_tokens {
+                root["max_tokens"] = Value::from(max_output_tokens);
+            }
+            root
+        }
+        OpenAiProtocol::Responses => {
+            let input = request
+                .messages
+                .iter()
+                .flat_map(|m| encode_response_message_for_tool(m, tool_name(m)))
+                .collect::<Vec<_>>();
+            let mut root = json!({
+                "model": model,
+                "stream": true,
+                "store": false,
+                "input": input,
+            });
+            if !tools.is_empty() {
+                root["tools"] = Value::Array(tools);
+            }
+            if let Some(max_output_tokens) = request.max_output_tokens {
+                root["max_output_tokens"] = Value::from(max_output_tokens);
+            }
+            root
+        }
+    }
+}
+
+/// Build the body accepted by provider-native input-token counting endpoints.
+/// It intentionally starts from the generation encoder so messages, replay
+/// items and tool schemas cannot drift, then removes output-only controls.
+pub fn build_openai_token_count_request(
+    protocol: OpenAiProtocol,
+    model: &str,
+    request: &ProviderRequest,
+) -> Value {
+    let mut root = build_openai_request(protocol, model, request);
+    let Some(object) = root.as_object_mut() else {
+        return root;
+    };
+    object.remove("stream");
+    object.remove("stream_options");
+    object.remove("max_tokens");
+    object.remove("max_output_tokens");
+    object.remove("store");
+    root
+}
+
+fn encode_tool(protocol: OpenAiProtocol, tool: &ToolDefinition) -> Value {
+    match protocol {
+        OpenAiProtocol::ChatCompletions => json!({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            }
+        }),
+        OpenAiProtocol::Responses => json!({
+            "type": "function",
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }),
+    }
+}
+
+/// Project only the known Harness tool envelope. No textual content is cut,
+/// and every unknown/diagnostic field survives. Only the incidental PID of a
+/// verified, successful foreground Bash result is omitted. Logs and the process
+/// executor keep the original result, including that PID.
+fn model_content(message: &AgentMessage, tool_name: Option<&str>) -> String {
+    if message.role != Role::Tool {
+        return message.content.clone();
+    }
+    let Ok(mut outer) = serde_json::from_str::<Value>(&message.content) else {
+        return message.content.clone();
+    };
+    if !outer.get("ok").is_some_and(Value::is_boolean)
+        || !outer.get("truncated").is_some_and(Value::is_boolean)
+    {
+        return message.content.clone();
+    }
+    let (mut inner, was_string) = match outer.get("content") {
+        Some(Value::String(content)) => match serde_json::from_str::<Value>(content) {
+            Ok(inner) => (inner, true),
+            Err(_) => return message.content.clone(),
+        },
+        Some(inner @ Value::Object(_)) if tool_name == Some("bash") => (inner.clone(), false),
+        _ => return message.content.clone(),
+    };
+    if !inner.is_object()
+        || !(inner.get("exit_code").is_some()
+            || inner.get("job_id").is_some()
+            || inner.get("bytes_read").is_some())
+    {
+        return message.content.clone();
+    }
+    let omit_pid = tool_name == Some("bash") && is_complete_foreground_bash(&outer, &inner);
+    if omit_pid {
+        inner.as_object_mut().unwrap().remove("pid");
+    } else if !was_string {
+        // Preserve the existing wire representation for ineligible object input.
+        return message.content.clone();
+    }
+    outer["content"] = inner;
+    serde_json::to_string(&outer).unwrap_or_else(|_| message.content.clone())
+}
+
+fn is_complete_foreground_bash(outer: &Value, inner: &Value) -> bool {
+    outer.get("ok").and_then(Value::as_bool) == Some(true)
+        && outer.get("truncated").and_then(Value::as_bool) == Some(false)
+        && outer.get("error").and_then(Value::as_str) == Some("")
+        && outer.get("archive").is_none()
+        && outer.get("reduction").is_none()
+        && inner.get("kind").and_then(Value::as_str) == Some("foreground")
+        && inner.get("success").and_then(Value::as_bool) == Some(true)
+        && inner.get("exit_code").and_then(Value::as_i64) == Some(0)
+        && inner.get("signal") == Some(&Value::Null)
+        && inner.get("termination").and_then(Value::as_str) == Some("exited")
+        && inner.get("stdout").is_some_and(Value::is_string)
+        && inner.get("stderr").is_some_and(Value::is_string)
+        && inner.get("stdout_bytes").and_then(Value::as_u64).is_some()
+        && inner.get("stderr_bytes").and_then(Value::as_u64).is_some()
+        && inner.get("stdout_truncated").and_then(Value::as_bool) == Some(false)
+        && inner.get("stderr_truncated").and_then(Value::as_bool) == Some(false)
+        && inner.get("stdout_omitted_bytes").and_then(Value::as_u64) == Some(0)
+        && inner.get("stderr_omitted_bytes").and_then(Value::as_u64) == Some(0)
+        && inner.get("job_id").is_none()
+        && inner
+            .get("pid")
+            .and_then(Value::as_u64)
+            .is_some_and(|pid| pid > 0)
+}
+
+fn encode_chat_message(message: &AgentMessage, tool_name: Option<&str>) -> Value {
+    let mut object = Map::new();
+    object.insert("role".to_owned(), json!(message.role.as_str()));
+    object.insert(
+        "content".to_owned(),
+        json!(model_content(message, tool_name)),
+    );
+    if !message.reasoning.is_empty() {
+        object.insert("reasoning_content".to_owned(), json!(message.reasoning));
+    }
+    if let Some(tool_call_id) = &message.tool_call_id {
+        object.insert("tool_call_id".to_owned(), json!(tool_call_id));
+    }
+    if !message.tool_calls.is_empty() {
+        object.insert(
+            "tool_calls".to_owned(),
+            Value::Array(
+                message
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id": call.provider_id(),
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.arguments_json,
+                            }
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(object)
+}
+
+pub(crate) fn encode_response_message(message: &AgentMessage) -> Vec<Value> {
+    encode_response_message_for_tool(message, None)
+}
+
+fn encode_response_message_for_tool(message: &AgentMessage, tool_name: Option<&str>) -> Vec<Value> {
+    if message.role == Role::Tool {
+        return vec![json!({
+            "type": "function_call_output",
+            "call_id": message.tool_call_id.clone().unwrap_or_default(),
+            "output": model_content(message, tool_name),
+        })];
+    }
+    if message.role == Role::Assistant && !message.provider_items.is_empty() {
+        return message.provider_items.clone();
+    }
+
+    let content_type = if message.role == Role::Assistant {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    let mut output = vec![json!({
+        "role": message.role.as_str(),
+        "content": [{ "type": content_type, "text": model_content(message, tool_name) }],
+    })];
+    if message.role == Role::Assistant {
+        output.extend(message.tool_calls.iter().map(encode_response_tool_call));
+    }
+    output
+}
+
+fn encode_response_tool_call(call: &ToolCall) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": call.provider_id(),
+        "name": call.name,
+        "arguments": call.arguments_json,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct OpenAiStreamNormalizer {
+    protocol: OpenAiProtocol,
+    usage: Option<TokenUsage>,
+    usage_semantics: InputUsageSemantics,
+    finish_reason: Option<FinishReason>,
+    saw_tool_call: bool,
+    provider_items: Vec<Value>,
+    provider_item_encodings: HashSet<String>,
+    argument_seen: HashSet<usize>,
+    completed: bool,
+}
+
+impl OpenAiStreamNormalizer {
+    pub fn new(protocol: OpenAiProtocol) -> Self {
+        Self {
+            protocol,
+            usage: None,
+            usage_semantics: InputUsageSemantics::Auto,
+            finish_reason: None,
+            saw_tool_call: false,
+            provider_items: Vec::new(),
+            provider_item_encodings: HashSet::new(),
+            argument_seen: HashSet::new(),
+            completed: false,
+        }
+    }
+
+    pub fn with_usage_semantics(mut self, semantics: InputUsageSemantics) -> Self {
+        self.usage_semantics = semantics;
+        self
+    }
+
+    pub fn consume(&mut self, event: SseEvent) -> Result<Vec<ProviderEvent>, ProviderError> {
+        if self.protocol == OpenAiProtocol::ChatCompletions && event.data == "[DONE]" {
+            self.completed = true;
+            return Ok(vec![ProviderEvent::Completed {
+                finish_reason: Some(self.finish_reason.clone().unwrap_or({
+                    if self.saw_tool_call {
+                        FinishReason::ToolCalls
+                    } else {
+                        FinishReason::Stop
+                    }
+                })),
+                usage: self.usage.clone(),
+                provider_items: Vec::new(),
+            }]);
+        }
+        let root: Value = serde_json::from_str(&event.data)
+            .map_err(|error| ProviderError::new(format!("invalid SSE JSON payload: {error}")))?;
+        match self.protocol {
+            OpenAiProtocol::ChatCompletions => self.consume_chat(root),
+            OpenAiProtocol::Responses => self.consume_responses(root),
+        }
+    }
+
+    pub fn finish(&self) -> Result<(), ProviderError> {
+        if self.completed {
+            Ok(())
+        } else {
+            // HTTP EOF is not application completion. Core retries this only
+            // before any model delta; partial output must never be replayed.
+            Err(ProviderError::retryable(
+                "SSE stream ended before protocol completion",
+            ))
+        }
+    }
+
+    fn consume_chat(&mut self, root: Value) -> Result<Vec<ProviderEvent>, ProviderError> {
+        if let Some(usage) = root.get("usage").filter(|value| !value.is_null()) {
+            self.usage = Some(openai_token_usage(
+                usage,
+                OpenAiProtocol::ChatCompletions,
+                self.usage_semantics,
+            ));
+        }
+        if let Some(error) = root.get("error").filter(|value| !value.is_null()) {
+            return Err(ProviderError::new(error_message(error)));
+        }
+        let Some(choice) = root
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            return Ok(Vec::new());
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.finish_reason = Some(chat_finish_reason(reason));
+        }
+        let Some(delta) = choice.get("delta") else {
+            return Ok(Vec::new());
+        };
+        let mut output = Vec::new();
+        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            if !text.is_empty() {
+                output.push(ProviderEvent::TextDelta(text.to_owned()));
+            }
+        }
+        // llama.cpp/older vLLM use reasoning_content, newer vLLM uses reasoning.
+        // A null/empty legacy field must not mask an actual reasoning delta.
+        // Prefer one non-empty string rather than concatenating aliases twice.
+        let reasoning = ["reasoning_content", "reasoning"]
+            .iter()
+            .filter_map(|key| delta.get(*key).and_then(Value::as_str))
+            .find(|text| !text.is_empty())
+            .unwrap_or_default();
+        if !reasoning.is_empty() {
+            output.push(ProviderEvent::ReasoningDelta(reasoning.to_owned()));
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            self.saw_tool_call |= !calls.is_empty();
+            for (fallback_index, call) in calls.iter().enumerate() {
+                let function = call.get("function").unwrap_or(&Value::Null);
+                output.push(ProviderEvent::ToolCallDelta {
+                    index: call
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as usize)
+                        .unwrap_or(fallback_index),
+                    id: string_field(call, "id"),
+                    name: string_field(function, "name"),
+                    arguments_delta: string_field(function, "arguments"),
+                });
+            }
+        }
+        Ok(output)
+    }
+
+    fn consume_responses(&mut self, root: Value) -> Result<Vec<ProviderEvent>, ProviderError> {
+        let event_type = string_field(&root, "type");
+        let index = root
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
+        let output = match event_type.as_str() {
+            "response.output_text.delta" => {
+                vec![ProviderEvent::TextDelta(string_field(&root, "delta"))]
+            }
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                vec![ProviderEvent::ReasoningDelta(string_field(&root, "delta"))]
+            }
+            "response.function_call_arguments.delta" => {
+                let delta = string_field(&root, "delta");
+                if !delta.is_empty() {
+                    self.argument_seen.insert(index);
+                }
+                vec![ProviderEvent::ToolCallDelta {
+                    index,
+                    id: String::new(),
+                    name: String::new(),
+                    arguments_delta: delta,
+                }]
+            }
+            "response.output_item.added" => {
+                if let Some(item) = root
+                    .get("item")
+                    .filter(|item| string_field(item, "type") == "function_call")
+                {
+                    self.saw_tool_call = true;
+                    let arguments = string_field(item, "arguments");
+                    if !arguments.is_empty() {
+                        self.argument_seen.insert(index);
+                    }
+                    vec![function_call_event(index, item, arguments)]
+                } else {
+                    Vec::new()
+                }
+            }
+            "response.output_item.done" => {
+                let Some(item) = root.get("item") else {
+                    return Ok(Vec::new());
+                };
+                self.saw_tool_call |= string_field(item, "type") == "function_call";
+                self.retain_item(item.clone());
+                if string_field(item, "type") == "function_call"
+                    && !self.argument_seen.contains(&index)
+                {
+                    let arguments = string_field(item, "arguments");
+                    if !arguments.is_empty() {
+                        self.argument_seen.insert(index);
+                    }
+                    vec![function_call_event(index, item, arguments)]
+                } else {
+                    Vec::new()
+                }
+            }
+            "response.completed" => vec![self.complete_response(&root, false)],
+            "response.incomplete" => vec![self.complete_response(&root, true)],
+            "error" | "response.failed" => {
+                let message = root
+                    .get("error")
+                    .map(error_message)
+                    .unwrap_or_else(|| "OpenAI Responses stream failed".to_owned());
+                return Err(ProviderError::new(message));
+            }
+            _ => Vec::new(),
+        };
+        Ok(output)
+    }
+
+    fn complete_response(&mut self, root: &Value, explicit_incomplete: bool) -> ProviderEvent {
+        let response = root.get("response").unwrap_or(root);
+        if let Some(usage) = response.get("usage").filter(|value| !value.is_null()) {
+            self.usage = Some(openai_token_usage(
+                usage,
+                OpenAiProtocol::Responses,
+                self.usage_semantics,
+            ));
+        }
+        let items = response
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        self.saw_tool_call |= items
+            .iter()
+            .any(|item| string_field(item, "type") == "function_call");
+        for item in items {
+            self.retain_item(item);
+        }
+
+        let finish_reason =
+            response_finish_reason(response, explicit_incomplete, self.saw_tool_call);
+        self.finish_reason = Some(finish_reason.clone());
+        self.completed = true;
+        ProviderEvent::Completed {
+            finish_reason: Some(finish_reason),
+            usage: self.usage.clone(),
+            provider_items: self.provider_items.clone(),
+        }
+    }
+
+    fn retain_item(&mut self, item: Value) {
+        let encoding = item.to_string();
+        if self.provider_item_encodings.insert(encoding) {
+            self.provider_items.push(item);
+        }
+    }
+}
+
+fn function_call_event(index: usize, item: &Value, arguments_delta: String) -> ProviderEvent {
+    ProviderEvent::ToolCallDelta {
+        index,
+        id: {
+            let call_id = string_field(item, "call_id");
+            if call_id.is_empty() {
+                string_field(item, "id")
+            } else {
+                call_id
+            }
+        },
+        name: string_field(item, "name"),
+        arguments_delta,
+    }
+}
+
+fn chat_finish_reason(reason: &str) -> FinishReason {
+    match reason {
+        "stop" => FinishReason::Stop,
+        "tool_calls" | "function_call" => FinishReason::ToolCalls,
+        "length" | "max_tokens" | "max_output_tokens" => FinishReason::Length,
+        "content_filter" | "safety" => FinishReason::ContentFilter,
+        other => FinishReason::Other(other.to_owned()),
+    }
+}
+
+fn response_finish_reason(
+    response: &Value,
+    explicit_incomplete: bool,
+    saw_tool_call: bool,
+) -> FinishReason {
+    let status = string_field(response, "status");
+    if explicit_incomplete || status == "incomplete" {
+        let reason = response
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return match reason {
+            "max_output_tokens" | "max_tokens" | "length" => FinishReason::Length,
+            "content_filter" | "safety" => FinishReason::ContentFilter,
+            other => FinishReason::Incomplete(other.to_owned()),
+        };
+    }
+    if !status.is_empty() && status != "completed" {
+        return FinishReason::Incomplete(status);
+    }
+    if saw_tool_call {
+        FinishReason::ToolCalls
+    } else {
+        FinishReason::Stop
+    }
+}
+
+fn openai_token_usage(
+    usage: &Value,
+    protocol: OpenAiProtocol,
+    semantics: InputUsageSemantics,
+) -> TokenUsage {
+    let native_read = first_u64(usage, &["cache_read_input_tokens"]);
+    let native_write = first_u64(usage, &["cache_creation_input_tokens"]);
+    // Known total-shaped fields win in Auto when a gateway mixes formats.
+    // A gateway that changes their meaning must configure UncachedInput.
+    let total_shape = first_u64(
+        usage,
+        &[
+            "prompt_tokens",
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+        ],
+    )
+    .is_some()
+        || usage
+            .get("input_tokens_details")
+            .is_some_and(Value::is_object)
+        || usage
+            .get("prompt_tokens_details")
+            .is_some_and(Value::is_object);
+    let uncached_input = match semantics {
+        InputUsageSemantics::UncachedInput => true,
+        InputUsageSemantics::TotalIncludesCache => false,
+        InputUsageSemantics::Auto => {
+            !total_shape
+                && usage.get("input_tokens").and_then(Value::as_u64).is_some()
+                && (native_read.is_some() || native_write.is_some())
+        }
+    };
+    let total_input = match protocol {
+        OpenAiProtocol::ChatCompletions => first_u64(usage, &["prompt_tokens", "input_tokens"]),
+        OpenAiProtocol::Responses => first_u64(usage, &["input_tokens", "prompt_tokens"]),
+    }
+    .unwrap_or_default();
+    let standard_read = nested_u64(usage, "input_tokens_details", "cached_tokens")
+        .or_else(|| nested_u64(usage, "prompt_tokens_details", "cached_tokens"))
+        .or_else(|| first_u64(usage, &["prompt_cache_hit_tokens", "cache_read_tokens"]));
+    let cache_read_tokens = if uncached_input {
+        native_read.or(standard_read)
+    } else {
+        standard_read.or(native_read)
+    }
+    .unwrap_or_default();
+    let explicitly_uncached = first_u64(usage, &["prompt_cache_miss_tokens"]);
+    let total_output_tokens = match protocol {
+        OpenAiProtocol::ChatCompletions => {
+            first_u64(usage, &["completion_tokens", "output_tokens"])
+        }
+        OpenAiProtocol::Responses => first_u64(usage, &["output_tokens", "completion_tokens"]),
+    }
+    .unwrap_or_default();
+    let reasoning_tokens = nested_u64(usage, "output_tokens_details", "reasoning_tokens")
+        .or_else(|| nested_u64(usage, "completion_tokens_details", "reasoning_tokens"))
+        .or_else(|| first_u64(usage, &["reasoning_tokens"]))
+        .unwrap_or_default();
+    let standard_write = nested_u64(usage, "input_tokens_details", "cache_write_tokens")
+        .or_else(|| first_u64(usage, &["cache_write_tokens"]));
+    let cache_write_tokens = if uncached_input {
+        native_write.or(standard_write)
+    } else {
+        standard_write.or(native_write)
+    }
+    .unwrap_or_default();
+
+    TokenUsage {
+        input_tokens: if uncached_input {
+            first_u64(
+                usage,
+                &["input_tokens", "prompt_cache_miss_tokens", "prompt_tokens"],
+            )
+            .unwrap_or_default()
+        } else {
+            explicitly_uncached.unwrap_or_else(|| {
+                total_input
+                    .saturating_sub(cache_read_tokens)
+                    .saturating_sub(cache_write_tokens)
+            })
+        },
+        // OpenAI's completion/output total includes reasoning tokens. Keep the
+        // portable TokenUsage buckets disjoint so summing them cannot double
+        // count hidden reasoning work.
+        output_tokens: total_output_tokens.saturating_sub(reasoning_tokens),
+        cache_read_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
+    }
+}
+
+fn first_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_u64))
+}
+
+fn nested_u64(value: &Value, parent: &str, key: &str) -> Option<u64> {
+    value
+        .get(parent)
+        .and_then(|details| details.get(key))
+        .and_then(Value::as_u64)
+}
+
+fn string_field(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn error_message(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| error.to_string())
+}
+
+#[cfg(test)]
+mod lossless_tool_projection_tests {
+    use super::*;
+    #[test]
+    fn envelope_projection_keeps_all_output_and_diagnostics() {
+        let inner = json!({"kind":"foreground","exit_code":141,"stdout":"a\n\"中文\"".repeat(9000),"stderr":"broken pipe","stdout_truncated":false,"future_field":[1,2,3]});
+        let outer = json!({"ok":true,"content":inner.to_string(),"error":"","truncated":false,"metadata":{"unknown":7}});
+        let m = AgentMessage {
+            role: Role::Tool,
+            content: outer.to_string(),
+            ..Default::default()
+        };
+        let projected: Value = serde_json::from_str(&model_content(&m, None)).unwrap();
+        assert_eq!(projected["content"], inner);
+        assert_eq!(projected["metadata"], outer["metadata"]);
+        assert_eq!(m.content, outer.to_string());
+        for protocol in [OpenAiProtocol::ChatCompletions, OpenAiProtocol::Responses] {
+            let request = ProviderRequest {
+                messages: vec![m.clone()],
+                tools: vec![],
+                step: 1,
+                reasoning_effort: None,
+                max_output_tokens: Some(100),
+                debug_scope: Default::default(),
+            };
+            let body = build_openai_request(protocol, "m", &request);
+            let content = if protocol == OpenAiProtocol::ChatCompletions {
+                &body["messages"][0]["content"]
+            } else {
+                &body["input"][0]["output"]
+            };
+            // role=tool needs an ID to become function output; this fixture exercises text mapping too.
+            assert_eq!(
+                serde_json::from_str::<Value>(content.as_str().unwrap()).unwrap(),
+                projected
+            );
+        }
+    }
+    #[test]
+    fn arbitrary_json_and_error_text_are_not_reinterpreted() {
+        for raw in ["not json", r#"{"content":"{\"stdout\":\"x\"}"}"#] {
+            let m = AgentMessage {
+                role: Role::Tool,
+                content: raw.into(),
+                ..Default::default()
+            };
+            assert_eq!(model_content(&m, None), raw);
+        }
+    }
+}

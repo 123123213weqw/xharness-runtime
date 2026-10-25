@@ -1,0 +1,16 @@
+[package]
+name = "xharness-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Compile-time native Windows/macOS/Linux platform composition for XHarness"
+
+[dependencies]
+thiserror.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+xharness-fs = { path = "../xharness-fs" }
+xharness-process = { path = "../xharness-process" }
+xharness-sandbox = { path = "../xharness-sandbox" }
+xharness-debug = { path = "../xharness-debug" }

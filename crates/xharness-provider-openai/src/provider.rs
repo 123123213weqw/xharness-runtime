@@ -1,0 +1,2162 @@
+use std::{
+    collections::HashMap,
+    error::Error as StdError,
+    fmt,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use crate::CalibrationStore;
+use async_trait::async_trait;
+use futures::StreamExt;
+use reqwest::{header, Client, Response};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use xharness_core::{
+    CapabilitySource, ContextLimitEvidence, ContextWindowCapability, ModelCapabilities,
+    ModelProvider, ProviderError, ProviderEvent, ProviderInputTokenCount,
+    ProviderNetworkDiagnostics, ProviderRequest, ProviderStream,
+};
+use xharness_debug::{DebugRecorder, DebugScope};
+use xharness_token::WireFeatures;
+
+use crate::{
+    build_openai_request, build_openai_token_count_request, client_builder_for_endpoint,
+    OpenAiProtocol, OpenAiStreamNormalizer, SseParser, DEFAULT_SSE_EVENT_LIMIT_BYTES,
+    DEFAULT_SSE_PENDING_LIMIT_BYTES,
+};
+
+pub const DEFAULT_ERROR_BODY_LIMIT_BYTES: usize = 4 * 1024;
+pub const DEFAULT_CAPABILITY_TTL: Duration = Duration::from_secs(300);
+const TOKEN_COUNT_UNKNOWN: u8 = 0;
+const TOKEN_COUNT_SUPPORTED: u8 = 1;
+const TOKEN_COUNT_UNSUPPORTED: u8 = 2;
+
+const RESERVED_REASONING_PATCH_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "input",
+    "tools",
+    "stream",
+    "stream_options",
+    "store",
+    "max_tokens",
+    "max_output_tokens",
+];
+
+/// Explicit structured endpoint used by an OpenAI-compatible deployment to
+/// report its live context capacity. The JSON pointer is configuration, not a
+/// capacity value; Core never infers a limit from a model name.
+#[derive(Clone, Debug)]
+pub struct OpenAiCapabilityProbe {
+    pub url: String,
+    pub context_window_json_pointer: String,
+    pub model_ceiling_json_pointer: Option<String>,
+    pub provider_limit_json_pointer: Option<String>,
+    pub account_limit_json_pointer: Option<String>,
+    pub ttl: Duration,
+}
+
+impl OpenAiCapabilityProbe {
+    pub fn new(url: impl Into<String>, context_window_json_pointer: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            context_window_json_pointer: context_window_json_pointer.into(),
+            model_ceiling_json_pointer: None,
+            provider_limit_json_pointer: None,
+            account_limit_json_pointer: None,
+            ttl: DEFAULT_CAPABILITY_TTL,
+        }
+    }
+
+    pub fn with_model_ceiling_json_pointer(mut self, pointer: impl Into<String>) -> Self {
+        self.model_ceiling_json_pointer = Some(pointer.into());
+        self
+    }
+
+    pub fn with_provider_limit_json_pointer(mut self, pointer: impl Into<String>) -> Self {
+        self.provider_limit_json_pointer = Some(pointer.into());
+        self
+    }
+
+    pub fn with_account_limit_json_pointer(mut self, pointer: impl Into<String>) -> Self {
+        self.account_limit_json_pointer = Some(pointer.into());
+        self
+    }
+
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedCapabilities {
+    expires_at: Instant,
+    value: ModelCapabilities,
+}
+
+/// Adapter-owned mapping from public reasoning effort ids to OpenAI-compatible
+/// request fragments. The Host and browser treat effort ids as opaque; only
+/// this adapter knows whether an id becomes `reasoning_effort`,
+/// `chat_template_kwargs`, or another endpoint-specific extension.
+#[derive(Clone, Debug)]
+pub struct OpenAiReasoningProfile {
+    default_effort: Option<String>,
+    patches: HashMap<String, Map<String, Value>>,
+}
+
+impl OpenAiReasoningProfile {
+    pub fn new(
+        default_effort: Option<String>,
+        efforts: impl IntoIterator<Item = (String, Value)>,
+    ) -> Result<Self, ProviderError> {
+        let mut patches = HashMap::new();
+        for (id, patch) in efforts {
+            if id.trim().is_empty() {
+                return Err(ProviderError::new(
+                    "OpenAI reasoning effort id must not be empty",
+                ));
+            }
+            let patch = patch.as_object().cloned().ok_or_else(|| {
+                ProviderError::new(format!(
+                    "OpenAI reasoning effort {id:?} request patch must be a JSON object"
+                ))
+            })?;
+            if let Some(key) = patch
+                .keys()
+                .find(|key| RESERVED_REASONING_PATCH_KEYS.contains(&key.as_str()))
+            {
+                return Err(ProviderError::new(format!(
+                    "OpenAI reasoning effort {id:?} request patch cannot override reserved field {key:?}"
+                )));
+            }
+            if patches.insert(id.clone(), patch).is_some() {
+                return Err(ProviderError::new(format!(
+                    "OpenAI reasoning effort id {id:?} is declared more than once"
+                )));
+            }
+        }
+        if patches.is_empty() {
+            return Err(ProviderError::new(
+                "OpenAI reasoning profile must declare at least one effort",
+            ));
+        }
+        if let Some(default_effort) = default_effort.as_deref() {
+            if !patches.contains_key(default_effort) {
+                return Err(ProviderError::new(format!(
+                    "OpenAI default reasoning effort {default_effort:?} is not declared"
+                )));
+            }
+        }
+        Ok(Self {
+            default_effort,
+            patches,
+        })
+    }
+
+    pub fn default_effort(&self) -> Option<&str> {
+        self.default_effort.as_deref()
+    }
+
+    fn apply(&self, requested: Option<&str>, body: &mut Value) -> Result<(), ProviderError> {
+        let Some(effort) = requested.or(self.default_effort()) else {
+            return Ok(());
+        };
+        let patch = self.patches.get(effort).ok_or_else(|| {
+            ProviderError::new(format!(
+                "unsupported reasoning effort {effort:?} for this model"
+            ))
+        })?;
+        let root = body.as_object_mut().ok_or_else(|| {
+            ProviderError::new("OpenAI request encoder produced a non-object body")
+        })?;
+        root.extend(patch.clone());
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct OpenAiProviderConfig {
+    pub protocol: OpenAiProtocol,
+    pub usage_input_semantics: crate::InputUsageSemantics,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub connect_timeout: Duration,
+    /// Maximum time to receive response headers. This is deliberately not a
+    /// total request deadline: a healthy model stream may run for much longer.
+    pub request_timeout: Duration,
+    /// Maximum gap between response-body chunks once headers have arrived.
+    /// Every received chunk resets this deadline.
+    pub stream_idle_timeout: Duration,
+    pub max_sse_pending_bytes: usize,
+    pub max_sse_event_bytes: usize,
+    pub max_error_body_bytes: usize,
+    pub reasoning: Option<OpenAiReasoningProfile>,
+    pub context_window_fallback: Option<u64>,
+    pub capability_probe: Option<OpenAiCapabilityProbe>,
+}
+
+impl OpenAiProviderConfig {
+    pub fn new(
+        protocol: OpenAiProtocol,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            protocol,
+            usage_input_semantics: crate::InputUsageSemantics::Auto,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: model.into(),
+            connect_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(600),
+            stream_idle_timeout: Duration::from_secs(300),
+            max_sse_pending_bytes: DEFAULT_SSE_PENDING_LIMIT_BYTES,
+            max_sse_event_bytes: DEFAULT_SSE_EVENT_LIMIT_BYTES,
+            max_error_body_bytes: DEFAULT_ERROR_BODY_LIMIT_BYTES,
+            reasoning: None,
+            context_window_fallback: None,
+            capability_probe: None,
+        }
+    }
+
+    pub fn with_reasoning_profile(mut self, reasoning: OpenAiReasoningProfile) -> Self {
+        self.reasoning = Some(reasoning);
+        self
+    }
+
+    pub fn with_context_window_fallback(mut self, tokens: Option<u64>) -> Self {
+        self.context_window_fallback = tokens;
+        self
+    }
+
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = timeout;
+        self
+    }
+
+    pub fn with_capability_probe(mut self, probe: OpenAiCapabilityProbe) -> Self {
+        self.capability_probe = Some(probe);
+        self
+    }
+
+    fn endpoint(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        match self.protocol {
+            OpenAiProtocol::ChatCompletions => format!("{base}/chat/completions"),
+            OpenAiProtocol::Responses => format!("{base}/responses"),
+        }
+    }
+
+    fn token_count_endpoint(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        match self.protocol {
+            OpenAiProtocol::ChatCompletions => {
+                format!("{base}/chat/completions/input_tokens")
+            }
+            OpenAiProtocol::Responses => format!("{base}/responses/input_tokens"),
+        }
+    }
+
+    fn token_counter_id(&self) -> &'static str {
+        match self.protocol {
+            OpenAiProtocol::ChatCompletions => "openai-compatible/chat-input-tokens/v1",
+            OpenAiProtocol::Responses => "openai/responses-input-tokens/v1",
+        }
+    }
+}
+
+impl fmt::Debug for OpenAiProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiProviderConfig")
+            .field("protocol", &self.protocol)
+            .field("usage_input_semantics", &self.usage_input_semantics)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
+            .field("max_sse_pending_bytes", &self.max_sse_pending_bytes)
+            .field("max_sse_event_bytes", &self.max_sse_event_bytes)
+            .field("max_error_body_bytes", &self.max_error_body_bytes)
+            .field(
+                "reasoning_efforts",
+                &self.reasoning.as_ref().map(|profile| profile.patches.len()),
+            )
+            .field("context_window_fallback", &self.context_window_fallback)
+            .field(
+                "capability_probe",
+                &self.capability_probe.as_ref().map(|probe| &probe.url),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct OpenAiProvider {
+    config: Arc<OpenAiProviderConfig>,
+    client: Client,
+    capability_client: Client,
+    token_count_support: Arc<AtomicU8>,
+    calibration: Arc<CalibrationStore>,
+    counter_retry_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    capability_cache: Arc<Mutex<Option<CachedCapabilities>>>,
+    debug: DebugRecorder,
+    attachments: Option<Arc<dyn xharness_attachments::AttachmentStore>>,
+    image_support: Option<bool>,
+}
+
+/// The wire encoder owns these arrays. Keep shape and offset checks at the
+/// mutation boundary so an encoder change becomes a provider error, not a
+/// panic that interrupts a live agent turn.
+fn encoded_items_mut(
+    body: &mut Value,
+    protocol: OpenAiProtocol,
+) -> Result<&mut Vec<Value>, ProviderError> {
+    let field = match protocol {
+        OpenAiProtocol::ChatCompletions => "messages",
+        OpenAiProtocol::Responses => "input",
+    };
+    body.get_mut(field)
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            ProviderError::new(format!(
+                "OpenAI request encoder produced invalid {field} array"
+            ))
+        })
+}
+
+fn encoded_item_mut(
+    body: &mut Value,
+    protocol: OpenAiProtocol,
+    position: usize,
+) -> Result<&mut Map<String, Value>, ProviderError> {
+    encoded_items_mut(body, protocol)?
+        .get_mut(position)
+        .ok_or_else(|| {
+            ProviderError::new("OpenAI request encoder message offset is out of bounds")
+        })?
+        .as_object_mut()
+        .ok_or_else(|| ProviderError::new("OpenAI request encoder produced a non-object message"))
+}
+
+fn insert_encoded_item(
+    body: &mut Value,
+    protocol: OpenAiProtocol,
+    position: usize,
+    item: Value,
+) -> Result<(), ProviderError> {
+    let items = encoded_items_mut(body, protocol)?;
+    if position > items.len() {
+        return Err(ProviderError::new(
+            "OpenAI request encoder insertion offset is out of bounds",
+        ));
+    }
+    items.insert(position, item);
+    Ok(())
+}
+
+impl OpenAiProvider {
+    pub fn new(config: OpenAiProviderConfig) -> Result<Self, ProviderError> {
+        if config.max_sse_pending_bytes == 0 {
+            return Err(ProviderError::new(
+                "max_sse_pending_bytes must be greater than zero",
+            ));
+        }
+        if config.max_sse_event_bytes == 0 {
+            return Err(ProviderError::new(
+                "max_sse_event_bytes must be greater than zero",
+            ));
+        }
+        if config.max_error_body_bytes == 0 {
+            return Err(ProviderError::new(
+                "max_error_body_bytes must be greater than zero",
+            ));
+        }
+        if config.connect_timeout.is_zero() {
+            return Err(ProviderError::new(
+                "connect_timeout must be greater than zero",
+            ));
+        }
+        if config.request_timeout.is_zero() {
+            return Err(ProviderError::new(
+                "request_timeout must be greater than zero",
+            ));
+        }
+        if config.stream_idle_timeout.is_zero() {
+            return Err(ProviderError::new(
+                "stream_idle_timeout must be greater than zero",
+            ));
+        }
+        if let Some(tokens) = config.context_window_fallback {
+            if tokens == 0 {
+                return Err(ProviderError::new(
+                    "context_window_fallback must be greater than zero",
+                ));
+            }
+        }
+        if let Some(probe) = &config.capability_probe {
+            if probe.url.trim().is_empty() {
+                return Err(ProviderError::new("capability probe URL must not be empty"));
+            }
+            for (name, pointer) in [
+                (
+                    "deployment context-window",
+                    Some(&probe.context_window_json_pointer),
+                ),
+                ("model ceiling", probe.model_ceiling_json_pointer.as_ref()),
+                ("Provider limit", probe.provider_limit_json_pointer.as_ref()),
+                ("account limit", probe.account_limit_json_pointer.as_ref()),
+            ] {
+                if pointer.is_some_and(|pointer| !pointer.starts_with('/')) {
+                    return Err(ProviderError::new(format!(
+                        "capability {name} JSON pointer must start with '/'"
+                    )));
+                }
+            }
+            if probe.ttl.is_zero() {
+                return Err(ProviderError::new(
+                    "capability probe TTL must be greater than zero",
+                ));
+            }
+        }
+        let client = client_builder_for_endpoint(&config.base_url)
+            .connect_timeout(config.connect_timeout)
+            // A rolling body timeout catches a stalled stream without killing
+            // a long but actively producing reasoning response.
+            .read_timeout(config.stream_idle_timeout)
+            .build()
+            .map_err(|error| ProviderError::new(format!("could not build HTTP client: {error}")))?;
+        let capability_client = if let Some(probe) = &config.capability_probe {
+            client_builder_for_endpoint(&probe.url)
+                .connect_timeout(config.connect_timeout)
+                .read_timeout(config.stream_idle_timeout)
+                .build()
+                .map_err(|error| {
+                    ProviderError::new(format!("could not build capability HTTP client: {error}"))
+                })?
+        } else {
+            client.clone()
+        };
+        Ok(Self {
+            config: Arc::new(config),
+            client,
+            capability_client,
+            token_count_support: Arc::new(AtomicU8::new(TOKEN_COUNT_UNKNOWN)),
+            calibration: Arc::new(CalibrationStore::default()),
+            counter_retry_at: Arc::new(std::sync::Mutex::new(None)),
+            capability_cache: Arc::new(Mutex::new(None)),
+            debug: DebugRecorder::disabled(),
+            attachments: None,
+            image_support: None,
+        })
+    }
+
+    pub fn with_calibration_store(mut self, store: Arc<CalibrationStore>) -> Self {
+        self.calibration = store;
+        self
+    }
+
+    pub fn with_debug(mut self, debug: DebugRecorder) -> Self {
+        self.debug = debug;
+        self
+    }
+
+    pub fn with_attachments(
+        mut self,
+        store: Arc<dyn xharness_attachments::AttachmentStore>,
+    ) -> Self {
+        self.attachments = Some(store);
+        self
+    }
+
+    /// None means unknown: send valid multimodal content and let the endpoint
+    /// decide. An explicit false fails before any network request.
+    pub fn with_image_support(mut self, support: Option<bool>) -> Self {
+        self.image_support = support;
+        self
+    }
+
+    pub fn config(&self) -> &OpenAiProviderConfig {
+        &self.config
+    }
+
+    async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        cancellation: &CancellationToken,
+        operation: &str,
+    ) -> Result<Response, ProviderError> {
+        let pending = request.send();
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                Err(ProviderError::new(format!("{operation} cancelled")))
+            }
+            result = tokio::time::timeout(self.config.request_timeout, pending) => {
+                match result {
+                    Ok(Ok(response)) => Ok(response),
+                    Ok(Err(error)) => {
+                        let mut failure = ProviderError::retryable(format!(
+                            "{operation} network error: {}", reqwest_error_summary(&error)));
+                        failure.retryable = !error.is_builder() && !permanent_transport_source(&error);
+                        Err(failure)
+                    },
+                    Err(_) => Err(ProviderError::retryable(format!(
+                        "{operation} response-header timeout after {}",
+                        format_duration(self.config.request_timeout),
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn fallback_capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            context_window: self
+                .config
+                .context_window_fallback
+                .map(ContextWindowCapability::declared_fallback)
+                .unwrap_or_default(),
+        }
+    }
+
+    async fn probe_capabilities(
+        &self,
+        probe: &OpenAiCapabilityProbe,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelCapabilities, ProviderError> {
+        let mut request = self.capability_client.get(&probe.url);
+        if !self.config.api_key.is_empty() {
+            request = request.bearer_auth(&self.config.api_key);
+        }
+        let response = self
+            .send_request(request, cancellation, "capability discovery request")
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ProviderError::http(
+                status.as_u16(),
+                format!("capability discovery returned HTTP {status}"),
+            ));
+        }
+        let revision = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body: Value = response.json().await.map_err(|error| {
+            ProviderError::new(format!(
+                "capability discovery returned invalid JSON: {error}"
+            ))
+        })?;
+        let read_limit = |name: &str, pointer: &str| -> Result<u64, ProviderError> {
+            body.pointer(pointer)
+                .and_then(Value::as_u64)
+                .filter(|tokens| *tokens > 0)
+                .ok_or_else(|| {
+                    ProviderError::new(format!(
+                        "capability discovery response has no positive {name} integer at JSON pointer {pointer:?}"
+                    ))
+                })
+        };
+        let tokens = read_limit(
+            "deployment context-window",
+            &probe.context_window_json_pointer,
+        )?;
+        let model_ceiling = probe
+            .model_ceiling_json_pointer
+            .as_deref()
+            .map(|pointer| read_limit("model ceiling", pointer))
+            .transpose()?;
+        let provider_limit = probe
+            .provider_limit_json_pointer
+            .as_deref()
+            .map(|pointer| read_limit("Provider limit", pointer))
+            .transpose()?;
+        let account_limit = probe
+            .account_limit_json_pointer
+            .as_deref()
+            .map(|pointer| read_limit("account limit", pointer))
+            .transpose()?;
+        let observed_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let ttl_ms: u64 = probe.ttl.as_millis().try_into().unwrap_or(u64::MAX);
+        let evidence = |tokens, source| ContextLimitEvidence {
+            tokens,
+            source,
+            revision: revision.clone(),
+            observed_at_ms: Some(observed_at_ms),
+            expires_at_ms: Some(observed_at_ms.saturating_add(ttl_ms)),
+            endpoint_fingerprint: None,
+        };
+        Ok(ModelCapabilities {
+            context_window: ContextWindowCapability {
+                model_ceiling: model_ceiling
+                    .map(|tokens| evidence(tokens, CapabilitySource::ProviderReported)),
+                provider_limit: provider_limit
+                    .map(|tokens| evidence(tokens, CapabilitySource::ProviderReported)),
+                deployment_limit: Some(evidence(tokens, CapabilitySource::DeploymentReported)),
+                account_limit: account_limit
+                    .map(|tokens| evidence(tokens, CapabilitySource::AccountReported)),
+                ..ContextWindowCapability::default()
+            },
+        })
+    }
+
+    fn count_features(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<(String, String, WireFeatures), ProviderError> {
+        let body = self.request_body(request, false)?;
+        // Template controls and tool schema are part of the scope. Credentials
+        // are not persisted or included; a new provider instance starts cold.
+        let mut controls = body.clone();
+        for k in ["messages", "input", "max_tokens", "max_output_tokens"] {
+            controls.as_object_mut().unwrap().remove(k);
+        }
+        let scope=format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"endpoint":self.config.endpoint(),"controls":controls,"encoder":"openai-wire/v2","usageSemantics":self.config.usage_input_semantics})).unwrap()));
+        let request_id = format!("{:x}", Sha256::digest(serde_json::to_vec(&body).unwrap()));
+        let messages = request
+            .messages
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ProviderError::new(e.to_string()))?;
+        let mut image_tokens =
+            crate::image_budget::estimate(&self.config.base_url, &self.config.model, &messages)
+                .map_err(|e| ProviderError::new(e.to_string()))?;
+        if image_tokens != 0 {
+            // request_body has not expanded content_blocks yet. Keep their
+            // accompanying text outside the learned text ratio so a large
+            // image caption cannot disappear behind text calibration.
+            for block in request.messages.iter().flat_map(|m| &m.content_blocks) {
+                if let xharness_attachments::ContentBlock::Text { text } = block {
+                    image_tokens = image_tokens
+                        .saturating_add(text.len() as u64)
+                        .saturating_add(64);
+                }
+            }
+        }
+        Ok((
+            scope,
+            request_id,
+            WireFeatures::from_body(&body, image_tokens),
+        ))
+    }
+
+    async fn multimodal_body(
+        &self,
+        request: &ProviderRequest,
+        token_count: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, ProviderError> {
+        if cancellation.is_cancelled() {
+            return Err(ProviderError::new("attachment request cancelled"));
+        }
+        let mut body = self.request_body(request, token_count)?;
+        let has_images = request.messages.iter().any(|m| {
+            m.content_blocks
+                .iter()
+                .any(|b| matches!(b, xharness_attachments::ContentBlock::Image { .. }))
+        });
+        if request.messages.iter().all(|m| m.content_blocks.is_empty()) {
+            return Ok(body);
+        }
+        if has_images && self.image_support == Some(false) {
+            return Err(ProviderError::new(
+                "selected model does not support image input; choose a vision model",
+            ));
+        }
+        let store = self.attachments.as_ref().ok_or_else(|| {
+            ProviderError::new("attachment resolver is not configured; image input cannot be sent")
+        })?;
+        let mut offset = 0usize;
+        let mut inserted = 0usize;
+        let mut tool_images = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut resolved = HashMap::new();
+        for (index, message) in request.messages.iter().enumerate() {
+            if !message.content_blocks.is_empty() {
+                if !matches!(
+                    message.role,
+                    xharness_core::Role::User | xharness_core::Role::Tool
+                ) {
+                    return Err(ProviderError::new(
+                        "image blocks are supported only on user messages",
+                    ));
+                }
+                let mut content = Vec::new();
+                for block in &message.content_blocks {
+                    use xharness_attachments::ContentBlock;
+                    match block {
+                        ContentBlock::Text { text } => content.push(json!({"type":if self.config.protocol==OpenAiProtocol::ChatCompletions {"text"} else {"input_text"},"text":text})),
+                        ContentBlock::File {attachment,name} => {
+                            let session=request.debug_scope.session_id.as_deref().unwrap_or(&attachment.session_id);
+                            let path=store.file_path(session,attachment).await.map_err(|e|ProviderError::new(e.to_string()))?.ok_or_else(||ProviderError::new("file read namespace unavailable"))?;
+                            content.push(json!({"type":if self.config.protocol==OpenAiProtocol::ChatCompletions {"text"} else {"input_text"},"text":format!("[file attachment: {}; {} bytes; read-only path: {}]",serde_json::to_string(name.as_deref().unwrap_or("attachment")).unwrap(),attachment.bytes,serde_json::to_string(&path).unwrap())}));
+                        }
+                        ContentBlock::Image { attachment } => {
+                            total_bytes=total_bytes.saturating_add(attachment.bytes);
+                            if total_bytes>xharness_core::MAX_REQUEST_IMAGE_BYTES { return Err(ProviderError::new("request images exceed 40 MiB; reduce image context")); }
+                            let key=(attachment.session_id.clone(),attachment.id.clone());
+                            if !resolved.contains_key(&key) {
+                                let item=tokio::select! {
+                                    _=cancellation.cancelled()=>return Err(ProviderError::new("attachment resolution cancelled")),
+                                    result=store.resolve(&attachment.session_id,&attachment.id)=> result.map_err(|e| ProviderError::new(e.to_string()))?,
+                                };
+                                if item.reference!=*attachment { return Err(ProviderError::new("attachment metadata mismatch; reattach the image")); }
+                                resolved.insert(key.clone(),item.data_url());
+                            }
+                            let url=&resolved[&key];
+                            content.push(match self.config.protocol {
+                                OpenAiProtocol::ChatCompletions=>json!({"type":"image_url","image_url":{"url":url}}),
+                                OpenAiProtocol::Responses=>json!({"type":"input_image","image_url":url}),
+                            });
+                        }
+                    }
+                }
+                if message.role == xharness_core::Role::Tool {
+                    tool_images.extend(content);
+                } else {
+                    let position = match self.config.protocol {
+                        OpenAiProtocol::ChatCompletions => index + inserted,
+                        OpenAiProtocol::Responses => offset,
+                    };
+                    encoded_item_mut(&mut body, self.config.protocol, position)?
+                        .insert("content".into(), Value::Array(content));
+                }
+            }
+            offset += crate::protocol::encode_response_message(message).len();
+            // Do not interleave user images into an unfinished assistant tool batch.
+            if !tool_images.is_empty()
+                && request
+                    .messages
+                    .get(index + 1)
+                    .is_none_or(|m| m.role != xharness_core::Role::Tool)
+            {
+                let item = json!({"role":"user","content":std::mem::take(&mut tool_images)});
+                let position = match self.config.protocol {
+                    OpenAiProtocol::ChatCompletions => index + inserted + 1,
+                    OpenAiProtocol::Responses => offset,
+                };
+                insert_encoded_item(&mut body, self.config.protocol, position, item)?;
+                match self.config.protocol {
+                    OpenAiProtocol::ChatCompletions => inserted += 1,
+                    OpenAiProtocol::Responses => offset += 1,
+                }
+            }
+        }
+        Ok(body)
+    }
+
+    fn request_body(
+        &self,
+        request: &ProviderRequest,
+        token_count: bool,
+    ) -> Result<Value, ProviderError> {
+        let mut body = if token_count {
+            build_openai_token_count_request(self.config.protocol, &self.config.model, request)
+        } else {
+            build_openai_request(self.config.protocol, &self.config.model, request)
+        };
+        match &self.config.reasoning {
+            Some(profile) => profile.apply(request.reasoning_effort.as_deref(), &mut body)?,
+            None if request.reasoning_effort.is_some() => {
+                return Err(ProviderError::new(
+                    "reasoning effort was selected for a model without a reasoning profile",
+                ));
+            }
+            None => {}
+        }
+        Ok(body)
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OpenAiProvider {
+    fn input_counter_failed(&self) {
+        if let Ok(mut at) = self.counter_retry_at.lock() {
+            *at = Some(Instant::now() + Duration::from_secs(60));
+        }
+    }
+
+    fn provider_name(&self) -> &str {
+        "openai-compatible"
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.config.model)
+    }
+
+    async fn capabilities(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<ModelCapabilities, ProviderError> {
+        let Some(probe) = self.config.capability_probe.as_ref() else {
+            return Ok(self.fallback_capabilities());
+        };
+        if let Some(cached) = self.capability_cache.lock().await.as_ref() {
+            if cached.expires_at > Instant::now() {
+                return Ok(cached.value.clone());
+            }
+        }
+        let capabilities = match self.probe_capabilities(probe, &cancellation).await {
+            Ok(capabilities) => capabilities,
+            Err(error) if self.config.context_window_fallback.is_some() => {
+                self.debug
+                    .record_lossy_with(
+                        "provider.openai",
+                        "capability.fallback",
+                        DebugScope::default(),
+                        || {
+                            serde_json::json!({
+                                "model": &self.config.model,
+                                "error": error.message,
+                                "source": "deployment_declared_fallback",
+                            })
+                        },
+                    )
+                    .await;
+                self.fallback_capabilities()
+            }
+            Err(error) => return Err(error),
+        };
+        *self.capability_cache.lock().await = Some(CachedCapabilities {
+            expires_at: Instant::now() + probe.ttl,
+            value: capabilities.clone(),
+        });
+        Ok(capabilities)
+    }
+
+    fn estimate_input_tokens(&self, request: &ProviderRequest) -> Option<ProviderInputTokenCount> {
+        let (scope, _, features) = self.count_features(request).ok()?;
+        self.calibration.estimate(&scope, &features)
+    }
+
+    async fn count_input_tokens(
+        &self,
+        request: &ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> Result<Option<ProviderInputTokenCount>, ProviderError> {
+        if self
+            .counter_retry_at
+            .lock()
+            .ok()
+            .is_some_and(|at| at.is_some_and(|t| t > Instant::now()))
+        {
+            return Ok(None);
+        }
+        if self.token_count_support.load(Ordering::Acquire) == TOKEN_COUNT_UNSUPPORTED {
+            return Ok(None);
+        }
+        let body = self.multimodal_body(request, true, &cancellation).await?;
+        self.trace(
+            &request.debug_scope,
+            "token_count.request",
+            || json!({"endpoint": self.config.token_count_endpoint(), "body": image_safe_trace(&body)}),
+        )
+        .await;
+        let request_builder = self
+            .client
+            .post(self.config.token_count_endpoint())
+            .bearer_auth(&self.config.api_key)
+            .json(&body);
+        let response = self
+            .send_request(
+                request_builder,
+                &cancellation,
+                "OpenAI input token count request",
+            )
+            .await?;
+        let status = response.status();
+        self.trace(
+            &request.debug_scope,
+            "token_count.response_status",
+            || json!({"status": status.as_u16()}),
+        )
+        .await;
+        if matches!(status.as_u16(), 404 | 405 | 501) {
+            self.token_count_support
+                .store(TOKEN_COUNT_UNSUPPORTED, Ordering::Release);
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let code = status.as_u16();
+            let body =
+                bounded_error_body(response, self.config.max_error_body_bytes, &cancellation)
+                    .await?;
+            let detail = if body.is_empty() {
+                format!("OpenAI input token count HTTP {code}")
+            } else {
+                format!("OpenAI input token count HTTP {code}: {body}")
+            };
+            return Err(ProviderError::http(code, detail));
+        }
+        let body =
+            bounded_error_body(response, self.config.max_error_body_bytes, &cancellation).await?;
+        self.trace(
+            &request.debug_scope,
+            "token_count.response_body",
+            || json!({"body": &body}),
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+            ProviderError::new(format!(
+                "invalid OpenAI input token count response: {error}"
+            ))
+        })?;
+        let input_tokens = value
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                ProviderError::new(
+                    "invalid OpenAI input token count response: missing input_tokens",
+                )
+            })?;
+        self.token_count_support
+            .store(TOKEN_COUNT_SUPPORTED, Ordering::Release);
+        Ok(Some(ProviderInputTokenCount::exact_request(
+            self.config.token_counter_id(),
+            input_tokens,
+        )))
+    }
+
+    async fn stream(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        let count_features = self.count_features(&request)?;
+        let calibration = self.calibration.clone();
+        let mut observation = NetworkObservation::new(&self.config.endpoint());
+        let body = self.multimodal_body(&request, false, &cancellation).await?;
+        self.trace(&request.debug_scope, "request", || {
+            json!({
+                "endpoint": self.config.endpoint(),
+                "protocol": format!("{:?}", self.config.protocol),
+                "body": image_safe_trace(&body),
+            })
+        })
+        .await;
+        let request_builder = self
+            .client
+            .post(self.config.endpoint())
+            .header(header::ACCEPT, "text/event-stream")
+            // Streaming compression buys little for token-sized SSE frames and
+            // makes a truncated intermediary response look like a codec error.
+            .header(header::ACCEPT_ENCODING, "identity")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .bearer_auth(&self.config.api_key)
+            .json(&body);
+        let response = self
+            .send_request(request_builder, &cancellation, "OpenAI request")
+            .await
+            .map_err(|error| observation.failure(error, "connect_or_headers"))?;
+
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| retry_after_ms(v, SystemTime::now()));
+        observation.request_id = response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("request-id"))
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| v.len() <= 128 && v.bytes().all(|b| b.is_ascii_graphic()))
+            .map(str::to_owned);
+        self.trace(
+            &request.debug_scope,
+            "response_status",
+            || json!({"status": status.as_u16()}),
+        )
+        .await;
+        if !status.is_success() {
+            let code = status.as_u16();
+            let body =
+                bounded_error_body(response, self.config.max_error_body_bytes, &cancellation)
+                    .await?;
+            self.trace(
+                &request.debug_scope,
+                "response_error",
+                || json!({"status": code, "body": &body}),
+            )
+            .await;
+            let detail = if body.is_empty() {
+                format!("OpenAI HTTP {code}")
+            } else {
+                format!("OpenAI HTTP {code}: {body}")
+            };
+            let mut error = observation.failure(ProviderError::http(code, detail), "http_status");
+            if error.is_context_overflow() {
+                calibration.invalidate(count_features.0.clone()).await;
+            }
+            error.retry_after_ms = retry_after;
+            return Err(error);
+        }
+
+        let protocol = self.config.protocol;
+        let usage_semantics = self.config.usage_input_semantics;
+        let max_sse_pending_bytes = self.config.max_sse_pending_bytes;
+        let max_sse_event_bytes = self.config.max_sse_event_bytes;
+        let debug = self.debug.clone();
+        let debug_scope = request.debug_scope.clone();
+        let output = async_stream::stream! {
+            let mut bytes = response.bytes_stream();
+            let mut parser = SseParser::with_limits(max_sse_pending_bytes, max_sse_event_bytes);
+            let mut normalizer = OpenAiStreamNormalizer::new(protocol).with_usage_semantics(usage_semantics);
+            let stream_started = Instant::now();
+            let mut received_chunks = 0_u64;
+            let mut received_bytes = 0_u64;
+            loop {
+                let next = tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    next = bytes.next() => next,
+                };
+                match next {
+                    Some(Ok(chunk)) => {
+                        observation.chunk(chunk.len());
+                        received_chunks = received_chunks.saturating_add(1);
+                        received_bytes = received_bytes.saturating_add(
+                            u64::try_from(chunk.len()).unwrap_or(u64::MAX),
+                        );
+                        debug.record_lossy_with(
+                            "provider.openai",
+                            "sse.chunk",
+                            debug_scope.clone(),
+                            || json!({
+                                "bytes": chunk.len(),
+                                "content": String::from_utf8_lossy(&chunk),
+                            }),
+                        ).await;
+                        match parser.feed_bytes(chunk, false) {
+                            Ok(events) => {
+                                for event in events {
+                                    match normalizer.consume(event) {
+                                        Ok(provider_events) => {
+                                            for provider_event in provider_events {
+                                                debug.record_lossy_with(
+                                                    "provider.openai",
+                                                    "stream.event",
+                                                    debug_scope.clone(),
+                                                    || provider_event_payload(&provider_event),
+                                                ).await;
+                                                if let ProviderEvent::Completed { usage: Some(usage), .. } = &provider_event {
+                                                    let actual=usage.input_tokens.saturating_add(usage.cache_read_tokens).saturating_add(usage.cache_write_tokens);
+                                                    calibration.observe(count_features.0.clone(),count_features.1.clone(),count_features.2.clone(),actual).await;
+                                                }
+                                                let terminal = matches!(provider_event, ProviderEvent::Completed { .. });
+                                                yield Ok(provider_event);
+                                                // The application terminal event owns completion;
+                                                // never turn a later transport close into another result.
+                                                if terminal { return; }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            yield Err(observation.failure(error, "protocol"));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                yield Err(observation.failure(error, "protocol"));
+                                return;
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let elapsed = stream_started.elapsed();
+                        let kind = reqwest_error_kind(&error);
+                        debug.record_lossy_with(
+                            "provider.openai",
+                            "stream.transport_error",
+                            debug_scope.clone(),
+                            || json!({
+                                "kind": kind,
+                                "elapsedMs": elapsed.as_millis(),
+                                "receivedChunks": received_chunks,
+                                "receivedBytes": received_bytes,
+                                "isTimeout": error.is_timeout(),
+                                "isConnect": error.is_connect(),
+                                "isDecode": error.is_decode(),
+                                "isBody": error.is_body(),
+                                "sourceChain": reqwest_error_source_chain(&error),
+                            }),
+                        ).await;
+                        yield Err(observation.failure(ProviderError::retryable(format!(
+                            "OpenAI stream interrupted after {} ({kind}; received {received_chunks} chunks / {received_bytes} bytes): {}",
+                            format_duration(elapsed),
+                            reqwest_error_summary(&error),
+                        )), kind));
+                        return;
+                    }
+                    None => break,
+                }
+            }
+
+            match parser.feed([], true) {
+                Ok(events) => {
+                    for event in events {
+                        match normalizer.consume(event) {
+                            Ok(provider_events) => {
+                                            for provider_event in provider_events {
+                                                debug.record_lossy_with(
+                                                    "provider.openai",
+                                                    "stream.event",
+                                                    debug_scope.clone(),
+                                                    || provider_event_payload(&provider_event),
+                                                ).await;
+                                                if let ProviderEvent::Completed { usage: Some(usage), .. } = &provider_event {
+                                                    let actual=usage.input_tokens.saturating_add(usage.cache_read_tokens).saturating_add(usage.cache_write_tokens);
+                                                    calibration.observe(count_features.0.clone(),count_features.1.clone(),count_features.2.clone(),actual).await;
+                                                }
+                                                let terminal = matches!(provider_event, ProviderEvent::Completed { .. });
+                                                yield Ok(provider_event);
+                                                // The application terminal event owns completion;
+                                                // never turn a later transport close into another result.
+                                                if terminal { return; }
+                                }
+                            }
+                            Err(error) => {
+                                yield Err(observation.failure(error, "protocol"));
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    yield Err(observation.failure(error, "protocol"));
+                    return;
+                }
+            }
+            if let Err(error) = normalizer.finish() {
+                yield Err(observation.failure(error, "protocol"));
+            }
+        };
+        Ok(Box::pin(output))
+    }
+}
+
+/// Only the origin is retained; URL credentials, path and query may contain secrets.
+struct NetworkObservation {
+    route: String,
+    started: Instant,
+    last_chunk: Option<Instant>,
+    chunks: u64,
+    bytes: u64,
+    request_id: Option<String>,
+}
+impl NetworkObservation {
+    fn new(endpoint: &str) -> Self {
+        let route = reqwest::Url::parse(endpoint)
+            .ok()
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|| "unknown".into());
+        Self {
+            route,
+            started: Instant::now(),
+            last_chunk: None,
+            chunks: 0,
+            bytes: 0,
+            request_id: None,
+        }
+    }
+    fn chunk(&mut self, bytes: usize) {
+        self.last_chunk = Some(Instant::now());
+        self.chunks = self.chunks.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+    fn failure(&self, mut error: ProviderError, kind: &str) -> ProviderError {
+        error.request_id = self.request_id.clone();
+        error.diagnostics = Some(Box::new(ProviderNetworkDiagnostics {
+            route: self.route.clone(),
+            kind: kind.into(),
+            elapsed_ms: duration_ms(self.started.elapsed()),
+            received_chunks: self.chunks,
+            received_bytes: self.bytes,
+            last_chunk_ago_ms: self.last_chunk.map(|at| duration_ms(at.elapsed())),
+            protocol_completed: false,
+        }));
+        error
+    }
+}
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+fn retry_after_ms(value: &str, now: SystemTime) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(
+            value
+                .parse::<u64>()
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1000),
+        );
+    }
+    httpdate::parse_http_date(value)
+        .ok()
+        .map(|at| duration_ms(at.duration_since(now).unwrap_or_default()))
+}
+
+// Inspect typed causes rather than locale/provider-specific error text.
+fn permanent_transport_source(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if error.downcast_ref::<rustls::Error>().is_some_and(|error| {
+            matches!(
+                error,
+                rustls::Error::InvalidCertificate(_)
+                    | rustls::Error::InvalidCertRevocationList(_)
+                    | rustls::Error::NoCertificatesPresented
+                    | rustls::Error::UnsupportedNameType
+                    | rustls::Error::PeerIncompatible(_)
+                    | rustls::Error::AlertReceived(
+                        rustls::AlertDescription::ProtocolVersion
+                            | rustls::AlertDescription::HandshakeFailure
+                            | rustls::AlertDescription::InsufficientSecurity
+                            | rustls::AlertDescription::UnsupportedExtension
+                            | rustls::AlertDescription::MissingExtension
+                            | rustls::AlertDescription::NoApplicationProtocol
+                            | rustls::AlertDescription::BadCertificate
+                            | rustls::AlertDescription::UnsupportedCertificate
+                            | rustls::AlertDescription::CertificateRevoked
+                            | rustls::AlertDescription::CertificateExpired
+                            | rustls::AlertDescription::CertificateUnknown
+                            | rustls::AlertDescription::UnknownCA
+                            | rustls::AlertDescription::AccessDenied
+                            | rustls::AlertDescription::CertificateRequired
+                    )
+            )
+        }) {
+            return true;
+        }
+        // io::Error::source can skip the wrapped error and expose only its
+        // source. rustls errors are leaves, so inspect get_ref explicitly.
+        source = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(|error| error.get_ref())
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| error.source());
+    }
+    false
+}
+
+fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "idle_timeout"
+    } else if error.is_connect() {
+        "connection"
+    } else if error.is_decode() {
+        // `Response::bytes_stream()` maps every lower-level response-body
+        // failure to reqwest's Decode kind, including HTTP/2 resets and an
+        // unexpected EOF. It does not imply malformed JSON or SSE.
+        "response_body"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
+    }
+}
+
+fn reqwest_error_summary(error: &reqwest::Error) -> String {
+    let kind = reqwest_error_kind(error);
+    let sources = reqwest_error_source_chain(error);
+    if sources.is_empty() {
+        format!("{kind}: {error}")
+    } else {
+        format!("{kind}: {sources}")
+    }
+}
+
+fn reqwest_error_source_chain(error: &reqwest::Error) -> String {
+    let mut sources = Vec::new();
+    let mut current = error.source();
+    while let Some(source) = current {
+        let text = source.to_string();
+        if sources.last() != Some(&text) {
+            sources.push(text);
+        }
+        if sources.len() == 6 {
+            break;
+        }
+        current = source.source();
+    }
+    sources.join(": ")
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() >= 1 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
+impl OpenAiProvider {
+    fn trace(
+        &self,
+        scope: &DebugScope,
+        event: &str,
+        payload: impl FnOnce() -> Value,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.debug
+            .record_lossy_with("provider.openai", event, scope.clone(), payload)
+    }
+}
+
+fn provider_event_payload(event: &ProviderEvent) -> Value {
+    match event {
+        ProviderEvent::TextDelta(delta) => json!({"type": "text_delta", "delta": delta}),
+        ProviderEvent::ReasoningDelta(delta) => {
+            json!({"type": "reasoning_delta", "delta": delta})
+        }
+        ProviderEvent::ToolCallDelta {
+            index,
+            id,
+            name,
+            arguments_delta,
+        } => json!({
+            "type": "tool_call_delta",
+            "index": index,
+            "id": id,
+            "name": name,
+            "argumentsDelta": arguments_delta,
+        }),
+        ProviderEvent::Completed {
+            finish_reason,
+            usage,
+            provider_items,
+        } => json!({
+            "type": "completed",
+            "finishReason": finish_reason,
+            "usage": usage,
+            "providerItems": provider_items,
+        }),
+    }
+}
+
+async fn bounded_error_body(
+    response: Response,
+    max_bytes: usize,
+    cancellation: &CancellationToken,
+) -> Result<String, ProviderError> {
+    let read_limit = max_bytes.saturating_add(1);
+    let mut body = Vec::with_capacity(max_bytes.min(4096));
+    let mut chunks = response.bytes_stream();
+    let mut truncated = false;
+    let mut read_failed = false;
+
+    while body.len() < read_limit {
+        let next = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(ProviderError::new("OpenAI error response read cancelled"));
+            }
+            next = chunks.next() => next,
+        };
+        match next {
+            Some(Ok(chunk)) => {
+                let remaining = read_limit - body.len();
+                let take = remaining.min(chunk.len());
+                body.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    truncated = true;
+                    break;
+                }
+            }
+            Some(Err(_)) => {
+                read_failed = true;
+                break;
+            }
+            None => break,
+        }
+    }
+    if body.len() > max_bytes {
+        body.truncate(max_bytes);
+        truncated = true;
+    }
+
+    let mut text = String::from_utf8_lossy(&body).into_owned();
+    if truncated {
+        text.push_str(" [truncated]");
+    } else if read_failed {
+        text.push_str(" [body read failed]");
+    }
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xharness_core::AgentMessage;
+
+    fn request(effort: Option<&str>) -> ProviderRequest {
+        ProviderRequest {
+            messages: vec![AgentMessage::user("hello")],
+            tools: Vec::new(),
+            step: 1,
+            reasoning_effort: effort.map(str::to_owned),
+            max_output_tokens: None,
+            debug_scope: Default::default(),
+        }
+    }
+
+    #[test]
+    fn encoded_message_mutations_reject_invalid_shapes_and_offsets() {
+        for (protocol, field) in [
+            (OpenAiProtocol::ChatCompletions, "messages"),
+            (OpenAiProtocol::Responses, "input"),
+        ] {
+            let mut body = json!({});
+            assert!(encoded_items_mut(&mut body, protocol)
+                .unwrap_err()
+                .message
+                .contains(field));
+            body[field] = json!({"not":"an array"});
+            assert!(encoded_items_mut(&mut body, protocol).is_err());
+
+            body[field] = json!([null]);
+            assert!(encoded_item_mut(&mut body, protocol, 0)
+                .unwrap_err()
+                .message
+                .contains("non-object"));
+            assert!(encoded_item_mut(&mut body, protocol, 1)
+                .unwrap_err()
+                .message
+                .contains("out of bounds"));
+            assert!(insert_encoded_item(&mut body, protocol, 2, json!({}))
+                .unwrap_err()
+                .message
+                .contains("out of bounds"));
+
+            body[field] = json!([{"role":"user"}]);
+            encoded_item_mut(&mut body, protocol, 0)
+                .unwrap()
+                .insert("content".into(), json!([{"type":"text","text":"hello"}]));
+            insert_encoded_item(&mut body, protocol, 1, json!({"role":"user"})).unwrap();
+            assert_eq!(body[field].as_array().unwrap().len(), 2);
+            assert_eq!(body[field][0]["content"][0]["text"], "hello");
+        }
+    }
+
+    #[test]
+    fn offline_recovery_encoder_matches_actual_rust_wire_features() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/token-calibration-wire-v2.json"
+        ))
+        .unwrap();
+        let value = &fixture["request"];
+        let request = ProviderRequest {
+            messages: serde_json::from_value(value["messages"].clone()).unwrap(),
+            tools: serde_json::from_value(value["tools"].clone()).unwrap(),
+            step: 1,
+            reasoning_effort: None,
+            max_output_tokens: Some(32000),
+            debug_scope: Default::default(),
+        };
+        let p = OpenAiProvider::new(OpenAiProviderConfig::new(
+            OpenAiProtocol::ChatCompletions,
+            "http://localhost:1234/v1",
+            "not-in-snapshot",
+            "fixture-model",
+        ))
+        .unwrap();
+        let (scope, id, features) = p.count_features(&request).unwrap();
+        assert_eq!(scope, fixture["expected"]["scope"]);
+        assert_eq!(id, fixture["expected"]["request_id"]);
+        assert_eq!(
+            serde_json::to_value(features).unwrap(),
+            fixture["expected"]["features"]
+        );
+    }
+
+    #[test]
+    fn calibration_scope_tracks_model_endpoint_tools_and_reasoning_not_output_limit() {
+        let profile = OpenAiReasoningProfile::new(
+            Some("off".into()),
+            [
+                ("off".into(), json!({"thinking":{"type":"disabled"}})),
+                ("high".into(), json!({"reasoning_effort":"high"})),
+            ],
+        )
+        .unwrap();
+        let config = OpenAiProviderConfig::new(
+            OpenAiProtocol::ChatCompletions,
+            "http://localhost:1234/v1",
+            "test",
+            "a",
+        )
+        .with_reasoning_profile(profile);
+        let p = OpenAiProvider::new(config.clone()).unwrap();
+        let mut r = request(None);
+        let base = p.count_features(&r).unwrap().0;
+        r.max_output_tokens = Some(4096);
+        assert_eq!(base, p.count_features(&r).unwrap().0);
+        r.reasoning_effort = Some("high".into());
+        assert_ne!(base, p.count_features(&r).unwrap().0);
+        r.reasoning_effort = None;
+        r.tools = vec![xharness_core::ToolDefinition {
+            name: "echo".into(),
+            description: "fixture".into(),
+            parameters: json!({"type":"object"}),
+        }];
+        assert_ne!(base, p.count_features(&r).unwrap().0);
+        let mut c = config.clone();
+        c.model = "b".into();
+        assert_ne!(
+            base,
+            OpenAiProvider::new(c)
+                .unwrap()
+                .count_features(&request(None))
+                .unwrap()
+                .0
+        );
+        let mut c = config.clone();
+        c.api_key = "rotated-secret".into();
+        assert_eq!(
+            base,
+            OpenAiProvider::new(c)
+                .unwrap()
+                .count_features(&request(None))
+                .unwrap()
+                .0
+        );
+        let mut c = config.clone();
+        c.protocol = OpenAiProtocol::Responses;
+        assert_ne!(
+            base,
+            OpenAiProvider::new(c)
+                .unwrap()
+                .count_features(&request(None))
+                .unwrap()
+                .0
+        );
+        let mut c = config.clone();
+        c.usage_input_semantics = crate::InputUsageSemantics::UncachedInput;
+        assert_ne!(
+            base,
+            OpenAiProvider::new(c)
+                .unwrap()
+                .count_features(&request(None))
+                .unwrap()
+                .0
+        );
+        let mut c = config;
+        c.base_url = "http://localhost:5678/v1".into();
+        assert_ne!(
+            base,
+            OpenAiProvider::new(c)
+                .unwrap()
+                .count_features(&request(None))
+                .unwrap()
+                .0
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_counter_cooldown_skips_network_without_disabling_local_estimate() {
+        let p = OpenAiProvider::new(OpenAiProviderConfig::new(
+            OpenAiProtocol::Responses,
+            "http://127.0.0.1:1/v1",
+            "test",
+            "a",
+        ))
+        .unwrap();
+        p.input_counter_failed();
+        assert!(p
+            .count_input_tokens(&request(None), CancellationToken::new())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(p.estimate_input_tokens(&request(None)).is_some());
+    }
+
+    #[test]
+    fn exact_model_reasoning_profile_maps_public_ids_to_wire_fragments() {
+        let profile = OpenAiReasoningProfile::new(
+            Some("high".to_owned()),
+            [
+                (
+                    "off".to_owned(),
+                    json!({"chat_template_kwargs": {"enable_thinking": false}}),
+                ),
+                ("high".to_owned(), json!({"reasoning_effort": "ultra"})),
+            ],
+        )
+        .unwrap();
+        let provider = OpenAiProvider::new(
+            OpenAiProviderConfig::new(
+                OpenAiProtocol::ChatCompletions,
+                "http://localhost/v1",
+                "",
+                "model",
+            )
+            .with_reasoning_profile(profile),
+        )
+        .unwrap();
+
+        let default_body = provider.request_body(&request(None), false).unwrap();
+        assert_eq!(default_body["reasoning_effort"], "ultra");
+
+        let off_body = provider.request_body(&request(Some("off")), false).unwrap();
+        assert_eq!(off_body["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(off_body.get("reasoning_effort").is_none());
+
+        let error = provider
+            .request_body(&request(Some("unknown")), false)
+            .unwrap_err();
+        assert!(error.message.contains("unsupported reasoning effort"));
+    }
+
+    #[test]
+    fn reasoning_profile_rejects_reserved_request_overrides() {
+        let error =
+            OpenAiReasoningProfile::new(None, [("bad".to_owned(), json!({"messages": []}))])
+                .unwrap_err();
+        assert!(error.message.contains("reserved field \"messages\""));
+    }
+}
+
+#[cfg(test)]
+mod network_metadata_tests {
+    use super::*;
+    #[test]
+    fn retry_after_seconds_dates_and_invalid_values() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(retry_after_ms(" 12 ", now), Some(12_000));
+        assert_eq!(retry_after_ms("0", now), Some(0));
+        assert_eq!(
+            retry_after_ms("99999999999999999999999999999", now),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            retry_after_ms(&httpdate::fmt_http_date(now + Duration::from_secs(7)), now),
+            Some(7000)
+        );
+        assert_eq!(
+            retry_after_ms(&httpdate::fmt_http_date(now - Duration::from_secs(7)), now),
+            Some(0)
+        );
+        for invalid in ["", "-1", "1.5", "next week", "+3"] {
+            assert_eq!(retry_after_ms(invalid, now), None);
+        }
+    }
+    #[test]
+    fn lightweight_diagnostics_never_include_url_credentials_or_contents() {
+        let mut observation = NetworkObservation::new(
+            "https://user:password@example.com:8443/private/key?token=secret#fragment",
+        );
+        observation.chunk(123);
+        let error = observation.failure(ProviderError::retryable("interrupted"), "response_body");
+        let diagnostic = error.diagnostics.unwrap();
+        assert_eq!(diagnostic.route, "https://example.com:8443");
+        assert_eq!(diagnostic.received_chunks, 1);
+        assert_eq!(diagnostic.received_bytes, 123);
+        assert!(diagnostic.last_chunk_ago_ms.is_some());
+        assert!(!diagnostic.protocol_completed);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tls_disconnect_tests {
+    use super::*;
+    use std::{
+        io::{BufRead, BufReader},
+        path::PathBuf,
+        process::{Child, Command, Stdio},
+    };
+    use xharness_core::{AgentMessage, LoopEngine, LoopEventKind, LoopRequest, LoopStatus};
+    struct Fixture {
+        child: Child,
+        directory: PathBuf,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+    #[tokio::test]
+    async fn real_tls_close_without_notify_is_bounded_and_never_replays_partial_output() {
+        for mode in ["before", "partial", "completed"] {
+            let dir = std::env::temp_dir().join(format!(
+                "xharness-tls-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let cert = dir.join("cert.pem");
+            let key = dir.join("key.pem");
+            // Do not inherit an OpenSSL/LibreSSL installation's x509 extensions.
+            // Keep leaf constraints and key usages consistent under strict TLS checks.
+            let cert_config = dir.join("openssl.cnf");
+            std::fs::write(&cert_config, "[req]\ndistinguished_name=dn\nx509_extensions=leaf\nprompt=no\n[dn]\nCN=localhost\n[leaf]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n").unwrap();
+            let generated = Command::new("openssl")
+                .args([
+                    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-config",
+                ])
+                .arg(&cert_config)
+                .arg("-keyout")
+                .arg(&key)
+                .arg("-out")
+                .arg(&cert)
+                .output()
+                .expect("TLS fixture requires openssl");
+            assert!(
+                generated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            let child = Command::new("python3")
+                .arg("-c")
+                .arg(include_str!("../tests/fixtures/tls_disconnect.py"))
+                .arg(&cert)
+                .arg(&key)
+                .arg(mode)
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("TLS fixture requires python3");
+            let mut fixture = Fixture {
+                child,
+                directory: dir,
+            };
+            let mut line = String::new();
+            BufReader::new(fixture.child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let port: u16 = line.trim().parse().expect("fixture address");
+            let config = OpenAiProviderConfig::new(
+                OpenAiProtocol::ChatCompletions,
+                format!("https://127.0.0.1:{port}/v1"),
+                "fixture-only",
+                "fixture",
+            );
+            let mut provider = OpenAiProvider::new(config).unwrap();
+            // Trust this fixture's certificate only; production TLS verification is unchanged.
+            provider.client = Client::builder()
+                .no_proxy()
+                .add_root_certificate(
+                    reqwest::Certificate::from_pem(&std::fs::read(cert).unwrap()).unwrap(),
+                )
+                .connect_timeout(Duration::from_secs(2))
+                .read_timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let mut request = LoopRequest::new(Arc::new(provider), vec![AgentMessage::user("go")]);
+            request.config.network_wait_enabled = false;
+            request.config.provider_retry_base_delay_ms = 10;
+            let mut run = LoopEngine.start(request);
+            let mut retries = 0;
+            let result = tokio::time::timeout(Duration::from_secs(8), async {
+                while let Some(event) = run.next().await {
+                    if matches!(event.kind, LoopEventKind::ModelRetry { .. }) {
+                        retries += 1;
+                    }
+                }
+                run.result().await
+            })
+            .await
+            .unwrap();
+            if mode == "partial" {
+                assert_eq!(result.status, LoopStatus::Completed, "{:?}", result.error);
+                assert_eq!(result.final_text, "partialrecovered");
+                assert_eq!(retries, 1);
+                assert!(result
+                    .messages
+                    .iter()
+                    .any(|message| message.interrupted && message.content == "partial"));
+            } else {
+                assert_eq!(
+                    result.status,
+                    LoopStatus::Completed,
+                    "{}: {:?}",
+                    mode,
+                    result.error
+                );
+                assert_eq!(result.final_text, "recovered");
+                assert_eq!(retries, usize::from(mode == "before"));
+            }
+        }
+    }
+}
+
+fn image_safe_trace(body: &Value) -> Value {
+    match body {
+        Value::String(s) if s.starts_with("data:image/") => {
+            json!({"redacted":"image payload","encodedBytes":s.len()})
+        }
+        Value::Array(items) => Value::Array(items.iter().map(image_safe_trace).collect()),
+        Value::Object(items) => Value::Object(
+            items
+                .iter()
+                .map(|(k, v)| (k.clone(), image_safe_trace(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod multimodal_tests {
+    use super::*;
+    use xharness_attachments::{AttachmentStore, ContentBlock, MemoryAttachmentStore, Upload};
+    use xharness_core::AgentMessage;
+    const PNG: &[u8] = include_bytes!("../../xharness-attachments/tests/fixtures/red-blue.png");
+    async fn fixture(protocol: OpenAiProtocol) -> (OpenAiProvider, ProviderRequest) {
+        let store = Arc::new(MemoryAttachmentStore::default());
+        let r = store
+            .put(
+                "s",
+                Upload {
+                    media_type: "image/png".into(),
+                    data: PNG.to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        let message = AgentMessage::user("").with_content_blocks(vec![
+            ContentBlock::Text {
+                text: "left?".into(),
+            },
+            ContentBlock::Image {
+                attachment: r.clone(),
+            },
+            ContentBlock::Text {
+                text: "right?".into(),
+            },
+            ContentBlock::Image { attachment: r },
+        ]);
+        let provider = OpenAiProvider::new(OpenAiProviderConfig::new(
+            protocol,
+            "http://127.0.0.1:1",
+            "",
+            "test",
+        ))
+        .unwrap()
+        .with_attachments(store);
+        (
+            provider,
+            ProviderRequest {
+                messages: vec![AgentMessage::system("test"), message],
+                tools: vec![],
+                step: 1,
+                reasoning_effort: None,
+                max_output_tokens: Some(128),
+                debug_scope: DebugScope::default(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn image_caption_allowance_is_not_scaled_by_the_text_ratio() {
+        use xharness_token::{ConservativeByteMeter, TokenBudget, TokenCountAccuracy, TokenGuard};
+
+        for protocol in [OpenAiProtocol::ChatCompletions, OpenAiProtocol::Responses] {
+            let (provider, mut request) = fixture(protocol).await;
+            let image = request.messages[1].content_blocks[1].clone();
+            for i in 0..8 {
+                request.messages = vec![AgentMessage::user(format!("{i} {}", "x".repeat(900_000)))];
+                let (scope, id, features) = provider.count_features(&request).unwrap();
+                provider
+                    .calibration
+                    .observe(scope, id, features, 225_000)
+                    .await;
+            }
+            let text = provider.estimate_input_tokens(&request).unwrap();
+            assert_eq!(text.accuracy, TokenCountAccuracy::Calibrated);
+            request
+                .messages
+                .push(AgentMessage::user("").with_content_blocks(vec![
+                    ContentBlock::Text {
+                        text: "c".repeat(900_000),
+                    },
+                    image,
+                ]));
+            let mixed = provider.estimate_input_tokens(&request).unwrap();
+            assert!(mixed.input_tokens >= text.input_tokens + 900_000 + 4096);
+            assert_eq!(mixed.accuracy, TokenCountAccuracy::Estimated);
+            let guard = TokenGuard::new(
+                Arc::new(ConservativeByteMeter),
+                TokenBudget::new(1_048_576, 65_536),
+            )
+            .unwrap();
+            assert!(guard.check_provider_count(&mixed).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn seventeen_small_images_are_not_a_hard_request_failure() {
+        for protocol in [OpenAiProtocol::ChatCompletions, OpenAiProtocol::Responses] {
+            let (provider, mut request) = fixture(protocol).await;
+            let image = request.messages[1].content_blocks[1].clone();
+            request.messages[1].content_blocks = vec![image; 17];
+            let body = provider
+                .multimodal_body(&request, false, &CancellationToken::new())
+                .await
+                .unwrap();
+            let key = if protocol == OpenAiProtocol::ChatCompletions {
+                "messages"
+            } else {
+                "input"
+            };
+            assert_eq!(body[key][1]["content"].as_array().unwrap().len(), 17);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_tool_output_follows_the_complete_tool_batch() {
+        for protocol in [OpenAiProtocol::ChatCompletions, OpenAiProtocol::Responses] {
+            let (p, mut request) = fixture(protocol).await;
+            let image = request
+                .messages
+                .iter()
+                .flat_map(|m| &m.content_blocks)
+                .find(|b| matches!(b, ContentBlock::Image { .. }))
+                .unwrap()
+                .clone();
+            request.messages = vec![
+                AgentMessage::user("inspect"),
+                AgentMessage::tool("a", "image output").with_content_blocks(vec![image]),
+                AgentMessage::tool("b", "second result"),
+                AgentMessage::user("continue"),
+            ];
+            let body = p
+                .multimodal_body(&request, false, &CancellationToken::new())
+                .await
+                .unwrap();
+            let rows = if protocol == OpenAiProtocol::ChatCompletions {
+                &body["messages"]
+            } else {
+                &body["input"]
+            };
+            assert_eq!(rows.as_array().unwrap().len(), 5);
+            if protocol == OpenAiProtocol::ChatCompletions {
+                assert_eq!(rows[1]["role"], "tool");
+                assert_eq!(rows[2]["role"], "tool");
+                assert!(rows[3]["content"][0]["image_url"]["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,"));
+            } else {
+                assert_eq!(rows[1]["type"], "function_call_output");
+                assert_eq!(rows[2]["type"], "function_call_output");
+                assert_eq!(rows[3]["content"][0]["type"], "input_image");
+            }
+            assert_eq!(rows[3]["role"], "user");
+        }
+    }
+    #[tokio::test]
+    async fn generic_file_is_a_verified_read_only_descriptor_not_fake_vision() {
+        let root = std::env::temp_dir().join(format!("xh-provider-file-{}", std::process::id()));
+        let store = Arc::new(xharness_attachments::FileAttachmentStore::new(&root).unwrap());
+        let r = store
+            .put_file(
+                "parent",
+                Upload {
+                    media_type: "text/plain".into(),
+                    data: b"hello file".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        for protocol in [OpenAiProtocol::ChatCompletions, OpenAiProtocol::Responses] {
+            let (_, mut request) = fixture(protocol).await;
+            request.debug_scope.session_id = Some("child".into());
+            request.messages = vec![AgentMessage::user("").with_content_blocks(vec![
+                ContentBlock::File {
+                    attachment: r.clone(),
+                    name: Some("note.txt".into()),
+                },
+            ])];
+            let p = OpenAiProvider::new(OpenAiProviderConfig::new(
+                protocol,
+                "http://127.0.0.1:1",
+                "",
+                "test",
+            ))
+            .unwrap()
+            .with_attachments(store.clone())
+            .with_image_support(Some(false));
+            let body = p
+                .multimodal_body(&request, false, &CancellationToken::new())
+                .await
+                .unwrap();
+            let rows = if protocol == OpenAiProtocol::ChatCompletions {
+                &body["messages"]
+            } else {
+                &body["input"]
+            };
+            assert!(rows[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("read-only path"));
+            assert!(!body.to_string().contains("base64"));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[tokio::test]
+    async fn both_protocols_and_token_count_send_ordered_real_images() {
+        for protocol in [OpenAiProtocol::ChatCompletions, OpenAiProtocol::Responses] {
+            let (p, request) = fixture(protocol).await;
+            for counting in [false, true] {
+                let wire = p
+                    .multimodal_body(&request, counting, &CancellationToken::new())
+                    .await
+                    .unwrap();
+                let key = if protocol == OpenAiProtocol::ChatCompletions {
+                    "messages"
+                } else {
+                    "input"
+                };
+                let content = &wire[key][1]["content"];
+                assert_eq!(content.as_array().unwrap().len(), 4);
+                assert_eq!(content[0]["text"], "left?");
+                assert_eq!(content[2]["text"], "right?");
+                let url = if protocol == OpenAiProtocol::ChatCompletions {
+                    content[1]["image_url"]["url"].as_str()
+                } else {
+                    content[1]["image_url"].as_str()
+                }
+                .unwrap();
+                assert!(url.starts_with("data:image/png;base64,"));
+                assert!(!image_safe_trace(&wire)
+                    .to_string()
+                    .contains("data:image/png;base64,"));
+                assert!(!serde_json::to_string(&request.messages)
+                    .unwrap()
+                    .contains("base64"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn unsupported_missing_tampered_and_cancelled_fail_without_text_fallback() {
+        let (p, mut r) = fixture(OpenAiProtocol::ChatCompletions).await;
+        let p = p.with_image_support(Some(false));
+        assert!(p
+            .multimodal_body(&r, false, &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .message
+            .contains("does not support"));
+        let p = p.with_image_support(None);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        // Removing the resolver must never silently flatten a multimodal message.
+        let missing = OpenAiProvider::new((*p.config).clone()).unwrap();
+        assert!(missing
+            .multimodal_body(&r, false, &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .message
+            .contains("resolver"));
+        if let ContentBlock::Image { attachment } = &mut r.messages[1].content_blocks[1] {
+            attachment.session_id = "foreign".into();
+        }
+        assert!(p
+            .multimodal_body(&r, false, &CancellationToken::new())
+            .await
+            .is_err());
+        assert!(p.multimodal_body(&r, false, &cancel).await.is_err());
+    }
+    #[tokio::test]
+    async fn responses_image_offset_preserves_tool_and_opaque_reasoning_replay() {
+        let (p, mut r) = fixture(OpenAiProtocol::Responses).await;
+        let mut assistant = AgentMessage::assistant("");
+        assistant.provider_items = vec![
+            json!({"type":"reasoning","id":"opaque"}),
+            json!({"type":"function_call","call_id":"c","name":"read","arguments":"{}"}),
+        ];
+        r.messages.insert(1, assistant);
+        r.messages.insert(2, AgentMessage::tool("c", "ok"));
+        let body = p
+            .multimodal_body(&r, false, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(body["input"][1]["id"], "opaque");
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+        assert_eq!(body["input"][4]["content"][1]["type"], "input_image");
+    }
+}
+
+#[cfg(test)]
+mod network_wait_certificate_tests {
+    use super::*;
+    #[test]
+    fn permanent_peer_alerts_stop_network_wait_but_temporary_alerts_do_not() {
+        use rustls::AlertDescription::*;
+        for alert in [
+            ProtocolVersion,
+            HandshakeFailure,
+            InsufficientSecurity,
+            UnsupportedExtension,
+            MissingExtension,
+            NoApplicationProtocol,
+            BadCertificate,
+            UnsupportedCertificate,
+            CertificateRevoked,
+            CertificateExpired,
+            CertificateUnknown,
+            UnknownCA,
+            AccessDenied,
+            CertificateRequired,
+        ] {
+            let error = rustls::Error::AlertReceived(alert);
+            assert!(permanent_transport_source(&error), "{alert:?}");
+            let nested = std::io::Error::other(error);
+            assert!(permanent_transport_source(&nested), "nested {alert:?}");
+        }
+        for alert in [InternalError, CloseNotify, UserCanceled, Unknown(255)] {
+            assert!(
+                !permanent_transport_source(&rustls::Error::AlertReceived(alert)),
+                "{alert:?}"
+            );
+        }
+        assert!(!permanent_transport_source(&rustls::Error::General(
+            "EOF".into()
+        )));
+    }
+    #[test]
+    fn permanent_tls_failures_are_not_treated_as_a_network_outage() {
+        assert!(permanent_transport_source(
+            &rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+        ));
+        assert!(permanent_transport_source(
+            &rustls::Error::NoCertificatesPresented
+        ));
+        assert!(!permanent_transport_source(&std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection cut"
+        )));
+        assert!(!permanent_transport_source(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "offline"
+        )));
+    }
+}
+
+#[cfg(test)]
+mod image_budget_tests;

@@ -1,0 +1,1047 @@
+//! Provider-neutral token metering and hard context-window admission.
+//!
+//! Exact provider/model tokenizers can implement [`TokenMeter`]. Deployments
+//! without one may use [`ConservativeByteMeter`], whose UTF-8/JSON byte count
+//! intentionally overestimates ordinary BPE token counts rather than risking
+//! an HTTP request that the model server must reject.
+
+mod calibration;
+pub use calibration::{Calibration, WireFeatures, MAX_CALIBRATION_BYTES};
+
+use std::{fmt, sync::Arc};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Complete provider-neutral material whose protocol serialization consumes
+/// context. System messages are separate so diagnostics explain the budget.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TokenEstimateRequest {
+    pub provider: String,
+    pub model: Option<String>,
+    pub system_messages: Vec<Value>,
+    pub conversation_messages: Vec<Value>,
+    pub tools: Vec<Value>,
+}
+
+/// Disjoint token estimate buckets.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenBreakdown {
+    pub system_tokens: u64,
+    pub message_tokens: u64,
+    pub tool_tokens: u64,
+    pub protocol_tokens: u64,
+    pub total_input_tokens: u64,
+}
+
+/// Display-only provenance supplied by the owning conversation journal.
+/// A provider role or model-authored text cannot establish human authorship.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContextMessageOrigin {
+    Human,
+    AgentReport,
+    RuntimeContext,
+    Checkpoint,
+    #[default]
+    Unknown,
+}
+
+/// Display-only composition of one prepared request. Provider counters return
+/// one total; category shares remain local estimates, not tokenizer readings.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextComposition {
+    /// Version 2 separates human authorship from the provider's user role.
+    #[serde(default)]
+    pub attribution_version: u32,
+    pub system_tokens: u64,
+    pub user_tokens: u64,
+    #[serde(default)]
+    pub agent_report_tokens: u64,
+    #[serde(default)]
+    pub runtime_context_tokens: u64,
+    #[serde(default)]
+    pub checkpoint_tokens: u64,
+    #[serde(default)]
+    pub unattributed_tokens: u64,
+    pub assistant_tokens: u64,
+    pub tool_result_tokens: u64,
+    pub tool_definition_tokens: u64,
+    pub protocol_tokens: u64,
+    pub total_input_tokens: u64,
+    pub accuracy: TokenCountAccuracy,
+}
+
+impl ContextComposition {
+    /// Without journal provenance user-role inputs are explicitly unattributed.
+    pub fn estimate(
+        request: &TokenEstimateRequest,
+        total_input_tokens: u64,
+    ) -> Result<Self, TokenMeterError> {
+        Self::estimate_with_origins(request, total_input_tokens, &[])
+    }
+
+    /// Origins align with conversation_messages, excluding system messages.
+    /// Missing or misaligned provenance cannot classify an input as human.
+    /// Largest-remainder allocation preserves the original request total.
+    pub fn estimate_with_origins(
+        request: &TokenEstimateRequest,
+        total_input_tokens: u64,
+        origins: &[ContextMessageOrigin],
+    ) -> Result<Self, TokenMeterError> {
+        let mut weights = [0_u64; 10];
+        for message in &request.system_messages {
+            weights[0] = weights[0]
+                .saturating_add(encoded_len(message)?)
+                .saturating_add(image_estimate(std::slice::from_ref(message))?)
+                .saturating_add(8);
+        }
+        for (index, message) in request.conversation_messages.iter().enumerate() {
+            let origin = if origins.len() == request.conversation_messages.len() {
+                origins[index]
+            } else {
+                ContextMessageOrigin::Unknown
+            };
+            let bucket = match message.get("role").and_then(Value::as_str) {
+                Some("user") => match origin {
+                    ContextMessageOrigin::Human => 1,
+                    ContextMessageOrigin::AgentReport => 6,
+                    ContextMessageOrigin::RuntimeContext => 7,
+                    ContextMessageOrigin::Checkpoint => 8,
+                    ContextMessageOrigin::Unknown => 9,
+                },
+                Some("tool") => 3,
+                Some("system") => 0,
+                Some("assistant") => 2,
+                _ => 9,
+            };
+            weights[bucket] = weights[bucket]
+                .saturating_add(encoded_len(message)?)
+                .saturating_add(image_estimate(std::slice::from_ref(message))?)
+                .saturating_add(8);
+        }
+        for tool in &request.tools {
+            weights[4] = weights[4]
+                .saturating_add(encoded_len(tool)?)
+                .saturating_add(12);
+        }
+        weights[5] = encoded_len(&(&request.provider, &request.model))?.saturating_add(32);
+        let weight_total: u128 = weights.iter().map(|weight| u128::from(*weight)).sum();
+        let mut allocated = [0_u64; 10];
+        if weight_total == 0 {
+            allocated[5] = total_input_tokens;
+        } else {
+            let mut remainders = [(0_u128, 0_usize); 10];
+            let mut allocated_total = 0_u64;
+            for (index, weight) in weights.iter().enumerate() {
+                let numerator = u128::from(*weight) * u128::from(total_input_tokens);
+                allocated[index] = numerator.checked_div(weight_total).unwrap_or(0) as u64;
+                allocated_total = allocated_total.saturating_add(allocated[index]);
+                remainders[index] = (numerator % weight_total, index);
+            }
+            remainders.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+            for (_, index) in remainders
+                .into_iter()
+                .take(total_input_tokens.saturating_sub(allocated_total) as usize)
+            {
+                allocated[index] += 1;
+            }
+        }
+        Ok(Self {
+            attribution_version: 2,
+            system_tokens: allocated[0],
+            user_tokens: allocated[1],
+            agent_report_tokens: allocated[6],
+            runtime_context_tokens: allocated[7],
+            checkpoint_tokens: allocated[8],
+            unattributed_tokens: allocated[9],
+            assistant_tokens: allocated[2],
+            tool_result_tokens: allocated[3],
+            tool_definition_tokens: allocated[4],
+            protocol_tokens: allocated[5],
+            total_input_tokens,
+            accuracy: TokenCountAccuracy::Estimated,
+        })
+    }
+}
+
+/// Confidence of the token count used for one admission decision.
+///
+/// Exact request counts are produced by an endpoint that accepts the same
+/// structured request as generation and therefore includes chat templates,
+/// tool schemas and protocol framing. Exact tokenizer counts operate on a
+/// provider-rendered prompt. Estimated counts are local fallbacks only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenCountAccuracy {
+    ExactRequest,
+    ExactTokenizer,
+    Calibrated,
+    #[default]
+    Estimated,
+}
+
+/// Provider-supplied input count for the complete prepared request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderInputTokenCount {
+    pub counter: String,
+    pub input_tokens: u64,
+    pub accuracy: TokenCountAccuracy,
+}
+
+impl ProviderInputTokenCount {
+    pub fn exact_request(counter: impl Into<String>, input_tokens: u64) -> Self {
+        Self {
+            counter: counter.into(),
+            input_tokens,
+            accuracy: TokenCountAccuracy::ExactRequest,
+        }
+    }
+}
+
+impl TokenBreakdown {
+    fn recompute_total(&mut self) {
+        self.total_input_tokens = self
+            .system_tokens
+            .saturating_add(self.message_tokens)
+            .saturating_add(self.tool_tokens)
+            .saturating_add(self.protocol_tokens);
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TokenMeterError {
+    #[error("token meter failed: {0}")]
+    Failed(String),
+}
+
+/// One tokenizer/estimator implementation. Implementations must return
+/// disjoint buckets and a total equal to their saturating sum.
+pub trait TokenMeter: Send + Sync + 'static {
+    fn id(&self) -> &str;
+
+    fn accuracy(&self) -> TokenCountAccuracy {
+        TokenCountAccuracy::Estimated
+    }
+
+    fn estimate(&self, request: &TokenEstimateRequest) -> Result<TokenBreakdown, TokenMeterError>;
+}
+
+/// Safe fallback: serialized UTF-8 bytes plus explicit message/tool framing.
+/// For byte-level BPE families, a token consumes at least one encoded byte;
+/// therefore this is deliberately pessimistic rather than falsely precise.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConservativeByteMeter;
+
+impl TokenMeter for ConservativeByteMeter {
+    fn id(&self) -> &str {
+        "conservative-utf8-json-bytes/v1"
+    }
+
+    fn estimate(&self, request: &TokenEstimateRequest) -> Result<TokenBreakdown, TokenMeterError> {
+        let mut breakdown = TokenBreakdown {
+            system_tokens: encoded_len(&request.system_messages)?,
+            message_tokens: encoded_len(&request.conversation_messages)?
+                .saturating_add(image_estimate(&request.conversation_messages)?),
+            tool_tokens: encoded_len(&request.tools)?,
+            // Account for role/message delimiters and the streaming request
+            // envelope even if an adapter's JSON happens to be very compact.
+            protocol_tokens: encoded_len(&(&request.provider, &request.model))?
+                .saturating_add(32)
+                .saturating_add((request.system_messages.len() as u64).saturating_mul(8))
+                .saturating_add((request.conversation_messages.len() as u64).saturating_mul(8))
+                .saturating_add((request.tools.len() as u64).saturating_mul(12)),
+            total_input_tokens: 0,
+        };
+        breakdown.recompute_total();
+        Ok(breakdown)
+    }
+}
+
+/// Conservative patch-based fallback, not a universal tokenizer bound. Exact
+/// provider counts supersede this. Metadata is verified by AttachmentStore.
+pub fn image_estimate(messages: &[Value]) -> Result<u64, TokenMeterError> {
+    let mut tokens = 0u64;
+    for message in messages {
+        if let Some(blocks) = message.get("content_blocks").and_then(Value::as_array) {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some("image") {
+                    continue;
+                }
+                let a = &block["attachment"];
+                let w = a["width"]
+                    .as_u64()
+                    .filter(|w| *w > 0)
+                    .ok_or_else(|| TokenMeterError::Failed("image width unavailable".into()))?;
+                let h = a["height"]
+                    .as_u64()
+                    .filter(|h| *h > 0)
+                    .ok_or_else(|| TokenMeterError::Failed("image height unavailable".into()))?;
+                tokens = tokens.saturating_add(
+                    w.div_ceil(16)
+                        .saturating_mul(h.div_ceil(16))
+                        .saturating_mul(4)
+                        .max(4096),
+                );
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+fn encoded_len(value: &impl Serialize) -> Result<u64, TokenMeterError> {
+    let len = serde_json::to_vec(value)
+        .map_err(|error| TokenMeterError::Failed(error.to_string()))?
+        .len();
+    Ok(u64::try_from(len).unwrap_or(u64::MAX))
+}
+
+/// Hard context admission configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenBudget {
+    pub context_window_tokens: u64,
+    /// Preferred per-request generation ceiling. The guard selects this value
+    /// while enough context remains and shrinks it only when doing so avoids an
+    /// unnecessary compaction/rejection.
+    pub reserved_output_tokens: u64,
+    /// Smallest generation region that may be admitted. Requests below this
+    /// reserve are rejected so the caller can compact before model I/O.
+    pub minimum_output_tokens: u64,
+    pub safety_margin_tokens: u64,
+}
+
+impl TokenBudget {
+    pub fn new(context_window_tokens: u64, reserved_output_tokens: u64) -> Self {
+        Self {
+            context_window_tokens,
+            reserved_output_tokens,
+            minimum_output_tokens: reserved_output_tokens,
+            safety_margin_tokens: 1_024,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), TokenBudgetError> {
+        if self.context_window_tokens == 0 {
+            return Err(TokenBudgetError::Invalid(
+                "context_window_tokens must be greater than zero".to_owned(),
+            ));
+        }
+        if self.reserved_output_tokens == 0 {
+            return Err(TokenBudgetError::Invalid(
+                "reserved_output_tokens must be greater than zero".to_owned(),
+            ));
+        }
+        if self.minimum_output_tokens == 0 {
+            return Err(TokenBudgetError::Invalid(
+                "minimum_output_tokens must be greater than zero".to_owned(),
+            ));
+        }
+        if self.minimum_output_tokens > self.reserved_output_tokens {
+            return Err(TokenBudgetError::Invalid(format!(
+                "minimum output reserve ({}) must not exceed target output ({})",
+                self.minimum_output_tokens, self.reserved_output_tokens
+            )));
+        }
+        let reserved = self
+            .minimum_output_tokens
+            .saturating_add(self.safety_margin_tokens);
+        if reserved >= self.context_window_tokens {
+            return Err(TokenBudgetError::Invalid(format!(
+                "output reserve ({}) plus safety margin ({}) must be smaller than context window ({})",
+                self.minimum_output_tokens,
+                self.safety_margin_tokens,
+                self.context_window_tokens
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn available_input_tokens(&self) -> u64 {
+        self.context_window_tokens
+            .saturating_sub(self.minimum_output_tokens)
+            .saturating_sub(self.safety_margin_tokens)
+    }
+
+    /// Resolve the largest safe output ceiling for one priced request. The
+    /// selected value never exceeds the configured target and never falls
+    /// below the minimum reserve accepted by admission.
+    pub fn resolve_output_tokens(&self, input_tokens: u64) -> u64 {
+        self.reserved_output_tokens.min(
+            self.context_window_tokens
+                .saturating_sub(input_tokens)
+                .saturating_sub(self.safety_margin_tokens),
+        )
+    }
+}
+
+/// Successful budget check recorded beside the prepared request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenBudgetReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    pub meter: String,
+    #[serde(default)]
+    pub accuracy: TokenCountAccuracy,
+    pub context_window_tokens: u64,
+    pub reserved_output_tokens: u64,
+    pub minimum_output_tokens: u64,
+    pub selected_output_tokens: u64,
+    pub safety_margin_tokens: u64,
+    pub available_input_tokens: u64,
+    pub estimate: TokenBreakdown,
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TokenBudgetError {
+    #[error("invalid token budget: {0}")]
+    Invalid(String),
+    #[error(transparent)]
+    Meter(#[from] TokenMeterError),
+    #[error(
+        "estimated request input ({estimated_input_tokens} tokens) exceeds available input budget ({available_input_tokens}); context={context_window_tokens}, output_reserve={reserved_output_tokens}, minimum_output={minimum_output_tokens}, safety_margin={safety_margin_tokens}"
+    )]
+    Exceeded {
+        estimated_input_tokens: u64,
+        available_input_tokens: u64,
+        context_window_tokens: u64,
+        reserved_output_tokens: u64,
+        minimum_output_tokens: u64,
+        safety_margin_tokens: u64,
+    },
+}
+
+/// Cloneable meter + hard budget supplied to a prepared loop.
+#[derive(Clone)]
+pub struct TokenGuard {
+    meter: Arc<dyn TokenMeter>,
+    budget: TokenBudget,
+    counter_timeout: std::time::Duration,
+    allow_counter_fallback: bool,
+    allow_provider_estimate: bool,
+}
+
+impl TokenGuard {
+    pub fn new(meter: Arc<dyn TokenMeter>, budget: TokenBudget) -> Result<Self, TokenBudgetError> {
+        budget.validate()?;
+        Ok(Self {
+            meter,
+            budget,
+            counter_timeout: std::time::Duration::from_secs(10),
+            allow_counter_fallback: true,
+            allow_provider_estimate: false,
+        })
+    }
+
+    /// A bounded optional counter must not block generation indefinitely.
+    /// Strict hosts may disable transient fallback without changing the adapter.
+    pub fn with_counter_policy(
+        mut self,
+        timeout: std::time::Duration,
+        allow_fallback: bool,
+    ) -> Self {
+        self.counter_timeout = timeout.max(std::time::Duration::from_millis(1));
+        self.allow_counter_fallback = allow_fallback;
+        self
+    }
+    pub fn counter_timeout(&self) -> std::time::Duration {
+        self.counter_timeout
+    }
+    pub fn allows_counter_fallback(&self) -> bool {
+        self.allow_counter_fallback
+    }
+    /// An explicitly supplied local meter is not silently overridden by an adapter estimate.
+    pub fn with_provider_estimate(mut self, allow: bool) -> Self {
+        self.allow_provider_estimate = allow;
+        self
+    }
+    pub fn allows_provider_estimate(&self) -> bool {
+        self.allow_provider_estimate
+    }
+
+    pub fn conservative(budget: TokenBudget) -> Result<Self, TokenBudgetError> {
+        Self::new(Arc::new(ConservativeByteMeter), budget).map(|g| g.with_provider_estimate(true))
+    }
+
+    pub fn check(
+        &self,
+        request: &TokenEstimateRequest,
+    ) -> Result<TokenBudgetReport, TokenBudgetError> {
+        let mut estimate = self.meter.estimate(request)?;
+        estimate.recompute_total();
+        let available_input_tokens = self.budget.available_input_tokens();
+        if estimate.total_input_tokens > available_input_tokens {
+            return Err(TokenBudgetError::Exceeded {
+                estimated_input_tokens: estimate.total_input_tokens,
+                available_input_tokens,
+                context_window_tokens: self.budget.context_window_tokens,
+                reserved_output_tokens: self.budget.reserved_output_tokens,
+                minimum_output_tokens: self.budget.minimum_output_tokens,
+                safety_margin_tokens: self.budget.safety_margin_tokens,
+            });
+        }
+        Ok(TokenBudgetReport {
+            fallback_reason: None,
+            meter: self.meter.id().to_owned(),
+            accuracy: self.meter.accuracy(),
+            context_window_tokens: self.budget.context_window_tokens,
+            reserved_output_tokens: self.budget.reserved_output_tokens,
+            minimum_output_tokens: self.budget.minimum_output_tokens,
+            selected_output_tokens: self
+                .budget
+                .resolve_output_tokens(estimate.total_input_tokens),
+            safety_margin_tokens: self.budget.safety_margin_tokens,
+            available_input_tokens,
+            estimate,
+        })
+    }
+
+    /// Enforce the same hard budget using a count supplied by the selected
+    /// provider. Its accuracy is retained; even a provider count endpoint does
+    /// not expose the system/message/tool bucket breakdown; it is placed in
+    /// `message_tokens` so the disjoint-total invariant remains true.
+    pub fn check_provider_count(
+        &self,
+        count: &ProviderInputTokenCount,
+    ) -> Result<TokenBudgetReport, TokenBudgetError> {
+        let estimate = TokenBreakdown {
+            message_tokens: count.input_tokens,
+            total_input_tokens: count.input_tokens,
+            ..TokenBreakdown::default()
+        };
+        let available_input_tokens = self.budget.available_input_tokens();
+        if count.input_tokens > available_input_tokens {
+            return Err(TokenBudgetError::Exceeded {
+                estimated_input_tokens: count.input_tokens,
+                available_input_tokens,
+                context_window_tokens: self.budget.context_window_tokens,
+                reserved_output_tokens: self.budget.reserved_output_tokens,
+                minimum_output_tokens: self.budget.minimum_output_tokens,
+                safety_margin_tokens: self.budget.safety_margin_tokens,
+            });
+        }
+        Ok(TokenBudgetReport {
+            fallback_reason: None,
+            meter: count.counter.clone(),
+            accuracy: count.accuracy,
+            context_window_tokens: self.budget.context_window_tokens,
+            reserved_output_tokens: self.budget.reserved_output_tokens,
+            minimum_output_tokens: self.budget.minimum_output_tokens,
+            selected_output_tokens: self.budget.resolve_output_tokens(count.input_tokens),
+            safety_margin_tokens: self.budget.safety_margin_tokens,
+            available_input_tokens,
+            estimate,
+        })
+    }
+
+    /// Rebind an auxiliary reserve while preserving meter and counter policy.
+    pub fn with_budget(&self, budget: TokenBudget) -> Result<Self, TokenBudgetError> {
+        budget.validate()?;
+        let mut guard = self.clone();
+        guard.budget = budget;
+        Ok(guard)
+    }
+
+    pub fn budget(&self) -> &TokenBudget {
+        &self.budget
+    }
+
+    /// Bind the same meter and output policy to a smaller session-selected
+    /// context window. The provider/deployment maximum is validated by the
+    /// caller; this method only enforces the budget's internal safety rules.
+    pub fn with_context_window(
+        &self,
+        context_window_tokens: u64,
+    ) -> Result<Self, TokenBudgetError> {
+        let mut budget = self.budget.clone();
+        budget.context_window_tokens = context_window_tokens;
+        Self::new(Arc::clone(&self.meter), budget).map(|g| {
+            g.with_counter_policy(self.counter_timeout, self.allow_counter_fallback)
+                .with_provider_estimate(self.allow_provider_estimate)
+        })
+    }
+}
+
+impl fmt::Debug for TokenGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenGuard")
+            .field("meter", &self.meter.id())
+            .field("budget", &self.budget)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_composition_is_disjoint_and_uses_prepared_roles() {
+        let request = TokenEstimateRequest {
+            provider: "example".into(),
+            model: Some("model".into()),
+            system_messages: vec![json!({"role":"system","content":"rules"})],
+            conversation_messages: vec![
+                json!({"role":"user","content":"question"}),
+                json!({"role":"assistant","content":"answer","tool_calls":[{"name":"read"}]}),
+                json!({"role":"tool","content":"result"}),
+            ],
+            tools: vec![json!({"name":"read","parameters":{"type":"object"}})],
+        };
+        let composition = ContextComposition::estimate(&request, 1_001).unwrap();
+        assert_eq!(composition.total_input_tokens, 1_001);
+        assert_eq!(composition.accuracy, TokenCountAccuracy::Estimated);
+        assert!(composition.system_tokens > 0);
+        assert_eq!(composition.user_tokens, 0);
+        assert!(composition.unattributed_tokens > 0);
+        assert!(composition.assistant_tokens > 0);
+        assert!(composition.tool_result_tokens > 0);
+        assert!(composition.tool_definition_tokens > 0);
+        assert_eq!(
+            composition.system_tokens
+                + composition.unattributed_tokens
+                + composition.user_tokens
+                + composition.assistant_tokens
+                + composition.tool_result_tokens
+                + composition.tool_definition_tokens
+                + composition.protocol_tokens,
+            1_001
+        );
+        assert_eq!(
+            ContextComposition::estimate(&request, 0)
+                .unwrap()
+                .total_input_tokens,
+            0
+        );
+    }
+    #[test]
+    fn composition_separates_human_reports_runtime_and_checkpoints() {
+        use ContextMessageOrigin::{AgentReport, Checkpoint, Human, RuntimeContext, Unknown};
+        let origins = [Human, AgentReport, RuntimeContext, Checkpoint, Unknown];
+        let request = TokenEstimateRequest {
+            conversation_messages: origins
+                .iter()
+                .map(|_| json!({"role":"user","content":"same protocol role and text"}))
+                .collect(),
+            ..TokenEstimateRequest::default()
+        };
+        for total in [0, 1, 9, 105_139, u64::MAX] {
+            let composition =
+                ContextComposition::estimate_with_origins(&request, total, &origins).unwrap();
+            let values = [
+                composition.system_tokens,
+                composition.user_tokens,
+                composition.agent_report_tokens,
+                composition.runtime_context_tokens,
+                composition.checkpoint_tokens,
+                composition.unattributed_tokens,
+                composition.assistant_tokens,
+                composition.tool_result_tokens,
+                composition.tool_definition_tokens,
+                composition.protocol_tokens,
+            ];
+            assert_eq!(
+                values.iter().map(|value| u128::from(*value)).sum::<u128>(),
+                u128::from(total)
+            );
+            assert_eq!(composition.attribution_version, 2);
+            assert_eq!(composition.accuracy, TokenCountAccuracy::Estimated);
+            if total > 100 {
+                assert!(composition.user_tokens > 0);
+                assert!(composition.agent_report_tokens > 0);
+                assert!(composition.runtime_context_tokens > 0);
+                assert!(composition.checkpoint_tokens > 0);
+                assert!(composition.unattributed_tokens > 0);
+            }
+        }
+        let unknown = ContextComposition::estimate(&request, 10_000).unwrap();
+        assert_eq!(unknown.user_tokens, 0);
+        assert!(unknown.unattributed_tokens > 0);
+        let misaligned =
+            ContextComposition::estimate_with_origins(&request, 10_000, &[Human]).unwrap();
+        assert_eq!(misaligned, unknown);
+    }
+
+    #[test]
+    fn provenance_cannot_reclassify_assistant_tools_or_unknown_roles_as_human() {
+        let request = TokenEstimateRequest {
+            conversation_messages: vec![
+                json!({"role":"assistant","content":"answer"}),
+                json!({"role":"tool","content":"result"}),
+                json!({"role":"unexpected","content":"unknown"}),
+            ],
+            ..TokenEstimateRequest::default()
+        };
+        let composition = ContextComposition::estimate_with_origins(
+            &request,
+            10_000,
+            &[ContextMessageOrigin::Human; 3],
+        )
+        .unwrap();
+        assert_eq!(composition.user_tokens, 0);
+        assert!(composition.assistant_tokens > 0);
+        assert!(composition.tool_result_tokens > 0);
+        assert!(composition.unattributed_tokens > 0);
+    }
+
+    #[test]
+    fn exceeded_reports_desired_and_minimum_output_without_changing_admission() {
+        let guard = TokenGuard::conservative(TokenBudget {
+            context_window_tokens: 1024,
+            reserved_output_tokens: 512,
+            minimum_output_tokens: 64,
+            safety_margin_tokens: 32,
+        })
+        .unwrap();
+        let request = TokenEstimateRequest {
+            conversation_messages: vec![json!({"content":"x".repeat(2048)})],
+            ..TokenEstimateRequest::default()
+        };
+        let count = ConservativeByteMeter
+            .estimate(&request)
+            .unwrap()
+            .total_input_tokens;
+        let local = guard.check(&request).unwrap_err();
+        let provider = guard
+            .check_provider_count(&ProviderInputTokenCount::exact_request("test", count))
+            .unwrap_err();
+        assert_eq!(local, provider);
+        assert!(matches!(
+            local,
+            TokenBudgetError::Exceeded {
+                reserved_output_tokens: 512,
+                minimum_output_tokens: 64,
+                available_input_tokens: 928,
+                ..
+            }
+        ));
+        let diagnostic = local.to_string();
+        assert!(diagnostic.contains("output_reserve=512"));
+        assert!(diagnostic.contains("minimum_output=64"));
+        let edge = guard
+            .check_provider_count(&ProviderInputTokenCount::exact_request("test", 928))
+            .unwrap();
+        assert_eq!(edge.selected_output_tokens, 64);
+        assert!(guard
+            .check_provider_count(&ProviderInputTokenCount::exact_request("test", 929))
+            .is_err());
+    }
+
+    #[test]
+    fn explicit_meter_and_smaller_window_keep_selection_policy() {
+        let custom = TokenGuard::new(
+            Arc::new(ConservativeByteMeter),
+            TokenBudget::new(8192, 1024),
+        )
+        .unwrap();
+        assert!(!custom.allows_provider_estimate());
+        let fallback = TokenGuard::conservative(TokenBudget::new(8192, 1024))
+            .unwrap()
+            .with_counter_policy(std::time::Duration::from_secs(2), false);
+        let changed = fallback.with_context_window(4096).unwrap();
+        assert!(changed.allows_provider_estimate());
+        assert!(!changed.allows_counter_fallback());
+        assert_eq!(changed.counter_timeout(), std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn conservative_meter_is_deterministic_and_reports_disjoint_buckets() {
+        let request = TokenEstimateRequest {
+            provider: "p".to_owned(),
+            model: Some("m".to_owned()),
+            system_messages: vec![json!({"role":"system","content":"规则"})],
+            conversation_messages: vec![json!({"role":"user","content":"hello"})],
+            tools: vec![json!({"name":"read","parameters":{"type":"object"}})],
+        };
+        let first = ConservativeByteMeter.estimate(&request).unwrap();
+        let second = ConservativeByteMeter.estimate(&request).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.total_input_tokens,
+            first
+                .system_tokens
+                .saturating_add(first.message_tokens)
+                .saturating_add(first.tool_tokens)
+                .saturating_add(first.protocol_tokens)
+        );
+    }
+
+    #[test]
+    fn budget_rejects_before_the_reserved_output_region() {
+        let guard = TokenGuard::conservative(TokenBudget {
+            context_window_tokens: 256,
+            reserved_output_tokens: 64,
+            minimum_output_tokens: 64,
+            safety_margin_tokens: 32,
+        })
+        .unwrap();
+        let error = guard
+            .check(&TokenEstimateRequest {
+                conversation_messages: vec![json!({"content":"x".repeat(300)})],
+                ..TokenEstimateRequest::default()
+            })
+            .unwrap_err();
+        assert!(matches!(error, TokenBudgetError::Exceeded { .. }));
+    }
+
+    #[test]
+    fn invalid_budget_is_rejected_when_the_guard_is_constructed() {
+        let error = TokenGuard::conservative(TokenBudget {
+            context_window_tokens: 4_096,
+            reserved_output_tokens: 4_096,
+            minimum_output_tokens: 4_096,
+            safety_margin_tokens: 0,
+        })
+        .unwrap_err();
+        assert!(matches!(error, TokenBudgetError::Invalid(_)));
+    }
+
+    #[test]
+    fn session_context_window_reuses_the_meter_and_preserves_output_policy() {
+        let guard = TokenGuard::conservative(TokenBudget {
+            context_window_tokens: 65_536,
+            reserved_output_tokens: 8_192,
+            minimum_output_tokens: 4_096,
+            safety_margin_tokens: 1_024,
+        })
+        .unwrap();
+
+        let selected = guard.with_context_window(32_768).unwrap();
+        assert_eq!(guard.budget().context_window_tokens, 65_536);
+        assert_eq!(selected.budget().context_window_tokens, 32_768);
+        assert_eq!(selected.budget().reserved_output_tokens, 8_192);
+        assert_eq!(selected.budget().minimum_output_tokens, 4_096);
+        assert_eq!(selected.budget().safety_margin_tokens, 1_024);
+
+        let error = guard.with_context_window(5_120).unwrap_err();
+        assert!(matches!(error, TokenBudgetError::Invalid(_)));
+    }
+
+    #[test]
+    fn provider_exact_count_overrides_the_local_estimator() {
+        let guard = TokenGuard::new(
+            Arc::new(ConservativeByteMeter),
+            TokenBudget {
+                context_window_tokens: 262_144,
+                reserved_output_tokens: 8_192,
+                minimum_output_tokens: 8_192,
+                safety_margin_tokens: 2_048,
+            },
+        )
+        .unwrap();
+        let report = guard
+            .check_provider_count(&ProviderInputTokenCount::exact_request(
+                "openai/chat-input-tokens/v1",
+                70_857,
+            ))
+            .unwrap();
+        assert_eq!(report.meter, "openai/chat-input-tokens/v1");
+        assert_eq!(report.accuracy, TokenCountAccuracy::ExactRequest);
+        assert_eq!(report.estimate.message_tokens, 70_857);
+        assert_eq!(report.estimate.total_input_tokens, 70_857);
+        assert_eq!(report.available_input_tokens, 251_904);
+    }
+
+    #[test]
+    fn adaptive_output_uses_target_when_room_exists_and_shrinks_to_the_safe_remainder() {
+        let guard = TokenGuard::new(
+            Arc::new(ConservativeByteMeter),
+            TokenBudget {
+                context_window_tokens: 262_144,
+                reserved_output_tokens: 49_152,
+                minimum_output_tokens: 16_384,
+                safety_margin_tokens: 4_096,
+            },
+        )
+        .unwrap();
+
+        let roomy = guard
+            .check_provider_count(&ProviderInputTokenCount::exact_request("exact", 100_000))
+            .unwrap();
+        assert_eq!(roomy.selected_output_tokens, 49_152);
+        assert_eq!(roomy.available_input_tokens, 241_664);
+
+        let pressured = guard
+            .check_provider_count(&ProviderInputTokenCount::exact_request("exact", 220_000))
+            .unwrap();
+        assert_eq!(pressured.selected_output_tokens, 38_048);
+        assert!(pressured.selected_output_tokens >= pressured.minimum_output_tokens);
+    }
+
+    #[test]
+    fn adaptive_output_rejects_before_falling_below_the_minimum_reserve() {
+        let guard = TokenGuard::new(
+            Arc::new(ConservativeByteMeter),
+            TokenBudget {
+                context_window_tokens: 262_144,
+                reserved_output_tokens: 49_152,
+                minimum_output_tokens: 16_384,
+                safety_margin_tokens: 4_096,
+            },
+        )
+        .unwrap();
+        let error = guard
+            .check_provider_count(&ProviderInputTokenCount::exact_request("exact", 242_000))
+            .unwrap_err();
+        assert!(matches!(error, TokenBudgetError::Exceeded { .. }));
+    }
+}
+
+#[cfg(test)]
+mod multimodal_tests {
+    use super::*;
+    #[test]
+    fn image_metadata_adds_budget_and_missing_dimensions_fail() {
+        let mut request = TokenEstimateRequest::default();
+        let base = ConservativeByteMeter
+            .estimate(&request)
+            .unwrap()
+            .total_input_tokens;
+        request.conversation_messages.push(serde_json::json!({"role":"user","content":"","content_blocks":[{"type":"image","attachment":{"id":"a","width":1024,"height":1024}}]}));
+        let images = ConservativeByteMeter
+            .estimate(&request)
+            .unwrap()
+            .total_input_tokens;
+        assert!(images >= base + 16384);
+        request.conversation_messages[0]["content_blocks"][0]["attachment"]["width"] = Value::Null;
+        assert!(ConservativeByteMeter.estimate(&request).is_err());
+    }
+}
+
+#[cfg(test)]
+mod budget_corner_matrix {
+    use super::*;
+
+    fn verify(budget: TokenBudget, input: u64) {
+        // Independent u128 oracle: exercise u64 saturation/overflow boundaries.
+        let valid = budget.context_window_tokens > 0
+            && budget.reserved_output_tokens > 0
+            && budget.minimum_output_tokens > 0
+            && budget.minimum_output_tokens <= budget.reserved_output_tokens
+            && u128::from(budget.minimum_output_tokens) + u128::from(budget.safety_margin_tokens)
+                < u128::from(budget.context_window_tokens);
+        let checked = TokenGuard::conservative(budget.clone());
+        assert_eq!(checked.is_ok(), valid, "{budget:?}");
+        let Ok(guard) = checked else { return };
+        let available = budget.context_window_tokens
+            - budget.minimum_output_tokens
+            - budget.safety_margin_tokens;
+        let result =
+            guard.check_provider_count(&ProviderInputTokenCount::exact_request("matrix", input));
+        assert_eq!(
+            result.is_ok(),
+            input <= available,
+            "{budget:?}, input={input}"
+        );
+        match result {
+            Ok(report) => {
+                let expected = budget
+                    .reserved_output_tokens
+                    .min(budget.context_window_tokens - input - budget.safety_margin_tokens);
+                assert_eq!(report.selected_output_tokens, expected);
+                assert!(report.selected_output_tokens >= budget.minimum_output_tokens);
+                assert!(
+                    u128::from(input)
+                        + u128::from(report.selected_output_tokens)
+                        + u128::from(budget.safety_margin_tokens)
+                        <= u128::from(budget.context_window_tokens)
+                );
+                assert_eq!(report.accuracy, TokenCountAccuracy::ExactRequest);
+            }
+            Err(TokenBudgetError::Exceeded {
+                available_input_tokens,
+                minimum_output_tokens,
+                reserved_output_tokens,
+                ..
+            }) => {
+                assert_eq!(available_input_tokens, available);
+                assert_eq!(minimum_output_tokens, budget.minimum_output_tokens);
+                assert_eq!(reserved_output_tokens, budget.reserved_output_tokens);
+            }
+            Err(error) => panic!("unexpected error: {error}"),
+        }
+        assert_eq!(
+            guard.budget(),
+            &budget,
+            "admission must not mutate configuration"
+        );
+    }
+
+    #[test]
+    fn exhaustive_small_budgets_and_u64_extremes() {
+        // 7^4 configurations, each checked at three exact admission boundaries.
+        let edges = [0, 1, 2, 64, 1024, u64::MAX - 1, u64::MAX];
+        for capacity in edges {
+            for target in edges {
+                for minimum in edges {
+                    for safety in edges {
+                        let budget = TokenBudget {
+                            context_window_tokens: capacity,
+                            reserved_output_tokens: target,
+                            minimum_output_tokens: minimum,
+                            safety_margin_tokens: safety,
+                        };
+                        let available = budget.available_input_tokens();
+                        for input in [
+                            available.saturating_sub(1),
+                            available,
+                            available.saturating_add(1),
+                        ] {
+                            verify(budget.clone(), input);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_ten_thousand_budget_and_model_capacity_transitions() {
+        let mut seed = 0x5848_434f_524e_4552u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+        for case in 0..10_000 {
+            let capacity = 2 + next() % 1_048_576;
+            let safety = next() % (capacity - 1);
+            let minimum = 1 + next() % (capacity - safety - 1);
+            let target = minimum.saturating_add(next() % 131_072);
+            let input = next() % 1_100_000;
+            let budget = TokenBudget {
+                context_window_tokens: capacity,
+                reserved_output_tokens: target,
+                minimum_output_tokens: minimum,
+                safety_margin_tokens: safety,
+            };
+            verify(budget.clone(), input);
+            let old = TokenGuard::conservative(budget.clone()).unwrap();
+            let new_capacity = if case % 2 == 0 {
+                capacity / 2
+            } else {
+                capacity * 2
+            };
+            let changed = TokenBudget {
+                context_window_tokens: new_capacity,
+                ..budget.clone()
+            };
+            verify(changed.clone(), input);
+            assert_eq!(
+                old.with_budget(changed.clone()).is_ok(),
+                changed.validate().is_ok()
+            );
+            assert_eq!(
+                old.budget(),
+                &budget,
+                "rebinding must leave the old route unchanged"
+            );
+        }
+    }
+}

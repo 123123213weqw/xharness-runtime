@@ -1,0 +1,996 @@
+use std::{pin::Pin, sync::Arc};
+
+use async_trait::async_trait;
+use futures::Stream;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+pub use xharness_session::{Message as AgentMessage, MessageRole as Role, ToolCall};
+
+pub type ProviderStream =
+    Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send + 'static>>;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub ok: bool,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+impl ToolResult {
+    pub fn success(content: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            content: content.into(),
+            error: String::new(),
+            truncated: false,
+            metadata: None,
+        }
+    }
+
+    pub fn failure(error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            content: String::new(),
+            error: error.into(),
+            truncated: false,
+            metadata: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderRequest {
+    pub messages: Vec<AgentMessage>,
+    pub tools: Vec<ToolDefinition>,
+    pub step: usize,
+    /// Opaque model-owned reasoning level selected by the Host. Core does not
+    /// interpret this value; the concrete provider adapter validates and maps
+    /// it to its native wire request.
+    pub reasoning_effort: Option<String>,
+    /// Provider-neutral generation ceiling. Adapters map this to their native
+    /// `max_tokens`/`max_output_tokens` request field.
+    pub max_output_tokens: Option<u64>,
+    /// Correlation metadata for provider-layer full debug traces. It never
+    /// affects the provider wire request.
+    pub debug_scope: xharness_debug::DebugScope,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProviderEvent {
+    TextDelta(String),
+    ReasoningDelta(String),
+    ToolCallDelta {
+        index: usize,
+        id: String,
+        name: String,
+        arguments_delta: String,
+    },
+    Completed {
+        /// Adapters should set this whenever the wire protocol exposes a
+        /// terminal reason. `None` remains accepted for legacy/custom
+        /// adapters and is inferred from the presence of tool calls.
+        finish_reason: Option<FinishReason>,
+        usage: Option<TokenUsage>,
+        provider_items: Vec<Value>,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    /// Uncached input tokens. Provider totals that include cached input are
+    /// normalized by subtracting `cache_read_tokens` and
+    /// `cache_write_tokens`. Providers reporting disjoint uncached input retain
+    /// that input unchanged; adapters normalize their wire-specific semantics.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Visible, non-reasoning output tokens. Provider totals that include
+    /// reasoning are normalized by subtracting `reasoning_tokens`.
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn saturating_add_assign(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    #[default]
+    Stop,
+    ToolCalls,
+    Length,
+    ContentFilter,
+    Incomplete(String),
+    Other(String),
+}
+
+impl FinishReason {
+    /// Only these reasons represent a complete, protocol-valid model turn.
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Stop | Self::ToolCalls)
+    }
+
+    pub fn description(&self) -> String {
+        match self {
+            Self::Stop => "stop".to_owned(),
+            Self::ToolCalls => "tool calls".to_owned(),
+            Self::Length => "output token limit".to_owned(),
+            Self::ContentFilter => "content filter".to_owned(),
+            Self::Incomplete(reason) => format!("incomplete: {reason}"),
+            Self::Other(reason) => format!("unrecognized finish reason: {reason}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[error("{message}")]
+pub struct ProviderError {
+    pub message: String,
+    pub retryable: bool,
+    pub http_status: Option<u16>,
+    pub retry_after_ms: Option<u64>,
+    pub request_id: Option<String>,
+    pub diagnostics: Option<Box<ProviderNetworkDiagnostics>>,
+}
+
+/// Content-free failure diagnostics retained even when full Debug Trace is off.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderNetworkDiagnostics {
+    pub route: String,
+    pub kind: String,
+    pub elapsed_ms: u64,
+    pub received_chunks: u64,
+    pub received_bytes: u64,
+    pub last_chunk_ago_ms: Option<u64>,
+    pub protocol_completed: bool,
+}
+
+impl ProviderError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            http_status: None,
+            retry_after_ms: None,
+            request_id: None,
+            diagnostics: None,
+        }
+    }
+
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            http_status: None,
+            retry_after_ms: None,
+            request_id: None,
+            diagnostics: None,
+        }
+    }
+
+    pub fn http(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: status == 408 || status == 429 || status >= 500,
+            http_status: Some(status),
+            retry_after_ms: None,
+            request_id: None,
+            diagnostics: None,
+        }
+    }
+
+    pub fn diagnostic_message(&self) -> String {
+        match &self.diagnostics {
+            Some(value) => format!(
+                "{}\nnetwork: {}",
+                self.message,
+                serde_json::json!({
+                    "transport": value,
+                    "requestId": self.request_id,
+                })
+            ),
+            None => self.message.clone(),
+        }
+    }
+
+    /// Provider-neutral classification for request-admission failures caused
+    /// by a full context window. Adapters can retain their native error text;
+    /// Core only invokes overflow recovery before any model delta was emitted.
+    pub fn is_context_overflow(&self) -> bool {
+        if self.http_status != Some(400) {
+            return false;
+        }
+        let message = self.message.to_ascii_lowercase();
+        message.contains("exceed_context_size")
+            || message.contains("context_length_exceeded")
+            || message.contains("maximum context length")
+            || message.contains("exceeds the available context size")
+            || (message.contains("context window") && message.contains("exceed"))
+    }
+
+    /// A committed stream may only be continued automatically after a
+    /// transport failure. HTTP and protocol failures need their own policy;
+    /// treating them as a dropped connection could repeat unsafe work.
+    pub fn is_transient_transport(&self) -> bool {
+        self.retryable
+            && self.http_status.is_none()
+            && self.diagnostics.as_ref().is_some_and(|diagnostics| {
+                matches!(
+                    diagnostics.kind.as_str(),
+                    "connection"
+                        | "connect_or_headers"
+                        | "idle_timeout"
+                        | "response_body"
+                        | "body"
+                        | "transport"
+                )
+            })
+    }
+}
+
+#[async_trait]
+pub trait ModelProvider: Send + Sync + 'static {
+    /// Stable adapter identity written to durable request headers.
+    fn provider_name(&self) -> &str {
+        "custom"
+    }
+
+    /// Configured model identity when the adapter owns one.
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Return a capability snapshot reported by the exact provider/model
+    /// deployment. Core never guesses limits from model names. `Unknown`
+    /// leaves policy binding to an explicitly labelled deployment fallback.
+    async fn capabilities(
+        &self,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelCapabilities, ProviderError> {
+        Ok(ModelCapabilities::default())
+    }
+
+    /// Count the complete structured request using a provider-native
+    /// capability when available. `Ok(None)` means the adapter has no exact
+    /// counter and the Core must use its configured local fallback meter.
+    async fn count_input_tokens(
+        &self,
+        _request: &ProviderRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<Option<xharness_token::ProviderInputTokenCount>, ProviderError> {
+        Ok(None)
+    }
+
+    /// Notify the adapter that its optional counter had a transient failure.
+    fn input_counter_failed(&self) {}
+
+    /// Local complete-wire estimate, isolated by the adapter's configuration.
+    /// Exact counters take precedence; this must never make network requests.
+    fn estimate_input_tokens(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Option<xharness_token::ProviderInputTokenCount> {
+        None
+    }
+
+    async fn stream(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError>;
+}
+
+/// Provenance of a model capability. Consumers must preserve this value so a
+/// deployment fallback can never be presented as provider-reported truth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySource {
+    ProviderReported,
+    ProviderCatalog,
+    DeploymentReported,
+    AccountReported,
+    DeploymentDeclaredFallback,
+    ObservedStructuredError,
+    #[default]
+    Unknown,
+}
+
+/// One independently sourced context-limit constraint.
+///
+/// A limit without provenance must never be promoted to Provider truth. The
+/// optional lifetime fields let a Host distinguish a fresh report from a
+/// last-known-good snapshot without teaching Core how a specific Provider is
+/// queried.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextLimitEvidence {
+    pub tokens: u64,
+    #[serde(default)]
+    pub source: CapabilitySource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_fingerprint: Option<String>,
+}
+
+impl ContextLimitEvidence {
+    pub fn new(tokens: u64, source: CapabilitySource) -> Self {
+        Self {
+            tokens,
+            source,
+            ..Self::default()
+        }
+    }
+}
+
+/// Independent ceilings that jointly determine one exact route's accepted
+/// context capacity.
+///
+/// `model_ceiling` is architectural metadata, not proof that the selected API
+/// endpoint accepts that many tokens. At least one operational constraint
+/// (`provider_limit`, `deployment_limit`, `account_limit`) or an explicitly
+/// labelled fallback is therefore required before `effective_hard_max()` can
+/// admit a request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextWindowCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ceiling: Option<ContextLimitEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_limit: Option<ContextLimitEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_limit: Option<ContextLimitEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_limit: Option<ContextLimitEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_limit: Option<ContextLimitEvidence>,
+}
+
+impl ContextWindowCapability {
+    pub fn reported(max_context_tokens: u64) -> Self {
+        Self {
+            provider_limit: Some(ContextLimitEvidence::new(
+                max_context_tokens,
+                CapabilitySource::ProviderReported,
+            )),
+            ..Self::default()
+        }
+    }
+
+    pub fn deployment_reported(max_context_tokens: u64) -> Self {
+        Self {
+            deployment_limit: Some(ContextLimitEvidence::new(
+                max_context_tokens,
+                CapabilitySource::DeploymentReported,
+            )),
+            ..Self::default()
+        }
+    }
+
+    pub fn declared_fallback(max_context_tokens: u64) -> Self {
+        Self {
+            fallback_limit: Some(ContextLimitEvidence::new(
+                max_context_tokens,
+                CapabilitySource::DeploymentDeclaredFallback,
+            )),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_model_ceiling(mut self, tokens: u64, source: CapabilitySource) -> Self {
+        self.model_ceiling = Some(ContextLimitEvidence::new(tokens, source));
+        self
+    }
+
+    /// Compute the maximum that can safely be offered to a Session.
+    ///
+    /// Operational constraints are intersected. A fallback participates only
+    /// when no operational source is available. A model ceiling can lower an
+    /// accepted limit but cannot establish endpoint readiness by itself.
+    pub fn effective_hard_max(&self) -> Option<u64> {
+        let operational = [
+            self.provider_limit.as_ref(),
+            self.deployment_limit.as_ref(),
+            self.account_limit.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|evidence| evidence.tokens > 0 && evidence.source != CapabilitySource::Unknown)
+        .map(|evidence| evidence.tokens)
+        .min()
+        .or_else(|| {
+            self.fallback_limit
+                .as_ref()
+                .filter(|evidence| {
+                    evidence.tokens > 0
+                        && evidence.source == CapabilitySource::DeploymentDeclaredFallback
+                })
+                .map(|evidence| evidence.tokens)
+        })?;
+        Some(match self.model_ceiling.as_ref() {
+            Some(model) if model.tokens > 0 && model.source != CapabilitySource::Unknown => {
+                operational.min(model.tokens)
+            }
+            _ => operational,
+        })
+    }
+
+    pub fn effective_source(&self) -> CapabilitySource {
+        let Some(maximum) = self.effective_hard_max() else {
+            return CapabilitySource::Unknown;
+        };
+        [
+            self.provider_limit.as_ref(),
+            self.deployment_limit.as_ref(),
+            self.account_limit.as_ref(),
+            self.fallback_limit.as_ref(),
+            self.model_ceiling.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|evidence| evidence.tokens == maximum && evidence.source != CapabilitySource::Unknown)
+        .map(|evidence| evidence.source)
+        .unwrap_or(CapabilitySource::Unknown)
+    }
+}
+
+/// Provider-neutral capability snapshot frozen before a turn starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCapabilities {
+    #[serde(default)]
+    pub context_window: ContextWindowCapability,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopStatus {
+    Completed,
+    /// Provider reached its output ceiling after every configured safe
+    /// continuation was consumed. Partial assistant content is preserved.
+    MaxTokens,
+    Failed,
+    Cancelled,
+    LimitReached,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectionMode {
+    /// Add the message before the next model request without interrupting the
+    /// model or any tools that are currently running.
+    #[default]
+    NextStep,
+    /// Cancel the current model stream, preserve any partial assistant text as
+    /// an interrupted turn, and continue with the injected message.
+    InterruptModel,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum LoopCommand {
+    InjectMessage {
+        message: AgentMessage,
+        mode: InjectionMode,
+    },
+    /// Shorthand for an `InjectMessage` using `InterruptModel`.
+    Steer(AgentMessage),
+    Pause,
+    Resume,
+    Cancel,
+    /// Explicit user stop; unlike internal cancellation, records a model-visible interruption.
+    InterruptByUser,
+    ApproveTool {
+        call_id: String,
+    },
+    /// Internal reviewer decision, fenced against user steering at the Loop boundary.
+    ReviewToolDecision {
+        call_id: String,
+        approved: bool,
+        /// Exact admitted user event for durable runs; None only for compatibility runs.
+        user_request_seq: Option<u64>,
+        user_request_sha256: String,
+    },
+    RejectTool {
+        call_id: String,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum LoopControlError {
+    #[error("loop is no longer accepting commands")]
+    Closed,
+    #[error("loop command rejected: {0}")]
+    Rejected(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum LoopEventKind {
+    ExecutionNotice(xharness_session::ExecutionNotice),
+    /// Initial or boundary-injected input is now durable and visible through the
+    /// authoritative Session store. Hosts use this pre-provider boundary to
+    /// remove claimed input from their pending queue and publish the user
+    /// message without waiting for the model's first delta.
+    InputCommitted,
+    TextDelta(String),
+    ReasoningDelta(String),
+    /// One provider tool-call fragment. Exposing the fragment lets durable
+    /// hosts publish every assistant stream record immediately while the
+    /// append-only session log is written in batches.
+    ToolCallDelta {
+        index: usize,
+        id: String,
+        name: String,
+        arguments_delta: String,
+    },
+    /// A bounded assistant stream batch is now visible in the authoritative
+    /// Session store. Durable hosts use this signal to refresh the Web event
+    /// cursor without reloading the complete log for every fragment.
+    StreamCheckpoint,
+    ToolStarted(ToolCall),
+    ToolCompleted {
+        call: ToolCall,
+        result: ToolResult,
+    },
+    ToolApprovalRequested {
+        approval_id: String,
+        call: ToolCall,
+    },
+    ToolApprovalResolved {
+        approval_id: String,
+        call: ToolCall,
+        approved: bool,
+        #[serde(default)]
+        cancelled: bool,
+        reason: Option<String>,
+    },
+    MessageInjected {
+        message: AgentMessage,
+        mode: InjectionMode,
+    },
+    RunPaused,
+    RunResumed,
+    ModelInterrupted,
+    ModelRetry {
+        retry_id: String,
+        policy_key: String,
+        attempt: usize,
+        /// None for sustained network recovery; HTTP retries remain bounded.
+        max_retries: Option<usize>,
+        error: String,
+        delay_ms: u64,
+    },
+    ModelRetryStarted {
+        retry_id: String,
+        attempt: usize,
+    },
+    /// The subscriber fell behind the bounded event journal. `resume_seq` is
+    /// the first event sequence still available for deterministic replay.
+    EventsLagged {
+        missed: u64,
+        resume_seq: u64,
+    },
+    RunCompleted {
+        text: String,
+    },
+    /// One incomplete provider output was safely committed and the loop will
+    /// issue a fresh continuation request. Truncated tool calls are never
+    /// carried into execution.
+    OutputContinuationScheduled {
+        attempt: usize,
+        max_attempts: Option<usize>,
+        cumulative_output_tokens: u64,
+    },
+    /// The turn ended at the configured cumulative/continuation ceiling.
+    RunMaxTokens {
+        text: String,
+        continuations: usize,
+        cumulative_output_tokens: u64,
+    },
+    RunFailed {
+        error: String,
+    },
+    RunCancelled,
+    LimitReached,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoopEvent {
+    pub seq: u64,
+    pub run_id: String,
+    pub step: usize,
+    pub kind: LoopEventKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoopResult {
+    pub status: LoopStatus,
+    #[serde(default)]
+    pub final_text: String,
+    #[serde(default)]
+    pub messages: Vec<AgentMessage>,
+    /// Saturating sum of every completed model step that reported usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+    /// Per-step usage in model request order, for requests whose provider
+    /// reported usage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub step_usage: Vec<StepUsage>,
+    /// Finish reason of the most recent completed model request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<FinishReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepUsage {
+    pub step: usize,
+    pub usage: TokenUsage,
+    pub finish_reason: FinishReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub session_id: String,
+    pub messages: Vec<AgentMessage>,
+    pub phase: String,
+    pub step: usize,
+    pub tool_batch_complete: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct LoopConfig {
+    /// Legacy explicit hard limit. usize::MAX means unset; explicit values retain their meaning.
+    pub max_steps: usize,
+    pub checkpoints: crate::CheckpointConfig,
+    pub max_tool_concurrency: usize,
+    pub tool_result_limit_bytes: usize,
+    pub provider_retries: usize,
+    pub provider_retry_base_delay_ms: u64,
+    pub provider_retry_max_delay_ms: u64,
+    /// Recovery deadline starts at the first retryable failure and stops
+    /// applying once model output begins. Healthy generation is not capped.
+    pub provider_retry_budget_ms: u64,
+    pub provider_retry_jitter_percent: u8,
+    /// Keep a transient transport failure waiting until cancelled or recovered.
+    /// HTTP/protocol/auth failures do not qualify.
+    pub network_wait_enabled: bool,
+    pub network_wait_max_delay_ms: u64,
+    /// Fresh model calls allowed after a provider reports an output-token
+    /// ceiling. None means no task-wide continuation cap; Some(0) exposes
+    /// max-tokens immediately. Explicit caps retain their task-wide meaning.
+    pub max_output_continuations: Option<usize>,
+    /// Optional cumulative generation budget for one LoopRun. None means
+    /// usage is statistics only, not a task stopping condition. Reasoning and
+    /// visible output are counted together when provider usage is available.
+    pub max_turn_output_tokens: Option<u64>,
+    /// Maximum number of events retained by the non-blocking in-memory event
+    /// journal. Slow subscribers receive an explicit lag record.
+    pub event_buffer: usize,
+    /// Aggregate serialized-byte budget of retained loop events. The journal
+    /// evicts oldest events until both count and byte budgets are satisfied.
+    pub event_buffer_bytes: usize,
+    pub command_buffer: usize,
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[error("{message}")]
+pub struct LoopValidationError {
+    pub message: String,
+}
+
+impl LoopValidationError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Default for LoopConfig {
+    fn default() -> Self {
+        Self {
+            max_steps: usize::MAX,
+            checkpoints: crate::CheckpointConfig::default(),
+            max_tool_concurrency: 8,
+            tool_result_limit_bytes: 256 * 1024,
+            provider_retries: 2,
+            provider_retry_base_delay_ms: 500,
+            provider_retry_max_delay_ms: 8_000,
+            provider_retry_budget_ms: 60_000,
+            provider_retry_jitter_percent: 20,
+            network_wait_enabled: true,
+            network_wait_max_delay_ms: 30_000,
+            max_output_continuations: None,
+            max_turn_output_tokens: None,
+            event_buffer: 128,
+            event_buffer_bytes: 8 * 1024 * 1024,
+            command_buffer: 64,
+        }
+    }
+}
+
+impl LoopConfig {
+    pub fn validate(&self) -> Result<(), LoopValidationError> {
+        self.checkpoints
+            .validate()
+            .map_err(LoopValidationError::new)?;
+        if self.provider_retry_base_delay_ms == 0
+            || self.provider_retry_max_delay_ms < self.provider_retry_base_delay_ms
+            || self.provider_retry_budget_ms == 0
+            || self.provider_retry_budget_ms > 86_400_000
+            || self.provider_retry_max_delay_ms > 86_400_000
+            || self.provider_retry_jitter_percent > 100
+            || self.network_wait_max_delay_ms < self.provider_retry_base_delay_ms
+            || self.network_wait_max_delay_ms > 86_400_000
+        {
+            return Err(LoopValidationError::new(
+                "invalid provider retry delay, deadline or jitter",
+            ));
+        }
+        if self.max_steps == 0 {
+            return Err(LoopValidationError::new(
+                "max_steps must be greater than zero",
+            ));
+        }
+        if self.max_tool_concurrency == 0 {
+            return Err(LoopValidationError::new(
+                "max_tool_concurrency must be greater than zero",
+            ));
+        }
+        if self.max_turn_output_tokens == Some(0) {
+            return Err(LoopValidationError::new(
+                "max_turn_output_tokens must be greater than zero",
+            ));
+        }
+        if self.tool_result_limit_bytes < crate::MIN_TOOL_RESULT_LIMIT_BYTES {
+            return Err(LoopValidationError::new(format!(
+                "tool_result_limit_bytes must be at least {}",
+                crate::MIN_TOOL_RESULT_LIMIT_BYTES
+            )));
+        }
+        if self.command_buffer == 0 {
+            return Err(LoopValidationError::new(
+                "command_buffer must be greater than zero",
+            ));
+        }
+        if self.event_buffer == 0 {
+            return Err(LoopValidationError::new(
+                "event_buffer must be greater than zero",
+            ));
+        }
+        if self.event_buffer_bytes == 0 {
+            return Err(LoopValidationError::new(
+                "event_buffer_bytes must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub struct LoopRequest {
+    pub provider: Arc<dyn ModelProvider>,
+    /// Optional full-fidelity diagnostic recorder shared by every layer of
+    /// this run. Disabled by default and never changes loop semantics.
+    pub debug: xharness_debug::DebugRecorder,
+    pub messages: Vec<AgentMessage>,
+    /// Exact-model reasoning level selected for this run. The value is
+    /// provider-owned and is copied unchanged into every model request.
+    pub reasoning_effort: Option<String>,
+    /// Independently resolved reasoning level used only by model-generated
+    /// compaction summaries. Hosts should select the target model's lowest
+    /// supported effort. `None` means no reasoning override; it never falls
+    /// back to `reasoning_effort`.
+    pub compaction_reasoning_effort: Option<String>,
+    /// Deterministic model-facing System Prompt. It is reassembled for each
+    /// turn and never becomes transcript history.
+    pub prompt: Option<xharness_prompt::PromptAssembly>,
+    /// Hard admission guard evaluated after context projection and before any
+    /// provider I/O. Production hosts should always configure one.
+    pub token_guard: Option<xharness_token::TokenGuard>,
+    /// Durable automatic context compaction. It is disabled for embedders by
+    /// default and requires both a hard token guard and append-only journal.
+    pub compaction: Option<xharness_compaction::CompactionConfig>,
+    /// Execute exactly one explicit maintenance compaction and finish without
+    /// sending a normal model turn. The value is the durable slash-command id
+    /// used to correlate `command/*` and `compaction/*` events.
+    pub manual_compaction_command_id: Option<String>,
+    /// Formal policy-aware tool runtime. This is the sole tool registration,
+    /// approval and scheduling path used by Core.
+    pub tool_executor: Option<xharness_tools::ToolExecutor>,
+    pub session_id: Option<String>,
+    pub session_store: Arc<dyn crate::SessionStore>,
+    /// Append-only source-of-truth store. When set, it replaces snapshot
+    /// restoration for this run; the legacy `session_store` remains a v0
+    /// migration bridge.
+    pub journal_store: Option<Arc<dyn xharness_session::Store>>,
+    /// Durable control-plane facts committed in the same atomic batch as the
+    /// next `turn/start` and new user input. Long-lived agents use this to
+    /// claim inbox messages without a crash window between dequeue and turn.
+    pub journal_expected_revision: Option<xharness_session::Revision>,
+    pub journal_prelude: Vec<xharness_session::SessionEvent>,
+    pub context_policy: Arc<dyn crate::ContextPolicy>,
+    pub config: LoopConfig,
+}
+
+impl LoopRequest {
+    pub fn new(provider: Arc<dyn ModelProvider>, messages: Vec<AgentMessage>) -> Self {
+        Self {
+            provider,
+            debug: xharness_debug::DebugRecorder::disabled(),
+            messages,
+            reasoning_effort: None,
+            compaction_reasoning_effort: None,
+            prompt: None,
+            token_guard: None,
+            compaction: None,
+            manual_compaction_command_id: None,
+            tool_executor: None,
+            session_id: None,
+            session_store: Arc::new(crate::MemorySessionStore::default()),
+            journal_store: None,
+            journal_expected_revision: None,
+            journal_prelude: Vec::new(),
+            context_policy: Arc::new(crate::IdentityContextPolicy),
+            config: LoopConfig::default(),
+        }
+    }
+
+    /// Validates configuration and tool declarations without invoking the
+    /// provider, session store, context policy, or any tool handler.
+    pub fn validate(&self) -> Result<(), LoopValidationError> {
+        self.config.validate()?;
+        if self.prompt.is_some()
+            && self
+                .messages
+                .iter()
+                .any(|message| message.role == Role::System)
+        {
+            return Err(LoopValidationError::new(
+                "prompt assembly and explicit system messages cannot be combined",
+            ));
+        }
+        if !self.journal_prelude.is_empty() && self.journal_store.is_none() {
+            return Err(LoopValidationError::new(
+                "journal_prelude requires journal_store",
+            ));
+        }
+        if let Some(compaction) = &self.compaction {
+            compaction
+                .validate()
+                .map_err(|error| LoopValidationError::new(error.to_string()))?;
+            if self.token_guard.is_none() {
+                return Err(LoopValidationError::new(
+                    "compaction requires a token_guard with model context capacity",
+                ));
+            }
+            if self.journal_store.is_none() {
+                return Err(LoopValidationError::new(
+                    "compaction requires an append-only journal_store",
+                ));
+            }
+        }
+        if let Some(command_id) = &self.manual_compaction_command_id {
+            if command_id.trim().is_empty() {
+                return Err(LoopValidationError::new(
+                    "manual compaction requires a non-empty command id",
+                ));
+            }
+            if self.compaction.is_none() {
+                return Err(LoopValidationError::new(
+                    "manual compaction requires compaction configuration",
+                ));
+            }
+            if !self.messages.is_empty() || !self.journal_prelude.is_empty() {
+                return Err(LoopValidationError::new(
+                    "manual compaction is an input-free maintenance turn",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn operational_constraints_intersect_with_the_model_ceiling() {
+        let capability = ContextWindowCapability {
+            model_ceiling: Some(ContextLimitEvidence::new(
+                1_048_576,
+                CapabilitySource::ProviderCatalog,
+            )),
+            provider_limit: Some(ContextLimitEvidence::new(
+                524_288,
+                CapabilitySource::ProviderReported,
+            )),
+            deployment_limit: Some(ContextLimitEvidence::new(
+                262_144,
+                CapabilitySource::DeploymentReported,
+            )),
+            account_limit: Some(ContextLimitEvidence::new(
+                131_072,
+                CapabilitySource::AccountReported,
+            )),
+            fallback_limit: Some(ContextLimitEvidence::new(
+                65_536,
+                CapabilitySource::DeploymentDeclaredFallback,
+            )),
+        };
+        assert_eq!(capability.effective_hard_max(), Some(131_072));
+        assert_eq!(
+            capability.effective_source(),
+            CapabilitySource::AccountReported
+        );
+    }
+
+    #[test]
+    fn a_model_ceiling_alone_does_not_claim_endpoint_readiness() {
+        let capability = ContextWindowCapability::default()
+            .with_model_ceiling(1_048_576, CapabilitySource::ProviderCatalog);
+        assert_eq!(capability.effective_hard_max(), None);
+        assert_eq!(capability.effective_source(), CapabilitySource::Unknown);
+    }
+
+    #[test]
+    fn fallback_is_used_only_without_an_operational_report() {
+        let fallback = ContextWindowCapability::declared_fallback(131_072)
+            .with_model_ceiling(1_048_576, CapabilitySource::ProviderCatalog);
+        assert_eq!(fallback.effective_hard_max(), Some(131_072));
+        assert_eq!(
+            fallback.effective_source(),
+            CapabilitySource::DeploymentDeclaredFallback
+        );
+
+        let reported = ContextWindowCapability {
+            provider_limit: Some(ContextLimitEvidence::new(
+                524_288,
+                CapabilitySource::ProviderReported,
+            )),
+            fallback_limit: fallback.fallback_limit,
+            model_ceiling: fallback.model_ceiling,
+            ..ContextWindowCapability::default()
+        };
+        assert_eq!(reported.effective_hard_max(), Some(524_288));
+    }
+}

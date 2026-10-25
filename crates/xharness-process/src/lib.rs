@@ -1,0 +1,1496 @@
+//! Native process runtime used by local XHarness tools.
+//!
+//! Commands are always spawned as an executable plus an argument vector;
+//! there is no implicit shell. Every child starts a dedicated process group
+//! (and, on Linux, a new session),
+//! receives an explicitly supplied working directory and environment, and has
+//! bounded stdout/stderr capture. Unix cancellation signals a dedicated process
+//! group; Windows assigns the tree to a kill-on-close Job Object. Process groups
+//! are deliberately only an execution-lifecycle primitive: a Unix descendant
+//! can call `setsid(2)` and escape them. Hard containment belongs to the platform
+//! sandbox below the shared runtime. Callers must await
+//! [`ProcessHandle::wait`] before shutting down Tokio so cancellation can reach
+//! quiescence and final output can be drained.
+
+pub mod powershell;
+pub mod shell;
+
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ffi::{OsStr, OsString},
+    future::pending,
+    io,
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::sync::Arc as WindowsArc;
+
+#[cfg(target_os = "macos")]
+use nix::unistd::setpgid;
+#[cfg(all(unix, not(target_os = "macos")))]
+use nix::unistd::setsid;
+#[cfg(unix)]
+use nix::{
+    errno::Errno,
+    sys::signal::{killpg, Signal},
+    unistd::Pid,
+};
+use serde_json::{json, Value};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::{Child, Command},
+    sync::{oneshot, watch},
+    time,
+};
+use xharness_debug::{DebugEvent, DebugRecorder};
+#[cfg(windows)]
+use xharness_win32::{
+    resume_suspended_process, Job, Win32Error, WINDOWS_CREATE_NO_WINDOW, WINDOWS_CREATE_SUSPENDED,
+};
+
+pub const DEFAULT_CAPTURE_LIMIT: usize = 256 * 1024;
+pub const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+pub const DEFAULT_CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// One explicit process invocation.
+///
+/// `program` and `args` are passed directly to `exec`; neither is parsed as a
+/// command line. `env` replaces the inherited environment rather than
+/// extending it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpawnSpec {
+    pub program: OsString,
+    pub args: Vec<OsString>,
+    pub cwd: PathBuf,
+    pub env: BTreeMap<OsString, OsString>,
+    pub timeout: Option<Duration>,
+    pub termination_grace: Duration,
+    /// Maximum time to wait for stdout/stderr EOF after the root and managed
+    /// process group have stopped. Expiry is a cleanup failure rather than a
+    /// successful process result: an escaped descendant may still own a pipe.
+    pub capture_drain_grace: Duration,
+    pub stdout_limit: usize,
+    pub stderr_limit: usize,
+    /// Diagnostic-only parent identity, normally the Tool execution id.
+    pub debug_parent: Option<String>,
+}
+
+impl SpawnSpec {
+    pub fn new(program: impl Into<OsString>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            cwd: cwd.into(),
+            env: BTreeMap::new(),
+            timeout: None,
+            termination_grace: DEFAULT_TERMINATION_GRACE,
+            capture_drain_grace: DEFAULT_CAPTURE_DRAIN_GRACE,
+            stdout_limit: DEFAULT_CAPTURE_LIMIT,
+            stderr_limit: DEFAULT_CAPTURE_LIMIT,
+            debug_parent: None,
+        }
+    }
+
+    pub fn arg(mut self, argument: impl Into<OsString>) -> Self {
+        self.args.push(argument.into());
+        self
+    }
+
+    pub fn args<I, S>(mut self, arguments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        self.args.extend(arguments.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn termination_grace(mut self, grace: Duration) -> Self {
+        self.termination_grace = grace;
+        self
+    }
+
+    pub fn capture_drain_grace(mut self, grace: Duration) -> Self {
+        self.capture_drain_grace = grace;
+        self
+    }
+
+    pub fn output_limits(mut self, stdout_limit: usize, stderr_limit: usize) -> Self {
+        self.stdout_limit = stdout_limit;
+        self.stderr_limit = stderr_limit;
+        self
+    }
+
+    pub fn debug_parent(mut self, parent: impl Into<String>) -> Self {
+        self.debug_parent = Some(parent.into());
+        self
+    }
+
+    /// Remove environment entries whose names look like credentials.
+    pub fn scrub_secrets(mut self) -> Self {
+        scrub_secret_env(&mut self.env);
+        self
+    }
+}
+
+/// Why the root process stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminationReason {
+    Exited,
+    Cancelled,
+    TimedOut,
+}
+
+/// Portable Unix exit information. A non-zero code is still a normal result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessStatus {
+    pub success: bool,
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub core_dumped: bool,
+}
+
+impl From<ExitStatus> for ProcessStatus {
+    fn from(status: ExitStatus) -> Self {
+        Self {
+            success: status.success(),
+            code: status.code(),
+            signal: exit_signal(&status),
+            core_dumped: exit_core_dumped(&status),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    status.signal()
+}
+
+#[cfg(windows)]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(unix)]
+fn exit_core_dumped(status: &ExitStatus) -> bool {
+    status.core_dumped()
+}
+
+#[cfg(windows)]
+fn exit_core_dumped(_status: &ExitStatus) -> bool {
+    false
+}
+
+/// One bounded stream capture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedOutput {
+    /// Valid UTF-8. Invalid source bytes are replaced lossily; a UTF-8 scalar
+    /// cut by the byte cap is omitted rather than replaced by a partial glyph.
+    pub text: String,
+    /// True when the byte cap or an incomplete terminal UTF-8 scalar removed
+    /// source bytes.
+    pub truncated: bool,
+    /// Total bytes drained from the pipe, including discarded bytes.
+    pub bytes_read: u64,
+    /// Bytes omitted from the bounded display (including incomplete UTF-8
+    /// scalars at its boundaries). The beginning and end are both retained.
+    pub omitted_bytes: u64,
+}
+
+/// Completed process result, including cancellation and timeout exits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessOutput {
+    pub pid: u32,
+    pub status: ProcessStatus,
+    pub termination: TerminationReason,
+    pub stdout: CapturedOutput,
+    pub stderr: CapturedOutput,
+}
+
+/// Absolute read positions for the two live process streams.
+///
+/// Cursors are intentionally independent from the final bounded capture. A
+/// caller can poll a long-running process without consuming another caller's
+/// view, while a higher-level Job registry may keep one model-facing cursor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessOutputCursor {
+    pub stdout: u64,
+    pub stderr: u64,
+}
+
+/// One non-consuming live-output delta.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveCapturedOutput {
+    pub text: String,
+    /// True when bytes before the requested cursor were evicted from the
+    /// bounded live window.
+    pub truncated: bool,
+    /// Cursor to use for the next read. An incomplete trailing UTF-8 scalar is
+    /// retained and is not included in this position until it is completed.
+    pub cursor: u64,
+    pub bytes_read: u64,
+}
+
+/// A coherent snapshot of both live streams.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessOutputSnapshot {
+    pub stdout: LiveCapturedOutput,
+    pub stderr: LiveCapturedOutput,
+    pub cursor: ProcessOutputCursor,
+    /// Monotonic change number used by [`ProcessOutputObserver::changed`].
+    pub revision: u64,
+    /// True after the process supervisor has published its final result or
+    /// terminal infrastructure error.
+    pub finished: bool,
+}
+
+#[derive(Debug)]
+struct LiveBuffer {
+    bytes: Vec<u8>,
+    start: u64,
+    end: u64,
+    limit: usize,
+}
+
+impl LiveBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8192)),
+            start: 0,
+            end: 0,
+            limit,
+        }
+    }
+
+    fn append(&mut self, chunk: &[u8]) {
+        self.end = self.end.saturating_add(chunk.len() as u64);
+        if self.limit == 0 {
+            self.bytes.clear();
+            self.start = self.end;
+            return;
+        }
+        self.bytes.extend_from_slice(chunk);
+        if self.bytes.len() > self.limit {
+            let overflow = self.bytes.len() - self.limit;
+            self.bytes.drain(..overflow);
+        }
+        self.start = self.end.saturating_sub(self.bytes.len() as u64);
+    }
+
+    fn read_from(&self, requested: u64) -> LiveCapturedOutput {
+        let truncated = requested < self.start;
+        let actual = requested.clamp(self.start, self.end);
+        let offset = usize::try_from(actual - self.start).unwrap_or(self.bytes.len());
+        let available = &self.bytes[offset.min(self.bytes.len())..];
+        let complete_len = incomplete_utf8_tail_start(available).unwrap_or(available.len());
+        let text = String::from_utf8_lossy(&available[..complete_len]).into_owned();
+        LiveCapturedOutput {
+            text,
+            truncated,
+            cursor: actual.saturating_add(complete_len as u64),
+            bytes_read: self.end,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LiveOutputInner {
+    stdout: LiveBuffer,
+    stderr: LiveBuffer,
+    revision: u64,
+    finished: bool,
+}
+
+#[derive(Debug)]
+struct LiveOutputState {
+    inner: Mutex<LiveOutputInner>,
+    changed: watch::Sender<u64>,
+}
+
+impl LiveOutputState {
+    fn new(stdout_limit: usize, stderr_limit: usize) -> Arc<Self> {
+        let (changed, _) = watch::channel(0);
+        Arc::new(Self {
+            inner: Mutex::new(LiveOutputInner {
+                stdout: LiveBuffer::new(stdout_limit),
+                stderr: LiveBuffer::new(stderr_limit),
+                revision: 0,
+                finished: false,
+            }),
+            changed,
+        })
+    }
+
+    fn append(&self, stream: &'static str, chunk: &[u8]) {
+        let revision = {
+            let mut inner = self.inner.lock().expect("live output lock poisoned");
+            match stream {
+                "stdout" => inner.stdout.append(chunk),
+                "stderr" => inner.stderr.append(chunk),
+                _ => return,
+            }
+            inner.revision = inner.revision.saturating_add(1);
+            inner.revision
+        };
+        self.changed.send_replace(revision);
+    }
+
+    fn finish(&self) {
+        let revision = {
+            let mut inner = self.inner.lock().expect("live output lock poisoned");
+            if inner.finished {
+                return;
+            }
+            inner.finished = true;
+            inner.revision = inner.revision.saturating_add(1);
+            inner.revision
+        };
+        self.changed.send_replace(revision);
+    }
+}
+
+/// Cloneable non-consuming view of a running process' bounded output window.
+#[derive(Clone, Debug)]
+pub struct ProcessOutputObserver {
+    state: Arc<LiveOutputState>,
+    changed: watch::Receiver<u64>,
+}
+
+impl ProcessOutputObserver {
+    pub fn snapshot_since(&self, cursor: ProcessOutputCursor) -> ProcessOutputSnapshot {
+        let inner = self.state.inner.lock().expect("live output lock poisoned");
+        let stdout = inner.stdout.read_from(cursor.stdout);
+        let stderr = inner.stderr.read_from(cursor.stderr);
+        ProcessOutputSnapshot {
+            cursor: ProcessOutputCursor {
+                stdout: stdout.cursor,
+                stderr: stderr.cursor,
+            },
+            stdout,
+            stderr,
+            revision: inner.revision,
+            finished: inner.finished,
+        }
+    }
+
+    /// Wait until output/lifecycle revision exceeds `after_revision`.
+    /// Returns false only when the observer is already terminal and unchanged.
+    pub async fn changed(&mut self, after_revision: u64) -> bool {
+        loop {
+            let (revision, finished) = {
+                let inner = self.state.inner.lock().expect("live output lock poisoned");
+                (inner.revision, inner.finished)
+            };
+            if revision > after_revision {
+                return true;
+            }
+            if finished {
+                return false;
+            }
+            if self.changed.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessError {
+    #[error("process program must not be empty")]
+    EmptyProgram,
+    #[error("a Tokio runtime is required to spawn a process")]
+    NoTokioRuntime,
+    #[error("spawned process did not expose a pid")]
+    MissingPid,
+    #[error("process pid {0} does not fit the Unix pid type")]
+    PidOutOfRange(u32),
+    #[cfg(windows)]
+    #[error(transparent)]
+    Win32(#[from] Win32Error),
+    #[error("failed to spawn {program:?}: {source}")]
+    Spawn {
+        program: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("process I/O failed while {operation}: {source}")]
+    Io {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("process supervisor stopped before publishing a result")]
+    SupervisorStopped,
+    #[error("{stream} capture worker stopped: {message}")]
+    CaptureWorker {
+        stream: &'static str,
+        message: String,
+    },
+    #[error(
+        "process output did not reach EOF within {grace_ms} ms after termination; an escaped descendant may still hold the pipes"
+    )]
+    CaptureDrainTimedOut { grace_ms: u128 },
+}
+
+/// Last-resort process-tree cleanup, armed before the supervisor is scheduled.
+/// Own the Child as well as its group: after Tokio shutdown there may be no
+/// runtime left to drain Tokio's orphan queue, so kill-on-drop alone can leave
+/// the root as a zombie. The independent reaper keeps the original Child until
+/// try_wait has reaped it; it never waits on a potentially reused raw PID.
+struct ProcessTreeGuard {
+    tree: NativeProcessTree,
+    child: Option<Child>,
+    armed: bool,
+}
+
+impl ProcessTreeGuard {
+    fn new(tree: NativeProcessTree, child: Child) -> Self {
+        Self {
+            tree,
+            child: Some(child),
+            armed: true,
+        }
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.child.as_mut().expect("guard owns the running child")
+    }
+
+    async fn terminate(&mut self, grace: Duration) -> Result<ExitStatus, ProcessError> {
+        terminate_tree(
+            self.child.as_mut().expect("guard owns the running child"),
+            &self.tree,
+            grace,
+        )
+        .await
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = hard_kill_tree(&self.tree);
+            #[cfg(unix)]
+            if let Some(mut child) = self.child.take() {
+                // Even if group signalling failed, preserve root ownership and
+                // request its death before handing it to the synchronous reaper.
+                let _ = child.start_kill();
+                reap_without_runtime(child);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reap_without_runtime(mut child: Child) {
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
+    // Sending only after successful thread creation keeps ownership here if
+    // resource exhaustion prevents spawning the reaper. Normal completion never
+    // creates a thread; this is exclusively a supervisor-abort fallback.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    match std::thread::Builder::new()
+        .name("xharness-process-reaper".to_owned())
+        .spawn(move || {
+            if let Ok(child) = receiver.recv() {
+                reap_owned_child(child);
+            }
+        }) {
+        Ok(_) => {
+            if let Err(error) = sender.send(child) {
+                reap_owned_child(error.0);
+            }
+        }
+        // Do not silently orphan the child if a cleanup thread cannot start.
+        Err(_) => reap_owned_child(child),
+    }
+}
+
+#[cfg(unix)]
+fn reap_owned_child(mut child: Child) {
+    // Child::try_wait does not use Tokio's reactor, unlike Child::wait. Holding
+    // this Child also prevents kill-on-drop from ever targeting a recycled PID.
+    while matches!(child.try_wait(), Ok(None)) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+type NativeProcessTree = Pid;
+
+#[cfg(windows)]
+type NativeProcessTree = WindowsArc<Job>;
+
+/// Stateless native process launcher.
+#[derive(Clone, Debug, Default)]
+pub struct ProcessRuntime {
+    debug: DebugRecorder,
+}
+
+impl ProcessRuntime {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_debug(debug: DebugRecorder) -> Self {
+        Self { debug }
+    }
+
+    /// Spawn an executable directly, creating a managed native process tree.
+    pub fn spawn(&self, spec: SpawnSpec) -> Result<ProcessHandle, ProcessError> {
+        if spec.program.is_empty() {
+            return Err(ProcessError::EmptyProgram);
+        }
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| ProcessError::NoTokioRuntime)?;
+        let diagnostic_spec = spawn_spec_payload(&spec);
+
+        #[cfg(windows)]
+        let pending_job = WindowsArc::new(Job::new_kill_on_close()?);
+
+        let mut command = Command::new(&spec.program);
+        #[cfg(windows)]
+        if let Some(arguments) = xharness_win32::cmd_script_arguments(&spec.program, &spec.args) {
+            command.as_std_mut().raw_arg(arguments);
+        } else {
+            command.args(&spec.args);
+        }
+        #[cfg(not(windows))]
+        command.args(&spec.args);
+        command
+            .current_dir(&spec.cwd)
+            .env_clear()
+            .envs(&spec.env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        // Windows processes start suspended so Job assignment is complete
+        // before their first instruction. Without this ordering, a fast child
+        // can create descendants before the parent joins the Job and escape
+        // tree-wide cancellation. These are non-interactive, pipe-backed
+        // commands: suppress console allocation without detaching their pipes
+        // or weakening Job ownership. Interactive terminals use ConPTY.
+        #[cfg(windows)]
+        command
+            .as_std_mut()
+            .creation_flags(WINDOWS_CREATE_SUSPENDED | WINDOWS_CREATE_NO_WINDOW);
+
+        // SAFETY: the closure captures no state and performs exactly one
+        // async-signal-safe syscall in the post-fork/pre-exec child. Linux
+        // gets a fresh session as well as a process group. On macOS, keeping
+        // the child in the parent's session while assigning a fresh process
+        // group is intentional: hosted/sandboxed macOS runners may reject a
+        // cross-session `killpg(2)` with EPERM even for same-uid children.
+        // A dedicated process group still gives the lifecycle runtime the
+        // required tree-wide TERM/KILL semantics; hard containment remains a
+        // responsibility of the platform sandbox.
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                #[cfg(target_os = "macos")]
+                let result = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+                #[cfg(not(target_os = "macos"))]
+                let result = setsid().map(|_| ());
+                result.map_err(|error| io::Error::from_raw_os_error(error as i32))
+            });
+        }
+
+        let program = spec.program.to_string_lossy().into_owned();
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(source) => {
+                let debug = self.debug.clone();
+                let error = source.to_string();
+                runtime.spawn(async move {
+                    debug
+                        .record_lossy(DebugEvent::new(
+                            "process",
+                            "spawn.failed",
+                            json!({"spec": diagnostic_spec, "error": error}),
+                        ))
+                        .await;
+                });
+                return Err(ProcessError::Spawn { program, source });
+            }
+        };
+        let pid = match child.id() {
+            Some(pid) => pid,
+            None => {
+                let _ = child.start_kill();
+                return Err(ProcessError::MissingPid);
+            }
+        };
+
+        #[cfg(unix)]
+        let process_tree = match i32::try_from(pid) {
+            Ok(pid) => Pid::from_raw(pid),
+            Err(_) => {
+                let _ = child.start_kill();
+                return Err(ProcessError::PidOutOfRange(pid));
+            }
+        };
+        #[cfg(windows)]
+        let process_tree = {
+            if let Err(error) = pending_job.assign_pid(pid) {
+                let _ = child.start_kill();
+                return Err(ProcessError::Win32(error));
+            }
+            if let Err(error) = resume_suspended_process(pid) {
+                let _ = pending_job.terminate(1);
+                let _ = child.start_kill();
+                return Err(ProcessError::Win32(error));
+            }
+            pending_job
+        };
+
+        let stdout = child
+            .stdout
+            .take()
+            .expect("stdout is available because it was configured as piped");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("stderr is available because it was configured as piped");
+        let live_output = LiveOutputState::new(spec.stdout_limit, spec.stderr_limit);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (result_tx, result_rx) = oneshot::channel();
+        let debug = self.debug.clone();
+        let supervisor_output = Arc::clone(&live_output);
+        let process_tree_guard = ProcessTreeGuard::new(process_tree, child);
+        runtime.spawn(async move {
+            let result = supervise(
+                process_tree_guard,
+                pid,
+                stdout,
+                stderr,
+                spec,
+                cancel_rx,
+                debug,
+                diagnostic_spec,
+                Arc::clone(&supervisor_output),
+            )
+            .await;
+            supervisor_output.finish();
+            let _ = result_tx.send(result);
+        });
+
+        Ok(ProcessHandle {
+            pid,
+            cancel_tx,
+            result_rx: Some(result_rx),
+            output: ProcessOutputObserver {
+                state: Arc::clone(&live_output),
+                changed: live_output.changed.subscribe(),
+            },
+        })
+    }
+}
+
+/// An owned running process. Dropping it requests cooperative cancellation;
+/// the detached supervisor remains alive until the managed process group and
+/// bounded output drains settle or report an explicit cleanup failure.
+#[must_use = "dropping a process handle cancels the process; call wait() to collect its result"]
+pub struct ProcessHandle {
+    pid: u32,
+    cancel_tx: watch::Sender<bool>,
+    result_rx: Option<oneshot::Receiver<Result<ProcessOutput, ProcessError>>>,
+    output: ProcessOutputObserver,
+}
+
+/// Cloneable cancellation capability separated from result ownership. This
+/// lets structured tool runtimes request termination while continuing to
+/// await the single owned [`ProcessHandle`] to quiescence.
+#[derive(Clone)]
+pub struct ProcessCancellation {
+    cancel_tx: watch::Sender<bool>,
+}
+
+impl ProcessCancellation {
+    /// Returns false when the supervisor has already stopped.
+    pub fn cancel(&self) -> bool {
+        self.cancel_tx.send(true).is_ok()
+    }
+}
+
+impl ProcessHandle {
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Request termination. Returns false if the supervisor already stopped.
+    pub fn cancel(&self) -> bool {
+        self.cancel_tx.send(true).is_ok()
+    }
+
+    pub fn cancellation(&self) -> ProcessCancellation {
+        ProcessCancellation {
+            cancel_tx: self.cancel_tx.clone(),
+        }
+    }
+
+    pub fn output_observer(&self) -> ProcessOutputObserver {
+        self.output.clone()
+    }
+
+    pub async fn cancel_and_wait(self) -> Result<ProcessOutput, ProcessError> {
+        self.cancel();
+        self.wait().await
+    }
+
+    pub async fn wait(mut self) -> Result<ProcessOutput, ProcessError> {
+        let receiver = self
+            .result_rx
+            .take()
+            .expect("a ProcessHandle owns exactly one result receiver");
+        receiver
+            .await
+            .map_err(|_| ProcessError::SupervisorStopped)?
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        let _ = self.cancel_tx.send(true);
+    }
+}
+
+enum StopTrigger {
+    Exited(io::Result<ExitStatus>),
+    Cancelled,
+    TimedOut,
+}
+
+/// JoinHandle drop detaches a task. Keep cancellation armed across every `?`
+/// and supervisor cancellation, without interfering with normal output drain.
+struct CaptureTaskCleanup(Vec<tokio::task::AbortHandle>);
+
+impl CaptureTaskCleanup {
+    fn abort(&self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for CaptureTaskCleanup {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+async fn drain_captures(
+    stdout_task: &mut tokio::task::JoinHandle<io::Result<CapturedOutput>>,
+    stderr_task: &mut tokio::task::JoinHandle<io::Result<CapturedOutput>>,
+    grace: Duration,
+    cleanup: &CaptureTaskCleanup,
+) -> Result<(CapturedOutput, CapturedOutput), ProcessError> {
+    let captures = async { tokio::join!(stdout_task, stderr_task) };
+    tokio::pin!(captures);
+    let (stdout_result, stderr_result) = match time::timeout(grace, &mut captures).await {
+        Ok(results) => results,
+        Err(_) => {
+            // The join may already own one completed output. Preserve it while
+            // aborting and reaping the other task; polling its consumed handle
+            // again would panic instead of publishing the cleanup failure.
+            cleanup.abort();
+            let _ = captures.await;
+            return Err(ProcessError::CaptureDrainTimedOut {
+                grace_ms: grace.as_millis(),
+            });
+        }
+    };
+    Ok((
+        capture_result("stdout", stdout_result)?,
+        capture_result("stderr", stderr_result)?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise(
+    mut process_tree_guard: ProcessTreeGuard,
+    pid: u32,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    spec: SpawnSpec,
+    mut cancel_rx: watch::Receiver<bool>,
+    debug: DebugRecorder,
+    diagnostic_spec: Value,
+    live_output: Arc<LiveOutputState>,
+) -> Result<ProcessOutput, ProcessError> {
+    debug
+        .record_lossy(DebugEvent::new(
+            "process",
+            "started",
+            json!({"pid": pid, "spec": diagnostic_spec}),
+        ))
+        .await;
+    let mut stdout_task = tokio::spawn(capture(
+        stdout,
+        spec.stdout_limit,
+        debug.clone(),
+        pid,
+        "stdout",
+        Arc::clone(&live_output),
+    ));
+    let mut stderr_task = tokio::spawn(capture(
+        stderr,
+        spec.stderr_limit,
+        debug.clone(),
+        pid,
+        "stderr",
+        live_output,
+    ));
+    let _capture_cleanup =
+        CaptureTaskCleanup(vec![stdout_task.abort_handle(), stderr_task.abort_handle()]);
+    let timeout_duration = spec.timeout;
+    let termination_grace = spec.termination_grace;
+    let capture_drain_grace = spec.capture_drain_grace;
+    let timeout = async move {
+        match timeout_duration {
+            Some(duration) => time::sleep(duration).await,
+            None => pending::<()>().await,
+        }
+    };
+    tokio::pin!(timeout);
+
+    let trigger = tokio::select! {
+        status = process_tree_guard.child().wait() => StopTrigger::Exited(status),
+        _ = cancellation_requested(&mut cancel_rx) => StopTrigger::Cancelled,
+        _ = &mut timeout => StopTrigger::TimedOut,
+    };
+
+    let (status, termination) = match trigger {
+        StopTrigger::Exited(status) => {
+            let status = status.map_err(|source| io_error("waiting for process", source))?;
+            // A tool is a contained process tree. Do not leave descendants
+            // alive after its root exits and holding capture pipes open.
+            hard_kill_tree(&process_tree_guard.tree)?;
+            (status, TerminationReason::Exited)
+        }
+        StopTrigger::Cancelled => (
+            process_tree_guard.terminate(termination_grace).await?,
+            TerminationReason::Cancelled,
+        ),
+        StopTrigger::TimedOut => (
+            process_tree_guard.terminate(termination_grace).await?,
+            TerminationReason::TimedOut,
+        ),
+    };
+
+    // TerminateJobObject initiates tree-wide teardown, but publication must
+    // wait for the Job's active count to reach zero. Otherwise a fast root
+    // exit can expose a short interval in which a descendant is still alive.
+    #[cfg(windows)]
+    wait_for_windows_tree_exit(&process_tree_guard.tree, capture_drain_grace).await?;
+
+    let (stdout, stderr) = drain_captures(
+        &mut stdout_task,
+        &mut stderr_task,
+        capture_drain_grace,
+        &_capture_cleanup,
+    )
+    .await?;
+    process_tree_guard.disarm();
+    let output = ProcessOutput {
+        pid,
+        status: status.into(),
+        termination,
+        stdout,
+        stderr,
+    };
+    debug
+        .record_lossy(DebugEvent::new(
+            "process",
+            "completed",
+            process_output_payload(&output),
+        ))
+        .await;
+    Ok(output)
+}
+
+async fn cancellation_requested(receiver: &mut watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
+    }
+    // Dropping every sender is also cancellation.
+}
+
+#[cfg(unix)]
+async fn terminate_tree(
+    child: &mut Child,
+    process_group: &NativeProcessTree,
+    grace: Duration,
+) -> Result<ExitStatus, ProcessError> {
+    if let Err(error) = signal_group(*process_group, Signal::SIGTERM) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(error);
+    }
+
+    match time::timeout(grace, child.wait()).await {
+        Ok(status) => {
+            let status = status.map_err(|source| io_error("waiting after SIGTERM", source))?;
+            // The root may exit while a descendant ignores TERM. KILL the
+            // remaining group before awaiting capture EOF.
+            signal_group(*process_group, Signal::SIGKILL)?;
+            Ok(status)
+        }
+        Err(_) => {
+            signal_group(*process_group, Signal::SIGKILL)?;
+            child
+                .wait()
+                .await
+                .map_err(|source| io_error("waiting after SIGKILL", source))
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn terminate_tree(
+    child: &mut Child,
+    process_tree: &NativeProcessTree,
+    _grace: Duration,
+) -> Result<ExitStatus, ProcessError> {
+    process_tree.terminate(1)?;
+    child
+        .wait()
+        .await
+        .map_err(|source| io_error("waiting after TerminateJobObject", source))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn signal_group(process_group: Pid, signal: Signal) -> Result<(), ProcessError> {
+    match killpg(process_group, signal) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(io_error(
+            "signalling process group",
+            io::Error::from_raw_os_error(error as i32),
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn signal_group(process_group: Pid, signal: Signal) -> Result<(), ProcessError> {
+    // Darwin can transiently report EPERM while a recently signalled process
+    // group contains only members that are exiting or waiting to be reaped.
+    // Give that state a bounded opportunity to settle to success or ESRCH,
+    // while preserving a hard failure for a persistent permission error.
+    const DARWIN_EPERM_RETRIES: usize = 25;
+    for retry in 0..=DARWIN_EPERM_RETRIES {
+        match killpg(process_group, signal) {
+            Ok(()) | Err(Errno::ESRCH) => return Ok(()),
+            Err(Errno::EPERM) if retry < DARWIN_EPERM_RETRIES => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => {
+                return Err(io_error(
+                    "signalling process group",
+                    io::Error::from_raw_os_error(error as i32),
+                ));
+            }
+        }
+    }
+    unreachable!("the final process-group signal attempt always returns")
+}
+
+#[cfg(unix)]
+fn hard_kill_tree(process_tree: &NativeProcessTree) -> Result<(), ProcessError> {
+    signal_group(*process_tree, Signal::SIGKILL)
+}
+
+#[cfg(windows)]
+fn hard_kill_tree(process_tree: &NativeProcessTree) -> Result<(), ProcessError> {
+    process_tree.terminate(1).map_err(ProcessError::from)
+}
+
+#[cfg(windows)]
+async fn wait_for_windows_tree_exit(
+    process_tree: &NativeProcessTree,
+    grace: Duration,
+) -> Result<(), ProcessError> {
+    let deadline = time::Instant::now() + grace;
+    loop {
+        if process_tree.accounting()?.active_processes == 0 {
+            return Ok(());
+        }
+        if time::Instant::now() >= deadline {
+            return Err(io_error(
+                "waiting for Windows Job process tree to exit",
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Windows Job still contains active processes",
+                ),
+            ));
+        }
+        time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn capture<R>(
+    mut reader: R,
+    limit: usize,
+    debug: DebugRecorder,
+    pid: u32,
+    stream: &'static str,
+    live_output: Arc<LiveOutputState>,
+) -> io::Result<CapturedOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut kept = CaptureWindow::new(limit);
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        live_output.append(stream, &buffer[..count]);
+        debug
+            .record_lossy(DebugEvent::new(
+                "process",
+                "output.chunk",
+                json!({
+                    "pid": pid,
+                    "stream": stream,
+                    "bytes": count,
+                    "content": String::from_utf8_lossy(&buffer[..count]),
+                }),
+            ))
+            .await;
+        kept.append(&buffer[..count]);
+    }
+    Ok(kept.finish())
+}
+
+/// Preserve both the start and the end of a long command output. Compiler and
+/// test failures commonly arrive at the end; keeping only a prefix hides them.
+struct CaptureWindow {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    head_limit: usize,
+    tail_limit: usize,
+    limit: usize,
+    bytes_read: u64,
+}
+
+impl CaptureWindow {
+    fn new(limit: usize) -> Self {
+        let head_limit = limit / 2;
+        Self {
+            head: Vec::with_capacity(head_limit.min(8192)),
+            tail: VecDeque::with_capacity((limit - head_limit).min(8192)),
+            head_limit,
+            tail_limit: limit - head_limit,
+            limit,
+            bytes_read: 0,
+        }
+    }
+
+    fn append(&mut self, chunk: &[u8]) {
+        self.bytes_read = self.bytes_read.saturating_add(chunk.len() as u64);
+        let head_count = chunk
+            .len()
+            .min(self.head_limit.saturating_sub(self.head.len()));
+        self.head.extend_from_slice(&chunk[..head_count]);
+        self.tail.extend(chunk[head_count..].iter().copied());
+        if self.tail.len() > self.tail_limit {
+            self.tail.drain(..self.tail.len() - self.tail_limit);
+        }
+    }
+
+    fn finish(self) -> CapturedOutput {
+        let capped = self.bytes_read > self.limit as u64;
+        let tail = self.tail.into_iter().collect::<Vec<_>>();
+        if !capped {
+            let mut bytes = self.head;
+            bytes.extend_from_slice(&tail);
+            let retained = incomplete_utf8_tail_start(&bytes).unwrap_or(bytes.len());
+            let omitted_bytes = bytes.len().saturating_sub(retained) as u64;
+            bytes.truncate(retained);
+            let mut text = String::from_utf8_lossy(&bytes).into_owned();
+            if omitted_bytes > 0 {
+                text.push_str(&format!("\n[{omitted_bytes} bytes omitted]\n"));
+            }
+            return CapturedOutput {
+                text,
+                truncated: omitted_bytes > 0,
+                bytes_read: self.bytes_read,
+                omitted_bytes,
+            };
+        }
+
+        let head_end = incomplete_utf8_tail_start(&self.head).unwrap_or(self.head.len());
+        let tail_start = tail
+            .iter()
+            .take_while(|byte| is_utf8_continuation(**byte))
+            .count();
+        let tail_end = incomplete_utf8_tail_start(&tail[tail_start..])
+            .map(|end| tail_start + end)
+            .unwrap_or(tail.len());
+        let retained = head_end.saturating_add(tail_end.saturating_sub(tail_start));
+        let omitted_bytes = self.bytes_read.saturating_sub(retained as u64);
+        let head = String::from_utf8_lossy(&self.head[..head_end]);
+        let tail = String::from_utf8_lossy(&tail[tail_start..tail_end]);
+        CapturedOutput {
+            text: format!("{head}\n[{omitted_bytes} bytes omitted]\n{tail}"),
+            truncated: true,
+            bytes_read: self.bytes_read,
+            omitted_bytes,
+        }
+    }
+}
+
+fn spawn_spec_payload(spec: &SpawnSpec) -> Value {
+    let env = spec
+        .env
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                Value::String(value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "program": spec.program.to_string_lossy(),
+        "args": spec.args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+        "cwd": spec.cwd.to_string_lossy(),
+        "env": env,
+        "timeoutMs": spec.timeout.map(|duration| duration.as_millis()),
+        "terminationGraceMs": spec.termination_grace.as_millis(),
+        "captureDrainGraceMs": spec.capture_drain_grace.as_millis(),
+        "stdoutLimit": spec.stdout_limit,
+        "stderrLimit": spec.stderr_limit,
+        "parent": &spec.debug_parent,
+    })
+}
+
+fn process_output_payload(output: &ProcessOutput) -> Value {
+    json!({
+        "pid": output.pid,
+        "termination": format!("{:?}", output.termination),
+        "status": {
+            "success": output.status.success,
+            "code": output.status.code,
+            "signal": output.status.signal,
+            "coreDumped": output.status.core_dumped,
+        },
+        "stdout": {
+            "text": &output.stdout.text,
+            "truncated": output.stdout.truncated,
+            "bytesRead": output.stdout.bytes_read,
+        },
+        "stderr": {
+            "text": &output.stderr.text,
+            "truncated": output.stderr.truncated,
+            "bytesRead": output.stderr.bytes_read,
+        },
+    })
+}
+
+/// Locate a terminal byte sequence that is still a possible prefix of a valid
+/// UTF-8 scalar. Invalid bytes earlier in the buffer do not prevent detection
+/// of an independently truncated scalar at the cap boundary.
+fn incomplete_utf8_tail_start(bytes: &[u8]) -> Option<usize> {
+    let mut continuation_start = bytes.len();
+    while continuation_start > 0 && is_utf8_continuation(bytes[continuation_start - 1]) {
+        continuation_start -= 1;
+    }
+
+    if continuation_start == bytes.len() {
+        let lead_index = bytes.len().checked_sub(1)?;
+        return utf8_width(bytes[lead_index])
+            .filter(|width| *width > 1)
+            .map(|_| lead_index);
+    }
+
+    let lead_index = continuation_start.checked_sub(1)?;
+    let width = utf8_width(bytes[lead_index])?;
+    let available = bytes.len() - lead_index;
+    if available >= width || !is_possible_utf8_prefix(&bytes[lead_index..]) {
+        return None;
+    }
+    Some(lead_index)
+}
+
+const fn is_utf8_continuation(byte: u8) -> bool {
+    byte & 0b1100_0000 == 0b1000_0000
+}
+
+const fn utf8_width(lead: u8) -> Option<usize> {
+    match lead {
+        0x00..=0x7f => Some(1),
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
+}
+
+fn is_possible_utf8_prefix(bytes: &[u8]) -> bool {
+    if bytes.len() < 2 {
+        return true;
+    }
+    let second = bytes[1];
+    match bytes[0] {
+        0xe0 => (0xa0..=0xbf).contains(&second),
+        0xed => (0x80..=0x9f).contains(&second),
+        0xf0 => (0x90..=0xbf).contains(&second),
+        0xf4 => (0x80..=0x8f).contains(&second),
+        _ => is_utf8_continuation(second),
+    }
+}
+
+fn capture_result(
+    stream: &'static str,
+    result: Result<io::Result<CapturedOutput>, tokio::task::JoinError>,
+) -> Result<CapturedOutput, ProcessError> {
+    match result {
+        Ok(Ok(capture)) => Ok(capture),
+        Ok(Err(source)) => Err(io_error("reading process output", source)),
+        Err(error) => Err(ProcessError::CaptureWorker {
+            stream,
+            message: error.to_string(),
+        }),
+    }
+}
+
+fn io_error(operation: &'static str, source: io::Error) -> ProcessError {
+    ProcessError::Io { operation, source }
+}
+
+/// Remove likely credential-bearing variables and return the removed names.
+///
+/// Matching is ASCII case-insensitive. It recognizes common exact variables,
+/// credential words separated by punctuation, and API/private key suffixes,
+/// while avoiding unrelated names such as `MONKEY`.
+pub fn scrub_secret_env(env: &mut BTreeMap<OsString, OsString>) -> Vec<OsString> {
+    let mut removed = Vec::new();
+    env.retain(|name, _| {
+        let secret = is_secret_env_name(name);
+        if secret {
+            removed.push(name.clone());
+        }
+        !secret
+    });
+    removed
+}
+
+pub fn is_secret_env_name(name: &OsStr) -> bool {
+    let normalized = name.to_string_lossy().to_ascii_uppercase();
+    if matches!(
+        normalized.as_str(),
+        "AUTHORIZATION"
+            | "COOKIE"
+            | "GIT_ASKPASS"
+            | "SSH_ASKPASS"
+            | "SSH_AUTH_SOCK"
+            | "API_KEY"
+            | "PRIVATE_KEY"
+    ) || normalized.ends_with("_API_KEY")
+        || normalized.ends_with("_PRIVATE_KEY")
+    {
+        return true;
+    }
+
+    normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| {
+            matches!(
+                part,
+                "TOKEN" | "SECRET" | "PASSWORD" | "PASSWD" | "CREDENTIAL" | "CREDENTIALS"
+            )
+        })
+}
+
+#[cfg(test)]
+mod capture_cleanup_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::{io::ReadBuf, sync::oneshot};
+
+    struct PendingReader(Option<oneshot::Sender<()>>);
+    impl AsyncRead for PendingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl Drop for PendingReader {
+        fn drop(&mut self) {
+            let _ = self.0.take().unwrap().send(());
+        }
+    }
+
+    fn pending_capture(
+        live: Arc<LiveOutputState>,
+        stream: &'static str,
+    ) -> (
+        tokio::task::JoinHandle<io::Result<CapturedOutput>>,
+        oneshot::Receiver<()>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        (
+            tokio::spawn(capture(
+                PendingReader(Some(tx)),
+                1024,
+                DebugRecorder::disabled(),
+                0,
+                stream,
+                live,
+            )),
+            rx,
+        )
+    }
+
+    async fn assert_released(rx: oneshot::Receiver<()>) {
+        time::timeout(Duration::from_secs(3), rx)
+            .await
+            .expect("capture cleanup hung")
+            .expect("reader not dropped");
+    }
+
+    #[tokio::test]
+    async fn error_return_cancels_both_detached_captures() {
+        let live = LiveOutputState::new(1024, 1024);
+        let weak = Arc::downgrade(&live);
+        let (stdout, out_dropped) = pending_capture(live.clone(), "stdout");
+        let (stderr, err_dropped) = pending_capture(live, "stderr");
+        let cleanup = CaptureTaskCleanup(vec![stdout.abort_handle(), stderr.abort_handle()]);
+        let result: Result<(), &str> = async move {
+            let _cleanup = cleanup;
+            let _tasks = (stdout, stderr);
+            Err("injected termination failure")?;
+            Ok(())
+        }
+        .await;
+        assert!(result.is_err());
+        assert_released(out_dropped).await;
+        assert_released(err_dropped).await;
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn supervisor_abort_also_cancels_captures() {
+        let live = LiveOutputState::new(1024, 1024);
+        let (stdout, out_dropped) = pending_capture(live.clone(), "stdout");
+        let (stderr, err_dropped) = pending_capture(live, "stderr");
+        let cleanup = CaptureTaskCleanup(vec![stdout.abort_handle(), stderr.abort_handle()]);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let supervisor = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            let _tasks = (stdout, stderr);
+            let _ = ready_tx.send(());
+            pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        supervisor.abort();
+        assert!(supervisor.await.unwrap_err().is_cancelled());
+        assert_released(out_dropped).await;
+        assert_released(err_dropped).await;
+    }
+
+    #[tokio::test]
+    async fn successful_capture_keeps_complete_tail_output() {
+        let live = LiveOutputState::new(1024, 1024);
+        let mut task = tokio::spawn(capture(
+            &b"tail output\n"[..],
+            1024,
+            DebugRecorder::disabled(),
+            0,
+            "stdout",
+            live,
+        ));
+        let _cleanup = CaptureTaskCleanup(vec![task.abort_handle()]);
+        let output = (&mut task).await.unwrap().unwrap();
+        assert_eq!(output.text, "tail output\n");
+        assert_eq!(output.bytes_read, 12);
+    }
+
+    async fn asymmetric_drain_timeout(completed_stream: &'static str) {
+        let live = LiveOutputState::new(1024, 1024);
+        let weak = Arc::downgrade(&live);
+        let mut complete = tokio::spawn(capture(
+            &b"complete\n"[..],
+            1024,
+            DebugRecorder::disabled(),
+            0,
+            completed_stream,
+            live.clone(),
+        ));
+        let pending_stream = if completed_stream == "stdout" {
+            "stderr"
+        } else {
+            "stdout"
+        };
+        let (mut pending, dropped) = pending_capture(live, pending_stream);
+        time::timeout(Duration::from_secs(3), async {
+            while !complete.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed capture did not finish");
+        let cleanup = CaptureTaskCleanup(vec![complete.abort_handle(), pending.abort_handle()]);
+        let grace = Duration::from_millis(20);
+        let result = if completed_stream == "stdout" {
+            drain_captures(&mut complete, &mut pending, grace, &cleanup).await
+        } else {
+            drain_captures(&mut pending, &mut complete, grace, &cleanup).await
+        };
+        assert!(matches!(
+            result,
+            Err(ProcessError::CaptureDrainTimedOut { grace_ms: 20 })
+        ));
+        assert!(complete.is_finished());
+        assert!(pending.is_finished());
+        assert_released(dropped).await;
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_timeout_after_stdout_completion_reaps_stderr_without_repolling_stdout() {
+        asymmetric_drain_timeout("stdout").await;
+    }
+
+    #[tokio::test]
+    async fn drain_timeout_after_stderr_completion_reaps_stdout_without_repolling_stderr() {
+        asymmetric_drain_timeout("stderr").await;
+    }
+}

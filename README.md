@@ -34,9 +34,11 @@ Apache-2.0。状态:**拆分验证中,尚未发布。**
 - CI 只覆盖 Linux + macOS;Windows 门控测试(如 `bundled_windows.rs`,依赖 `apps/desktop` 桌面资源)未随迁。
 - 上游的架构边界检查(`config/architecture-*.json` + `check-architecture.py`)属于 host 仓库治理,未随迁;本仓库以 `cargo check/test` 为底线。
 
-## 自动跟随上游
+## 上游策略:冻结
 
-`scripts/sync-upstream.sh` + `.github/workflows/sync-upstream.yml` 实现每日自动同步:克隆上游 → 按本仓库 members 清单重新抽取闭包 → `cargo check` → 有变更则以 `sync/upstream-<sha>` 分支开 PR。**同步永远走 PR + CI 审查,不自动合并**;上游若重命名/删除闭包内 crate,脚本会显式报错等人工处理。手动触发:Actions 页 workflow_dispatch,或本地 `bash scripts/sync-upstream.sh`。
+运行时核心定位为基础设施,已冻结(基线 `58d8941`),不自动跟随上游——本地特殊设计因此没有同步冲突压力。同步机制保留为手动档:需要追上游时走 Actions 的 workflow_dispatch 或本地 `bash scripts/sync-upstream.sh`(按 members 清单重新抽取闭包 + cargo check,变更仍以 PR + CI 审查进入)。
+
+例外:上游若修复闭包内 crate 的安全类问题(session/沙箱/鉴权),值得手动同步一次;常规功能迭代不追。
 
 ## 验证
 

@@ -1,8 +1,7 @@
 name: sync-upstream
 
+# 上游已冻结于 58d8941,仅按需手动触发(workflow_dispatch 或本地脚本)。
 on:
-  schedule:
-    - cron: "0 21 * * *" # 每日 UTC 21:00(北京时间 05:00)
   workflow_dispatch:
 
 permissions:

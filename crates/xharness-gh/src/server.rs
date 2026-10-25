@@ -111,11 +111,13 @@ fn build_prompt(payload: &TaskPayload, workspace: &std::path::Path) -> String {
                  diff stat:\n```\n{stat}\n```\n\
                  diff {note}:\n```diff\n{diff}\n```\n\
                  \n\
+                 {ground_truth}\n\
                  评审要求:\n\
                  1. 按严重度分级:**P0 必须修复**(bug/安全/数据丢失/破坏兼容)、**P1 建议修复**(逻辑隐患/缺测试/性能)、**P2 可选**(风格/命名)。\n\
                  2. 每条 finding 的第一行必须是代码引用,格式 `path/to/file.rs:42`;无引用的 finding 不算数。\n\
-                 3. 每条 finding 给出可执行的验证方式(命令、测试名或构造步骤);不确定的明确标注「未验证」。\n\
-                 4. 可以在工作目录里跑命令核实(read 文件、grep、跑测试),核实过的标注「已验证」。\n\
+                 3. **P0 必须是你在工作目录亲自验证过的**(跑复现命令/测试/构造输入并看到失败);无法验证的只能写「P0?(未验证)」并降级讨论。\n\
+                 4. 每条 finding 给出可执行的验证方式(命令、测试名或构造步骤);宿主预跑检查的报错可直接引用为证据。\n\
+                 5. 可以在工作目录里跑命令核实(read 文件、grep、跑测试),核实过的标注「已验证」。\n\
                  \n\
                  输出格式(严格遵守,不要输出别的章节):\n\
                  ## 总结\n<一两段>\n## P0\n<列表或「无」>\n## P1\n<列表或「无」>\n## P2\n<列表或「无」>\n## 验证建议\n<列表>\n\
@@ -132,6 +134,14 @@ fn build_prompt(payload: &TaskPayload, workspace: &std::path::Path) -> String {
                 note = inline_note,
                 diff = pr.diff_inline,
                 body = payload.body,
+                ground_truth = match payload.pr.as_ref().and_then(|pr| pr.checks_inline.clone()) {
+                    Some(checks) => format!(
+                        "宿主预跑静态检查(ground truth,可直接引用;完整输出见 {}):\n```\n{}\n```",
+                        payload.pr.as_ref().and_then(|pr| pr.checks_path.as_deref()).unwrap_or("checks.log"),
+                        checks
+                    ),
+                    None => "(宿主未预跑静态检查:非 Rust 项目或检查不可用,请你自行运行构建/测试来验证)".to_owned(),
+                },
             )
         }
         None => format!(
@@ -369,10 +379,15 @@ pub async fn poll_once(state: &GhHostState) -> Result<usize, String> {
             )
             .await;
             match prepared {
-                Ok(outcome) => {
+                Ok(mut outcome) => {
                     let _ = std::fs::remove_dir_all(&workspace);
                     if std::fs::rename(&staging, &workspace).is_err() {
                         return Err(format!("review workspace 替换失败: {session_id}"));
+                    }
+                    if let Some((inline, path)) = crate::gitprep::run_quick_checks(&workspace).await
+                    {
+                        outcome.context.checks_inline = Some(inline);
+                        outcome.context.checks_path = Some(path);
                     }
                     Some(outcome.context)
                 }

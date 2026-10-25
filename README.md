@@ -44,7 +44,9 @@ Apache-2.0。状态:**拆分验证中,尚未发布。**
 
 `/xh` 评论落在 PR 上时自动进入 review 模式:host clone 仓库、checkout PR head、生成 diff.patch 与 diff.stat 注入任务;评审输出按 **P0 必须修复 / P1 建议修复 / P2 可选** 分级,每条 finding 强制 `path:line` 引用与验证方式;结果评论附 host 生成的**复现信息块**(repo/PR/head/base SHA/diff stat/session id)。label:`xh:reviewed`,出现 P0 加 `xh:review-p0`。
 
-- 思考强度:`XH_GH_REASONING`(如 high),进 ModelRoute.reasoning_effort;端点需支持。
+- **宿主预跑静态检查**:Rust 项目在评审前自动 `cargo check` + `cargo clippy`(240s 超时),结果作为 ground truth 注入 prompt 并存 `checks.log`——本地 loop 独有,评论发出前宿主已跑过你的构建。
+- **verify-first 分级**:P0 必须是 agent 在工作区亲自验证过的(跑复现/测试见失败);无法验证只能写「P0?(未验证)」。这是压制误报、超越只看 diff 的云端 review 的核心规则。
+- 思考强度:`XH_GH_REASONING`(建议 high;DeepSeek 建议配 deepseek-reasoner),进 ModelRoute.reasoning_effort;端点需支持。
 - 可复现:task.json 记录任务与 PR SHA;评审轨迹在 durable session(append-only JSONL);同 PR 新 `/xh` 评论即刷新评审。
 - 崩溃恢复:启动时 `recover_pending` 重放 task.json;已完成(done.marker)跳过,未完成的以重试 tag 重跑(at-least-once,回写 upsert 幂等)。
 - 私有仓/本地 origin:`XH_GH_ORIGIN` 覆盖 clone 源。

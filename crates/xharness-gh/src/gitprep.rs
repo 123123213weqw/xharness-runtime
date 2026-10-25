@@ -2,6 +2,7 @@
 //! diff.patch / diff.stat。全部通过 tokio::process 调 git,失败显式报错。
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,12 @@ pub struct PrContext {
     pub diff_truncated: bool,
     /// 内联 diff 前缀(与 diff_path 内容一致,可能截断)。
     pub diff_inline: String,
+    /// 宿主预跑静态检查的输出(ground truth);None = 未跑/不适用。
+    #[serde(default)]
+    pub checks_inline: Option<String>,
+    /// 完整检查输出在 workspace 的路径。
+    #[serde(default)]
+    pub checks_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -109,6 +116,57 @@ pub async fn prepare_review_workspace(
             diff_path: diff_path.to_owned(),
             diff_truncated,
             diff_inline,
+            checks_inline: None,
+            checks_path: None,
         },
     })
+}
+
+/// 仓库感知的快速静态检查(Rust 项目:cargo check + clippy;其他生态
+/// 暂跳过)。这是本地 loop 的独有优势:评审评论发出前,宿主先跑过构建。
+/// 超时 240s;完整输出写 checks.log,内联截断到 8000 字符。
+pub async fn run_quick_checks(workspace: &Path) -> Option<(String, String)> {
+    if !workspace.join("Cargo.toml").exists() {
+        return None;
+    }
+    let mut combined = String::new();
+    for (label, args) in [
+        (
+            "cargo check --all-targets",
+            vec!["check", "--all-targets", "--message-format=short"],
+        ),
+        (
+            "cargo clippy --all-targets",
+            vec!["clippy", "--all-targets", "--message-format=short"],
+        ),
+    ] {
+        combined.push_str(&format!("\n$ {label}\n"));
+        match tokio::time::timeout(
+            Duration::from_secs(240),
+            tokio::process::Command::new("cargo")
+                .current_dir(workspace)
+                .args(&args)
+                .output(),
+        )
+        .await
+        {
+            Ok(Ok(output)) => {
+                combined.push_str(&String::from_utf8_lossy(&output.stdout));
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // short 模式把诊断写 stderr;错误才有价值。
+                for line in stderr.lines() {
+                    if line.contains("error") || line.contains("warning:") {
+                        combined.push_str(line);
+                        combined.push('\n');
+                    }
+                }
+                combined.push_str(&format!("(exit {})\n", output.status.code().unwrap_or(-1)));
+            }
+            Ok(Err(_)) => combined.push_str("(cargo 启动失败)\n"),
+            Err(_) => combined.push_str("(超时 240s,跳过)\n"),
+        }
+    }
+    let _ = std::fs::write(workspace.join("checks.log"), &combined);
+    let inline: String = combined.chars().take(8_000).collect();
+    Some((inline, "checks.log".to_owned()))
 }

@@ -1,5 +1,6 @@
-//! Axum 任务入口:POST /tasks 提交 issue 任务,GET /results/:id 轮询结果。
-//! 每个 (repo, issue) 一个持久 durable session。
+//! Axum 任务入口:POST /tasks 提交 issue 任务,GET /results/{id} 轮询结果。
+//! 每个 (repo, issue) 一个持久 durable session;turn 完成后由完成钩子把
+//! 结果 upsert 到该会话的评论槽并打 xh:done。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,11 +20,15 @@ use xharness_host::{
 };
 use xharness_session::{Message, MessageRole};
 
+use crate::client::session_marker;
+use crate::factory::GhToolConfig;
+
 #[derive(Clone)]
 pub struct GhHostState {
     pub runtime: Arc<DurableLoopAgentRuntime>,
     pub route: ModelRoute,
     pub results: Arc<Mutex<HashMap<String, TaskOutcome>>>,
+    pub gh: Option<GhToolConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,14 +52,25 @@ pub struct TaskPayload {
     pub body: String,
 }
 
-fn session_id_for(repo: &str, issue: u64) -> String {
-    format!("gh-{}-{issue}", repo.replace('/', "-"))
+pub fn session_id_for(repo: &str, issue: u64) -> String {
+    format!("gh-{}-{issue}", repo.replace('/', "--"))
 }
 
 async fn submit_task(
     State(state): State<GhHostState>,
     Json(payload): Json<TaskPayload>,
 ) -> impl IntoResponse {
+    if let Some(gh) = &state.gh {
+        if payload.repo != gh.repo {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!(
+                    "repo {} 不在本 gh-host 的服务范围({})内",
+                    payload.repo, gh.repo
+                )})),
+            );
+        }
+    }
     let session_id = session_id_for(&payload.repo, payload.issue);
     let request = AgentTurnRequest {
         session_id: session_id.clone(),
@@ -94,6 +110,8 @@ async fn submit_task(
     };
     let results = Arc::clone(&state.results);
     let tracked_session = session_id.clone();
+    let gh = state.gh.clone();
+    let issue = payload.issue;
     tokio::spawn(async move {
         while turn.next_event().await.is_some() {}
         let result = turn.result().await;
@@ -101,13 +119,31 @@ async fn submit_task(
             LoopStatus::Completed => "done",
             _ => "stopped",
         };
+        let final_text = if result.final_text.is_empty() {
+            "(任务结束,模型没有产生文本输出)"
+        } else {
+            result.final_text.as_str()
+        };
         results.lock().unwrap().insert(
-            tracked_session,
+            tracked_session.clone(),
             TaskOutcome {
                 status: status.to_owned(),
-                final_text: result.final_text,
+                final_text: final_text.to_owned(),
             },
         );
+        if let Some(gh) = gh {
+            let body = format!("## xh-gh 任务结果\n\n{final_text}\n\n---\n状态: `{status}`");
+            if let Err(error) = gh
+                .client
+                .upsert_session_comment(&gh.repo, issue, &session_marker(&tracked_session), &body)
+                .await
+            {
+                eprintln!("[xh-gh] 结果评论写入失败: {error}");
+            }
+            if let Err(error) = gh.client.add_label(&gh.repo, issue, "xh:done").await {
+                eprintln!("[xh-gh] label 写入失败: {error}");
+            }
+        }
     });
     (StatusCode::ACCEPTED, Json(json!({"sessionId": session_id})))
 }

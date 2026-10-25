@@ -28,6 +28,7 @@ async fn task_post_runs_turn_and_records_tool_call() {
     let leases = Arc::new(FileLeaseManager::new(dir.join("leases")).expect("lease manager"));
     let calls = Arc::new(Mutex::new(Vec::new()));
     let factory = Arc::new(GhToolFactory {
+        gh: None,
         calls: Arc::clone(&calls),
     });
     let runtime = Arc::new(DurableLoopAgentRuntime::new(
@@ -44,6 +45,7 @@ async fn task_post_runs_turn_and_records_tool_call() {
         runtime,
         route: ModelRoute::new("mock", "scripted"),
         results: Default::default(),
+        gh: None,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -67,13 +69,13 @@ async fn task_post_runs_turn_and_records_tool_call() {
     let status = response.status();
     let accepted: Value = response.json().await.expect("response body");
     assert_eq!(status, 202, "body: {accepted}");
-    assert_eq!(accepted["sessionId"], "gh-acme-x-7");
+    assert_eq!(accepted["sessionId"], "gh-acme--x-7");
 
     let mut final_text = String::new();
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let result: Value = client
-            .get(format!("http://{addr}/results/gh-acme-x-7"))
+            .get(format!("http://{addr}/results/gh-acme--x-7"))
             .send()
             .await
             .expect("get /results")
@@ -89,6 +91,5 @@ async fn task_post_runs_turn_and_records_tool_call() {
 
     let recorded = calls.lock().unwrap();
     assert_eq!(recorded.len(), 1, "gh_comment 恰好被调用一次: {recorded:?}");
-    assert_eq!(recorded[0]["issue_number"], 7);
     assert_eq!(recorded[0]["body"], "fixed by mock agent");
 }

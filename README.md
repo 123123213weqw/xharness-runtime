@@ -24,7 +24,7 @@ Apache-2.0。状态:**拆分验证中,尚未发布。**
 ## 溯源
 
 - 来源:`123123213weqw/x-harness-rs`
-- 基线提交:`58d894140cb566865023481b49eed437b6ccb5fe`
+- 基线提交:`cf9b0fc6d8c07bdad781c81876988e816cca5578`
 - 拆分日期:2026-10-25
 - 拆分方式:按 `xharness-core / xharness-agent / xharness-platform / xharness-provider-openai` 四根做依赖闭包 BFS,逐 crate 原样复制(源码零修改);`runtime/`、`scripts/fixtures/`、`config/providers.local-reasoning.example.json` 为测试所需的上游根目录资源,一并保留。
 - git 历史未随迁;需要时可对上游做 `git filter-repo` graft。

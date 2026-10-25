@@ -24,6 +24,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # coding-tools 的 glob/grep 真实依赖 ripgrep;2026-10 起 GitHub 镜像不再预装
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - if: runner.os == 'macOS'
+        run: brew install ripgrep
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy

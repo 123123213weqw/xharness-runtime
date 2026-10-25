@@ -40,6 +40,11 @@ Apache-2.0。状态:**拆分验证中,尚未发布。**
 
 例外:上游若修复闭包内 crate 的安全类问题(session/沙箱/鉴权),值得手动同步一次;常规功能迭代不追。
 
+## 部署依赖
+
+- `ripgrep`(rg):coding-tools 的 glob/grep 真实调用宿主 rg,V100/CI 需安装(apt/brew)。CI 已显式安装。
+- 其余:git(克隆/推送)、OpenAI 兼容模型端点。
+
 ## 验证
 
 ```sh

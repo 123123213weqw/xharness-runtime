@@ -1,0 +1,1274 @@
+//! Regression coverage for delayed, steered and removed Host observers.
+use super::*;
+use serde_json::json;
+
+struct Issue73Provider {
+    requests: AtomicUsize,
+}
+
+#[async_trait]
+impl ModelProvider for Issue73Provider {
+    async fn stream(
+        &self,
+        _: ProviderRequest,
+        _: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        let first = self.requests.fetch_add(1, AtomicOrdering::SeqCst) == 0;
+        if first {
+            Ok(Box::pin(stream::iter([
+                Ok(ProviderEvent::ToolCallDelta {
+                    index: 0,
+                    id: "issue73-call".into(),
+                    name: "issue73-gated".into(),
+                    arguments_delta: "{}".into(),
+                }),
+                Ok(ProviderEvent::Completed {
+                    finish_reason: Some(FinishReason::ToolCalls),
+                    usage: None,
+                    provider_items: Vec::new(),
+                }),
+            ])))
+        } else {
+            Ok(Box::pin(stream::iter([
+                Ok(ProviderEvent::TextDelta("completed".into())),
+                Ok(ProviderEvent::Completed {
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: None,
+                    provider_items: Vec::new(),
+                }),
+            ])))
+        }
+    }
+}
+
+struct Issue73Tools {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl SessionToolFactory for Issue73Tools {
+    async fn executor(
+        &self,
+        _: &str,
+        _: &str,
+        _: PermissionPreset,
+    ) -> Result<xharness_tools::ToolExecutor, String> {
+        use xharness_tools::{ToolDefinition, ToolExecutor, ToolOutput, ToolRegistry, ToolSpec};
+        let registry = Arc::new(ToolRegistry::new());
+        let started = Arc::clone(&self.started);
+        let release = Arc::clone(&self.release);
+        registry
+            .register(ToolSpec::new(
+                ToolDefinition::new("issue73-gated", "gated test", json!({"type":"object"})),
+                move |_| {
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        Ok(ToolOutput::text("tool-completed"))
+                    }
+                },
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(ToolExecutor::new(registry))
+    }
+}
+
+/// #73: busy-Enter must not let Host start another turn while the first tool
+/// is still running, and must not convert its eventual result to unknown.
+#[tokio::test]
+async fn queued_prompt_waits_for_in_flight_tool_to_finish() {
+    use std::time::Duration;
+    use xharness_api::RpcId;
+    use xharness_session::{EventData, ToolOutcome, TurnEndReason};
+
+    crate::statecheck::assert_profile("running tool prompt");
+
+    let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let runtime = Arc::new(DurableLoopAgentRuntime::new(
+        "test",
+        "test-model",
+        Some(Arc::new(Issue73Provider {
+            requests: AtomicUsize::new(0),
+        })),
+        Arc::new(Issue73Tools {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        }),
+        Arc::new(IdentityContextPolicy),
+        Arc::clone(&store),
+        Arc::new(MemoryLeaseManager::default()),
+        64,
+    ));
+    let mut config = crate::HostConfig::new(std::env::current_dir().unwrap());
+    config.provider_id = "test".into();
+    config.model_id = "test-model".into();
+    let host = crate::BasicHost::with_agent_runtime(config, runtime.clone());
+    crate::rpc::session_lifecycle::create(&host, &json!({"sessionId":"issue73"}))
+        .await
+        .unwrap();
+    let admission = |id: &str| crate::driver::PromptAdmission {
+        rpc_id: RpcId::new(id),
+        session_id: "issue73".into(),
+        mode: "queue".into(),
+        text: id.into(),
+        content: vec![json!({"type":"text","text":id})],
+        source: json!({"kind":"user"}),
+        fingerprint: None,
+    };
+
+    host.enqueue_prompt(admission("first")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), started.notified())
+        .await
+        .expect("first tool must start");
+    host.enqueue_prompt(admission("queued")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let during = store.load("issue73").await.unwrap().unwrap();
+    assert_eq!(
+        during
+            .events()
+            .iter()
+            .filter(|e| matches!(e.data(), EventData::TurnStart { .. }))
+            .count(),
+        1,
+        "second turn started while the first tool was in flight"
+    );
+    assert!(!during
+        .events()
+        .iter()
+        .any(|e| matches!(e.data(), EventData::TurnEnd { .. })));
+    assert!(!during.events().iter().any(|e| matches!(
+        e.data(),
+        EventData::ToolResult { result, .. } if result.outcome == ToolOutcome::OutcomeUnknown
+    )));
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let session = store.load("issue73").await.unwrap().unwrap();
+            if session.events().iter().any(|e| {
+                matches!(
+                    e.data(),
+                    EventData::TurnEnd {
+                        turn: 2,
+                        reason: TurnEndReason::Completed
+                    }
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued turn must complete after the first tool");
+    let session = store.load("issue73").await.unwrap().unwrap();
+    let events = session.events();
+    let tool_result = events.iter().position(|e| matches!(
+        e.data(), EventData::ToolResult { result, .. }
+            if result.outcome == ToolOutcome::Success && result.content.contains("tool-completed")
+    )).expect("first tool result must survive");
+    let first_end = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e.data(),
+                EventData::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Completed
+                }
+            )
+        })
+        .expect("first turn must complete normally");
+    let second_start = events
+        .iter()
+        .position(|e| matches!(e.data(), EventData::TurnStart { turn: 2 }))
+        .expect("second turn must start");
+    assert!(tool_result < first_end && first_end < second_start);
+    assert!(!events.iter().any(|e| matches!(
+        e.data(), EventData::ToolResult { result, .. } if result.outcome == ToolOutcome::OutcomeUnknown
+    )));
+    runtime.shutdown(Duration::from_secs(1)).await;
+}
+
+/// Parameterized Host/Agent boundary check: each run admits a next-turn input
+/// while the first provider request is suspended, then releases it.
+#[tokio::test]
+async fn queued_prompt_waits_for_in_flight_model_to_finish() {
+    use std::time::Duration;
+    use xharness_api::RpcId;
+    use xharness_session::{EventData, TurnEndReason};
+
+    crate::statecheck::assert_profile("running model prompt");
+    for ordinal in 0..3 {
+        let session_id = format!("statecheck-model-{ordinal}");
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let release = Arc::new(Notify::new());
+        let provider = Arc::new(BlockingFirstProvider {
+            attempts: AtomicUsize::new(0),
+            release: Arc::clone(&release),
+        });
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider.clone()),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let mut config = crate::HostConfig::new(std::env::current_dir().unwrap());
+        config.provider_id = "test".into();
+        config.model_id = "test-model".into();
+        let host = crate::BasicHost::with_agent_runtime(config, runtime.clone());
+        crate::rpc::session_lifecycle::create(&host, &json!({"sessionId":session_id}))
+            .await
+            .unwrap();
+        let admission = |id: &str| crate::driver::PromptAdmission {
+            rpc_id: RpcId::new(format!("{id}-{ordinal}")),
+            session_id: session_id.clone(),
+            mode: "queue".into(),
+            text: id.into(),
+            content: vec![json!({"type":"text","text":id})],
+            source: json!({"kind":"user"}),
+            fingerprint: None,
+        };
+        host.enqueue_prompt(admission("first")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while provider.attempts.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first model request must start");
+        host.enqueue_prompt(admission("queued")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let during = store.load(&session_id).await.unwrap().unwrap();
+        assert_eq!(
+            during
+                .events()
+                .iter()
+                .filter(|e| matches!(e.data(), EventData::TurnStart { .. }))
+                .count(),
+            1,
+            "case {ordinal}: second turn started before first model completion"
+        );
+        assert!(!during
+            .events()
+            .iter()
+            .any(|e| matches!(e.data(), EventData::TurnEnd { .. })));
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let session = store.load(&session_id).await.unwrap().unwrap();
+                if session.events().iter().any(|e| {
+                    matches!(
+                        e.data(),
+                        EventData::TurnEnd {
+                            turn: 2,
+                            reason: TurnEndReason::Completed
+                        }
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued turn must finish");
+        let session = store.load(&session_id).await.unwrap().unwrap();
+        let events = session.events();
+        let first_end = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e.data(),
+                    EventData::TurnEnd {
+                        turn: 1,
+                        reason: TurnEndReason::Completed
+                    }
+                )
+            })
+            .unwrap();
+        let second_start = events
+            .iter()
+            .position(|e| matches!(e.data(), EventData::TurnStart { turn: 2 }))
+            .unwrap();
+        assert!(first_end < second_start, "case {ordinal}: turns overlapped");
+        runtime.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+struct FloodThenBlock {
+    attempts: AtomicUsize,
+    emitted: Arc<AtomicUsize>,
+    begin: Arc<Notify>,
+    finish: Arc<Notify>,
+}
+#[async_trait]
+impl ModelProvider for FloodThenBlock {
+    async fn stream(
+        &self,
+        _: ProviderRequest,
+        _: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        if self.attempts.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+            let (begin, finish, emitted) = (
+                self.begin.clone(),
+                self.finish.clone(),
+                self.emitted.clone(),
+            );
+            Ok(Box::pin(async_stream::stream! {
+                begin.notified().await;
+                for _ in 0..2200 {
+                    yield Ok(ProviderEvent::TextDelta("x".into()));
+                    emitted.fetch_add(1, AtomicOrdering::SeqCst);
+                    // No wall-clock pacing: Windows timer granularity can turn
+                    // 2200 one-millisecond sleeps into >30 seconds.
+                    tokio::task::yield_now().await;
+                }
+                finish.notified().await;
+                yield Ok(ProviderEvent::Completed { finish_reason:Some(FinishReason::Stop), usage:None, provider_items:Vec::new() });
+            }))
+        } else {
+            Ok(Box::pin(stream::pending()))
+        }
+    }
+}
+#[tokio::test]
+async fn lagged_queue_and_steering_observers_finish_after_user_stop() {
+    lagged_queue_observer_stop_case(true).await;
+}
+
+#[tokio::test]
+async fn removed_queue_observer_finishes_after_user_stop() {
+    lagged_queue_observer_stop_case(false).await;
+}
+
+async fn lagged_queue_observer_stop_case(steer: bool) {
+    use std::time::Duration;
+    let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+    let begin = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let emitted = Arc::new(AtomicUsize::new(0));
+    let runtime = DurableLoopAgentRuntime::new(
+        "test",
+        "test-model",
+        Some(Arc::new(FloodThenBlock {
+            attempts: AtomicUsize::new(0),
+            emitted: emitted.clone(),
+            begin: begin.clone(),
+            finish: finish.clone(),
+        })),
+        Arc::new(NoTools),
+        Arc::new(IdentityContextPolicy),
+        store.clone(),
+        Arc::new(MemoryLeaseManager::default()),
+        2048,
+    );
+    let a = AgentTurnRequest {
+        session_id: "stop-repro".into(),
+        cwd: "/workspace".into(),
+        route: ModelRoute::new("test", "test-model"),
+        permission: PermissionPreset::WorkspaceWrite,
+        prompt: None,
+        messages: vec![AgentMessage::user("a").with_id("a")],
+        input_metadata: None,
+    };
+    let b = AgentTurnRequest {
+        messages: vec![AgentMessage::user("b").with_id("b")],
+        ..a.clone()
+    };
+    let c = AgentTurnRequest {
+        messages: vec![AgentMessage::user("c").with_id("c")],
+        ..a.clone()
+    };
+    runtime.admit_turn(a.clone()).await.unwrap();
+    let mut arun = runtime.start_turn(a).await.unwrap();
+    let drain = tokio::spawn(async move {
+        while arun.next_event().await.is_some() {}
+        arun.result().await
+    });
+    runtime.admit_turn(b.clone()).await.unwrap();
+    begin.notify_one();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while emitted.load(AtomicOrdering::SeqCst) < 2200 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    runtime.admit_turn(c.clone()).await.unwrap();
+    finish.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(15), drain)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        LoopStatus::Completed
+    );
+    let mut brun = runtime.start_turn(b).await.unwrap();
+    // Lag is a resynchronization boundary, not a failed model result.
+    let event = brun.next_event().await.unwrap();
+    assert!(matches!(
+        event.kind,
+        xharness_core::LoopEventKind::StreamCheckpoint
+    ));
+    let mut crun = runtime.start_turn(c).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), crun.next_event())
+            .await
+            .is_err()
+    );
+    runtime
+        .remove_pending_input("stop-repro", "c")
+        .await
+        .unwrap();
+    if steer {
+        crun.send(LoopCommand::Steer(AgentMessage::user("c").with_id("c")))
+            .await
+            .unwrap();
+    }
+    crun.send(LoopCommand::InterruptByUser).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let s = store.load("stop-repro").await.unwrap().unwrap();
+            if s.events().iter().any(|e| {
+                matches!(
+                    e.data(),
+                    xharness_session::EventData::TurnEnd {
+                        turn: 2,
+                        reason: xharness_session::TurnEndReason::UserInterrupted
+                    }
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for run in [&mut brun, &mut crun] {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while run.next_event().await.is_some() {}
+        })
+        .await
+        .expect("observer must settle after durable stop");
+        assert_eq!(run.result().await.status, LoopStatus::Cancelled);
+    }
+    let session = store.load("stop-repro").await.unwrap().unwrap();
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|e| matches!(e.data(), xharness_session::EventData::TurnStart { .. }))
+            .count(),
+        2
+    );
+    runtime.shutdown(Duration::from_secs(1)).await;
+}
+#[tokio::test]
+async fn late_observer_recovers_only_its_turn_without_reexecuting_input() {
+    use std::time::Duration;
+    let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+    let runtime = DurableLoopAgentRuntime::new(
+        "test",
+        "test-model",
+        Some(Arc::new(ScriptProvider {
+            answers: Mutex::new((0..5).map(|n| format!("answer-{n}")).collect()),
+        })),
+        Arc::new(NoTools),
+        Arc::new(IdentityContextPolicy),
+        store.clone(),
+        Arc::new(MemoryLeaseManager::default()),
+        16,
+    );
+    let request = |n| AgentTurnRequest {
+        session_id: "late-observer".into(),
+        cwd: "/workspace".into(),
+        route: ModelRoute::new("test", "test-model"),
+        permission: PermissionPreset::WorkspaceWrite,
+        prompt: None,
+        messages: vec![AgentMessage::user(format!("input-{n}")).with_id(format!("input-{n}"))],
+        input_metadata: None,
+    };
+    let mut first = runtime.start_turn(request(0)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if store
+                .load("late-observer")
+                .await
+                .unwrap()
+                .unwrap()
+                .events()
+                .iter()
+                .any(|e| {
+                    matches!(
+                        e.data(),
+                        xharness_session::EventData::TurnEnd { turn: 1, .. }
+                    )
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for n in 1..5 {
+        let mut next = runtime.start_turn(request(n)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while next.next_event().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(next.result().await.final_text, format!("answer-{n}"));
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while first.next_event().await.is_some() {}
+    })
+    .await
+    .unwrap();
+    let result = first.result().await;
+    assert_eq!(result.status, LoopStatus::Completed);
+    assert_eq!(result.final_text, "answer-0");
+    assert_eq!(result.finish_reason, Some(FinishReason::Stop));
+    assert_eq!(result.messages.len(), 2);
+    assert!(!result.messages.iter().any(|m| m.content == "answer-4"));
+    let session = store.load("late-observer").await.unwrap().unwrap();
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|e| matches!(e.data(), xharness_session::EventData::TurnStart { .. }))
+            .count(),
+        5
+    );
+    runtime.shutdown(Duration::from_secs(1)).await;
+}
+#[tokio::test]
+async fn host_flood_steer_stop_clears_running_and_parks_internal_followup() {
+    use serde_json::json;
+    use xharness_api::{ApiBackend, RpcId, RpcMethod};
+    let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+    let begin = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let emitted = Arc::new(AtomicUsize::new(0));
+    let runtime = Arc::new(DurableLoopAgentRuntime::new(
+        "test",
+        "test-model",
+        Some(Arc::new(FloodThenBlock {
+            attempts: AtomicUsize::new(0),
+            emitted: emitted.clone(),
+            begin: begin.clone(),
+            finish: finish.clone(),
+        })),
+        Arc::new(NoTools),
+        Arc::new(IdentityContextPolicy),
+        store.clone(),
+        Arc::new(MemoryLeaseManager::default()),
+        2048,
+    ));
+    let mut config = crate::HostConfig::new(std::env::current_dir().unwrap());
+    config.provider_id = "test".into();
+    config.model_id = "test-model".into();
+    let host = crate::BasicHost::with_agent_runtime(config, runtime.clone());
+    crate::rpc::session_lifecycle::create(&host, &json!({"sessionId":"host-stop"}))
+        .await
+        .unwrap();
+    let admission = |id: &str| crate::driver::PromptAdmission {
+        rpc_id: RpcId::new(id),
+        session_id: "host-stop".into(),
+        mode: "queue".into(),
+        text: id.into(),
+        content: vec![json!({"type":"text","text":id})],
+        source: json!({"kind":if id=="late-settlement" {"agent-settlement"} else {"user"}}),
+        fingerprint: None,
+    };
+    host.enqueue_prompt(admission("a")).await.unwrap();
+    host.enqueue_prompt(admission("b")).await.unwrap();
+    begin.notify_one();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while emitted.load(AtomicOrdering::SeqCst) < 2200 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    host.enqueue_prompt(admission("c")).await.unwrap();
+    finish.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let session = store.load("host-stop").await.unwrap().unwrap();
+            if session
+                .events()
+                .iter()
+                .any(|e| matches!(e.data(), xharness_session::EventData::TurnStart { turn: 2 }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = host
+        .call(
+            RpcId::new("steer-c"),
+            RpcMethod::SessionUpdateQueue,
+            json!({"sessionId":"host-stop","itemId":"c","action":{"kind":"steer"}}),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(response, xharness_api::RpcResult::Success { .. }),
+        "{response:?}"
+    );
+    let response = host
+        .call(
+            RpcId::new("stop"),
+            RpcMethod::SessionCancel,
+            json!({"sessionId":"host-stop"}),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(response, xharness_api::RpcResult::Success { .. }),
+        "{response:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !host.state.read().await.sessions["host-stop"].running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("Host must clear running after explicit stop");
+    host.enqueue_prompt(admission("late-settlement"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let state = host.state.read().await;
+    let record = &state.sessions["host-stop"];
+    assert!(!record.running);
+    assert!(record.control.is_none());
+    assert!(record.dispatch_paused);
+    drop(state);
+    let session = store.load("host-stop").await.unwrap().unwrap();
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|e| matches!(e.data(), xharness_session::EventData::TurnStart { .. }))
+            .count(),
+        2
+    );
+    assert!(session.events().iter().any(|e| matches!(
+        e.data(),
+        xharness_session::EventData::TurnEnd {
+            turn: 2,
+            reason: xharness_session::TurnEndReason::UserInterrupted
+        }
+    )));
+    runtime.shutdown(Duration::from_secs(1)).await;
+}
+
+/// Blocks the first turn until it is cancelled, then completes every later one.
+pub(super) struct BlockFirstTurn {
+    pub(super) attempts: AtomicUsize,
+}
+#[async_trait]
+impl ModelProvider for BlockFirstTurn {
+    async fn stream(
+        &self,
+        _: ProviderRequest,
+        _: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        if self.attempts.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+            Ok(Box::pin(stream::pending()))
+        } else {
+            Ok(Box::pin(async_stream::stream! {
+                yield Ok(ProviderEvent::Completed {
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: None,
+                    provider_items: Vec::new(),
+                });
+            }))
+        }
+    }
+}
+
+/// An explicit stop ends the current turn only. A user prompt that was already
+/// queued must still start the next turn instead of waiting behind the gate for
+/// an unrelated new message (live regression: session-1789634172710-56127).
+#[tokio::test]
+async fn user_stop_lets_the_already_queued_prompt_start_the_next_turn() {
+    crate::statecheck::assert_profile("stopped queued turn");
+    use serde_json::json;
+    use std::time::Duration;
+    use xharness_api::{ApiBackend, RpcId, RpcMethod};
+    let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+    let runtime = Arc::new(DurableLoopAgentRuntime::new(
+        "test",
+        "test-model",
+        Some(Arc::new(BlockFirstTurn {
+            attempts: AtomicUsize::new(0),
+        })),
+        Arc::new(NoTools),
+        Arc::new(IdentityContextPolicy),
+        store.clone(),
+        Arc::new(MemoryLeaseManager::default()),
+        2048,
+    ));
+    let mut config = crate::HostConfig::new(std::env::current_dir().unwrap());
+    config.provider_id = "test".into();
+    config.model_id = "test-model".into();
+    let host = crate::BasicHost::with_agent_runtime(config, runtime.clone());
+    crate::rpc::session_lifecycle::create(&host, &json!({"sessionId":"stop-queue"}))
+        .await
+        .unwrap();
+    let admission = |id: &str| crate::driver::PromptAdmission {
+        rpc_id: RpcId::new(id),
+        session_id: "stop-queue".into(),
+        mode: "queue".into(),
+        text: id.into(),
+        content: vec![json!({"type":"text","text":id})],
+        source: json!({"kind":"user"}),
+        fingerprint: None,
+    };
+    let turn_count = |session: &xharness_session::Session| {
+        session
+            .events()
+            .iter()
+            .filter(|e| matches!(e.data(), xharness_session::EventData::TurnStart { .. }))
+            .count()
+    };
+    host.enqueue_prompt(admission("first")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let session = store.load("stop-queue").await.unwrap().unwrap();
+            if turn_count(&session) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first turn must start");
+    // Queued while the first turn is still running.
+    host.enqueue_prompt(admission("queued")).await.unwrap();
+    let response = host
+        .call(
+            RpcId::new("stop"),
+            RpcMethod::SessionCancel,
+            json!({"sessionId":"stop-queue"}),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(response, xharness_api::RpcResult::Success { .. }),
+        "{response:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let session = store.load("stop-queue").await.unwrap().unwrap();
+            if session.events().iter().any(|e| {
+                matches!(
+                    e.data(),
+                    xharness_session::EventData::TurnEnd { turn: 2, .. }
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the queued user prompt must start the next turn after the stop");
+    let session = store.load("stop-queue").await.unwrap().unwrap();
+    assert_eq!(turn_count(&session), 2);
+    assert!(session.events().iter().any(|e| matches!(
+        e.data(),
+        xharness_session::EventData::TurnEnd {
+            turn: 1,
+            reason: xharness_session::TurnEndReason::UserInterrupted
+        }
+    )));
+    // The reopened gate is durable: a restart must not re-freeze the session.
+    let state = host.state.read().await;
+    assert!(!state.sessions["stop-queue"].dispatch_paused);
+    assert!(!state.sessions["stop-queue"].running);
+    drop(state);
+    assert!(!crate::delegation::restored_dispatch_paused(&session));
+    runtime.shutdown(Duration::from_secs(1)).await;
+}
+
+/// Completes every turn immediately.
+pub(super) struct CompleteImmediately;
+#[async_trait]
+impl ModelProvider for CompleteImmediately {
+    async fn stream(
+        &self,
+        _: ProviderRequest,
+        _: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        Ok(Box::pin(async_stream::stream! {
+            yield Ok(ProviderEvent::Completed {
+                finish_reason: Some(FinishReason::Stop),
+                usage: None,
+                provider_items: Vec::new(),
+            });
+        }))
+    }
+}
+
+/// The persisted stop also outlives the process: a user prompt queued before it
+/// must be resumed at startup instead of staying parked behind the gate.
+#[tokio::test]
+async fn restart_resumes_a_queued_user_prompt_despite_the_persisted_stop() {
+    use std::time::Duration;
+    use xharness_session::{EventData, InboxMessage, InboxTarget, Revision};
+    let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+    store
+        .create(SessionHeader::new("stop-restore"))
+        .await
+        .unwrap();
+    store
+        .append(
+            "stop-restore",
+            Revision::ZERO,
+            vec![
+                EventData::AgentInboxSpliced {
+                    target: InboxTarget::NextTurn,
+                    start: 0,
+                    removed_count: 0,
+                    inserted: vec![InboxMessage::user("queued", "queued prompt")],
+                    outcome: None,
+                }
+                .into(),
+                EventData::AgentDispatchPaused { paused: true }.into(),
+            ],
+        )
+        .await
+        .unwrap();
+    let runtime = Arc::new(DurableLoopAgentRuntime::new(
+        "test",
+        "test-model",
+        Some(Arc::new(CompleteImmediately)),
+        Arc::new(NoTools),
+        Arc::new(IdentityContextPolicy),
+        store.clone(),
+        Arc::new(MemoryLeaseManager::default()),
+        2048,
+    ));
+    let mut config = crate::HostConfig::new(std::env::current_dir().unwrap());
+    config.provider_id = "test".into();
+    config.model_id = "test-model".into();
+    let host = crate::BasicHost::with_agent_runtime(config, runtime.clone());
+    let report = host.restore_from_store(store.clone()).await.unwrap();
+    assert_eq!(report.resumed_pending_turns, 1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let session = store.load("stop-restore").await.unwrap().unwrap();
+            if session.events().iter().any(|e| {
+                matches!(
+                    e.data(),
+                    xharness_session::EventData::TurnEnd { turn: 1, .. }
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a queued user prompt must still run after a restart");
+    // The actor can now atomically resume a queued human input itself. Its
+    // durable TurnEnd precedes the asynchronously attached Host observer;
+    // verify publication too, rather than treating journal closure as that
+    // observer's acknowledgement.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = host.state.read().await;
+            let record = &state.sessions["stop-restore"];
+            if !record.dispatch_paused && !record.running {
+                break;
+            }
+            drop(state);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Host must publish the durable human resume and settled status");
+    let state = host.state.read().await;
+    assert!(!state.sessions["stop-restore"].dispatch_paused);
+    drop(state);
+    let session = store.load("stop-restore").await.unwrap().unwrap();
+    assert!(!crate::delegation::restored_dispatch_paused(&session));
+    runtime.shutdown(Duration::from_secs(1)).await;
+}
+
+// Hold the gate commit at a deterministic scheduling boundary.
+struct GateCommitRuntime {
+    entered: Notify,
+    release: Notify,
+    starts: AtomicUsize,
+    inputs: Mutex<Vec<String>>,
+}
+#[async_trait]
+impl AgentRuntime for GateCommitRuntime {
+    fn has_available_route(&self) -> bool {
+        true
+    }
+    fn can_route(&self, _: &ModelRoute) -> bool {
+        true
+    }
+    async fn persist_session_events(
+        &self,
+        _: &str,
+        _: &str,
+        events: Vec<xharness_session::SessionEvent>,
+    ) -> Result<bool, AgentRuntimeError> {
+        if events.iter().any(|e| {
+            matches!(
+                e.data(),
+                xharness_session::EventData::AgentDispatchPaused { paused: false }
+            )
+        }) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(false)
+    }
+    async fn start_turn(
+        &self,
+        request: AgentTurnRequest,
+    ) -> Result<Box<dyn RunningTurn>, AgentRuntimeError> {
+        self.starts.fetch_add(1, AtomicOrdering::SeqCst);
+        self.inputs
+            .lock()
+            .unwrap()
+            .push(request.messages.last().unwrap().content.clone());
+        Err(AgentRuntimeError::Preparation {
+            message: "fixture handoff".into(),
+        })
+    }
+}
+async fn gate_race_host() -> (Arc<crate::BasicHost>, Arc<GateCommitRuntime>) {
+    use crate::state::{QueuePlacement, QueuedPrompt};
+    let rt = Arc::new(GateCommitRuntime {
+        entered: Notify::new(),
+        release: Notify::new(),
+        starts: AtomicUsize::new(0),
+        inputs: Mutex::new(Vec::new()),
+    });
+    let host = crate::BasicHost::with_agent_runtime(
+        crate::HostConfig::new(std::env::temp_dir()),
+        rt.clone(),
+    );
+    crate::rpc::session_lifecycle::create(&host, &json!({"sessionId":"race"}))
+        .await
+        .unwrap();
+    {
+        let mut state = host.state.write().await;
+        let s = state.sessions.get_mut("race").unwrap();
+        s.dispatch_paused = true;
+        s.running = true;
+        for (id, kind) in [("internal", "agent-settlement"), ("user-queued", "user")] {
+            s.queue.push_back(QueuedPrompt {
+                id: id.into(),
+                text: id.into(),
+                content: vec![json!({"type":"text","text":id})],
+                source: json!({"kind":kind}),
+                fingerprint: None,
+                placement: QueuePlacement::Queued,
+            });
+        }
+    }
+    (host, rt)
+}
+async fn remove_race_input(host: &crate::BasicHost) -> xharness_api::RpcResult {
+    use xharness_api::{ApiBackend, RpcId, RpcMethod};
+    host.call(
+        RpcId::new("delete"),
+        RpcMethod::SessionUpdateQueue,
+        json!({"sessionId":"race","itemId":"user-queued","action":{"kind":"remove"}}),
+        CancellationToken::new(),
+    )
+    .await
+}
+#[tokio::test]
+async fn deleting_last_queued_user_before_handoff_keeps_internal_work_paused() {
+    let (host, rt) = gate_race_host().await;
+    assert!(remove_race_input(&host).await.is_ok());
+    let (_tx, rx) = tokio::sync::mpsc::channel(4);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        host.as_ref().clone().drive_session("race".into(), rx),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rt.starts.load(AtomicOrdering::SeqCst), 0);
+    assert!(host.state.read().await.sessions["race"].dispatch_paused);
+}
+#[tokio::test]
+async fn queue_removal_cannot_overtake_resume_commit_and_user_handoff() {
+    let (host, rt) = gate_race_host().await;
+    let (_tx, rx) = tokio::sync::mpsc::channel(4);
+    let h = host.as_ref().clone();
+    let driver = tokio::spawn(async move { h.drive_session("race".into(), rx).await });
+    tokio::time::timeout(Duration::from_secs(3), rt.entered.notified())
+        .await
+        .unwrap();
+    // Poll the real RPC while persistence is blocked. It must wait rather
+    // than acknowledge deletion and then let the old gate commit take effect.
+    let removal = remove_race_input(&host);
+    tokio::pin!(removal);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut removal)
+            .await
+            .is_err()
+    );
+    rt.release.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(3), removal)
+        .await
+        .unwrap();
+    assert!(
+        !result.is_ok(),
+        "handoff already claimed the queued user input"
+    );
+    tokio::time::timeout(Duration::from_secs(3), driver)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rt.inputs.lock().unwrap().first().unwrap(), "user-queued");
+}
+#[tokio::test]
+async fn idle_driver_acknowledges_steering_while_waiting_for_admission_lock() {
+    use crate::state::DriverCommand;
+    let (host, rt) = gate_race_host().await;
+    let guard = host.lock_admission("race").await;
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let h = host.as_ref().clone();
+    let driver = tokio::spawn(async move { h.drive_session("race".into(), rx).await });
+    let (acknowledgement, accepted) = tokio::sync::oneshot::channel();
+    tx.send(DriverCommand {
+        command: xharness_core::LoopCommand::Steer(AgentMessage::new(
+            xharness_core::Role::User,
+            "steer",
+        )),
+        input_metadata: None,
+        acknowledgement,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), accepted)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(xharness_core::LoopControlError::Closed)
+    ));
+    // No model request is necessary to exercise the idle lock/ack inversion.
+    host.state
+        .write()
+        .await
+        .sessions
+        .get_mut("race")
+        .unwrap()
+        .queue
+        .clear();
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(3), driver)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rt.starts.load(AtomicOrdering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn concurrent_stop_is_not_overwritten_by_resume_commit() {
+    let (host, rt) = gate_race_host().await;
+    let (_tx, rx) = tokio::sync::mpsc::channel(4);
+    let h = host.as_ref().clone();
+    let driver = tokio::spawn(async move { h.drive_session("race".into(), rx).await });
+    tokio::time::timeout(Duration::from_secs(3), rt.entered.notified())
+        .await
+        .unwrap();
+    let stop = crate::rpc::turn::send_control(&host, "race", xharness_core::LoopCommand::Cancel);
+    tokio::pin!(stop);
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut stop)
+        .await
+        .is_err());
+    rt.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), stop)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), driver)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(host.state.read().await.sessions["race"].dispatch_paused);
+}
+
+struct RestrictedHostTools;
+#[async_trait]
+impl SessionToolFactory for RestrictedHostTools {
+    fn allows_host_tool(&self, _: &str) -> bool {
+        false
+    }
+    async fn executor(
+        &self,
+        id: &str,
+        cwd: &str,
+        permission: PermissionPreset,
+    ) -> Result<xharness_tools::ToolExecutor, String> {
+        NoTools.executor(id, cwd, permission).await
+    }
+}
+
+#[tokio::test]
+async fn deployment_policy_fences_host_injected_history_and_goal_tools() {
+    // Bootstrap requires a genuinely absolute workspace on every target OS.
+    let workspace = std::env::temp_dir().to_str().unwrap().to_owned();
+    assert!(std::path::Path::new(&workspace).is_absolute());
+    struct FixtureGate(bool);
+    impl crate::ExecutionGate for FixtureGate {
+        fn require_active(&self) -> Result<(), String> {
+            if self.0 {
+                Ok(())
+            } else {
+                Err("fixture execution is inactive".into())
+            }
+        }
+    }
+    // The deployment allowlist remains authoritative in local and Active
+    // hosted modes; an inactive hosted gate must reject before tool injection.
+    for gate_active in [None, Some(true), Some(false)] {
+        for restricted in [false, true] {
+            for automatic_goal in [false, true] {
+                let execution = crate::execution::ExecutionBoundary::default();
+                if let Some(active) = gate_active {
+                    execution.install(Arc::new(FixtureGate(active))).unwrap();
+                }
+                let mut models = ModelRegistry::new();
+                models
+                    .register(RegisteredModel::new(
+                        ModelDescriptor::new("test", "test", "test-model", "test-model"),
+                        Arc::new(ScriptProvider {
+                            answers: Mutex::new(VecDeque::new()),
+                        }),
+                    ))
+                    .unwrap();
+                let goals = Arc::new(crate::goals::GoalBridge::default());
+                // Register the Host branch without dereferencing a live application.
+                goals.host.set(std::sync::Weak::new()).unwrap();
+                let tool_factory: Arc<dyn SessionToolFactory> = if restricted {
+                    Arc::new(RestrictedHostTools)
+                } else {
+                    Arc::new(NoTools)
+                };
+                let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+                let input = if automatic_goal {
+                    crate::prepare_goal_session(
+                        store.as_ref(),
+                        &crate::GoalBootstrapSpec {
+                            operation_id: "visibility-fixture".into(),
+                            session_id: "restricted".into(),
+                            goal_id: "visibility-goal".into(),
+                            objective: "Check evidence".into(),
+                            acceptance_criteria: vec![],
+                            max_goal_rounds: 2,
+                            created_at_ms: 1,
+                            workspace: workspace.clone(),
+                            provider: "test".into(),
+                            model: "test-model".into(),
+                            reasoning_effort: None,
+                            context_window_tokens: None,
+                            permission: PermissionPreset::DangerFullAccess,
+                        },
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                    xharness_agent::GoalController::new(store.clone(), "restricted")
+                        .reconcile()
+                        .await
+                        .unwrap();
+                    let session = store.load("restricted").await.unwrap().unwrap();
+                    vec![xharness_agent::InboxProjection::from_session(&session)
+                        .unwrap()
+                        .next_turn()[0]
+                        .message
+                        .clone()]
+                } else {
+                    Vec::new()
+                };
+                let factory = DurableTurnFactory {
+                    execution,
+                    goals,
+                    store,
+                    delegation_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+                    models: Arc::new(StdRwLock::new(models)),
+                    tool_factory,
+                    context_policy: Arc::new(IdentityContextPolicy),
+                    compaction: Arc::new(StdRwLock::new(None)),
+                    sessions: Arc::new(RwLock::new(HashMap::from([(
+                        "restricted".into(),
+                        DurableSessionConfig {
+                            cwd: workspace.clone(),
+                            permission: PermissionPreset::DangerFullAccess,
+                            prompt: None,
+                            route: ModelRoute::new("test", "test-model"),
+                        },
+                    )]))),
+                    debug: Arc::new(StdRwLock::new(DebugRecorder::default())),
+                };
+                let request = factory.build("restricted", input).await;
+                if gate_active == Some(false) {
+                    assert_eq!(
+                        request.err().expect("inactive gate must reject"),
+                        "fixture execution is inactive"
+                    );
+                    continue;
+                }
+                let request = request.unwrap();
+                let names = request
+                    .tool_executor
+                    .unwrap()
+                    .registry()
+                    .definitions()
+                    .await
+                    .into_iter()
+                    .map(|d| d.name)
+                    .collect::<Vec<_>>();
+                if restricted {
+                    assert!(names.is_empty(), "{names:?}");
+                } else {
+                    assert_eq!(
+                        names,
+                        if automatic_goal {
+                            vec!["goal_report", "history"]
+                        } else {
+                            vec!["history"]
+                        }
+                    );
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,2461 @@
+//! Crash-tolerant, append-only JSONL persistence for XHarness sessions.
+//!
+//! A session occupies exactly one `<id>.jsonl` file. The first record is an
+//! immutable header and every later record contains one complete CAS append
+//! batch. Version 2 may gzip older batches inside that same file while fresh
+//! appends remain ordinary JSON. A torn, unterminated final JSON record is
+//! ignored during recovery; corruption anywhere else is rejected.
+
+use std::{
+    collections::HashMap,
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::{FileExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, OwnedMutexGuard};
+use xharness_session::{
+    AppendReceipt, LoggedEvent, Revision, Session, SessionCatalogEntry, SessionEvent,
+    SessionHeader, SessionInspection, StartupCandidate, Store, StoreError, UnreadableSession,
+};
+
+mod audit;
+mod blobs;
+mod catalog_scan;
+mod harness_snapshot;
+mod history_index;
+mod recovery_checkpoint;
+mod replay_scope;
+mod results;
+mod seeded;
+
+const FILE_FORMAT: &str = "xharness.session.jsonl";
+const FILE_FORMAT_VERSION: u32 = 1;
+const COMPRESSED_FILE_FORMAT_VERSION: u32 = 2;
+const HEADER_RECORD: &str = "header";
+const BATCH_RECORD: &str = "batch";
+const COMPRESSED_BATCH_RECORD: &str = "batch_gzip";
+const MAX_RECORD_BYTES: u64 = 128 * 1024 * 1024;
+const MIN_COMPRESS_BYTES: usize = 4096;
+const FILE_SUFFIX: &str = ".jsonl";
+const CATALOG_FORMAT_VERSION: u32 = 1;
+// Daily metric views grow by calendar day, not by token/event count. Keep the
+// sidecar bounded while allowing years of usage (the former 32 KiB limit was
+// too small for a metric-bearing catalogue).
+const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
+const MAX_SESSION_ID_BYTES: usize = 200;
+const FINGERPRINT_SAMPLE_BYTES: usize = 4 * 1_024;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+type SessionLock = AsyncMutex<()>;
+type LockTable = StdMutex<HashMap<PathBuf, Weak<SessionLock>>>;
+
+static PROCESS_LOCKS: OnceLock<LockTable> = OnceLock::new();
+
+/// Decode persisted JSON while containing the Windows `SliceRead` crash path.
+///
+/// Windows crash dumps from released builds point at serde_json's borrowed
+/// slice string scanner, even though every persisted target here is owned. Use
+/// the independent `IoRead` scanner there. Other platforms retain the faster
+/// slice decoder until evidence shows that they need the containment too.
+#[cfg(windows)]
+pub(crate) fn decode_owned_json<T: DeserializeOwned>(bytes: &[u8]) -> serde_json::Result<T> {
+    serde_json::from_reader(bytes)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn decode_owned_json<T: DeserializeOwned>(bytes: &[u8]) -> serde_json::Result<T> {
+    serde_json::from_slice(bytes)
+}
+
+/// A filesystem-backed [`Store`] with one append-only JSONL file per session.
+///
+/// Clones and independently opened stores in this process share a per-file
+/// mutex. A companion advisory lock serializes the same load/compare/append
+/// transaction across processes, so the on-disk revision remains the
+/// authoritative CAS value.
+#[derive(Clone, Debug)]
+pub struct JsonlSessionStore {
+    root: Arc<PathBuf>,
+    request_audit_mode: RequestAuditMode,
+    audit_reads: Arc<tokio::sync::Semaphore>,
+    /// Detached logical snapshots keyed by the exact on-disk identity.  The
+    /// advisory file lock still owns cross-process CAS correctness; this cache
+    /// only removes the previous O(file-size) replay from every in-process
+    /// append/load/checkpoint.
+    cache: Arc<StdMutex<SnapshotCache>>,
+    history_cache: Arc<StdMutex<history_index::Cache>>,
+    maintenance: Arc<tokio::sync::Semaphore>,
+}
+
+/// Request diagnostics are independent of the authoritative conversation
+/// journal and default-on Harness system/tool snapshots. Ordinary request
+/// audits keep only metadata; full conversation input capture is opt-in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RequestAuditMode {
+    #[default]
+    MetadataOnly,
+    Full,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeaderRecord {
+    record: String,
+    format: String,
+    format_version: u32,
+    header: SessionHeader,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchRecord {
+    record: String,
+    previous_revision: Revision,
+    revision: Revision,
+    events: Vec<LoggedEvent>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompressedBatchRecord {
+    record: String,
+    uncompressed_len: u64,
+    sha256: String,
+    compressed_sha256: String,
+    data: String,
+}
+
+#[derive(Deserialize)]
+struct RecordTag {
+    record: String,
+}
+
+#[derive(Debug)]
+enum BatchDecodeError {
+    Json(serde_json::Error),
+    Invalid(String),
+}
+
+impl std::fmt::Display for BatchDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json(error) => error.fmt(f),
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
+/// An explicitly requested, single-session storage migration. A no-op never
+/// modifies the authoritative file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColdCompressionReport {
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub batches_compressed: u64,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedFile {
+    session: Session,
+    format_version: u32,
+    /// Prefix known to contain only accepted records.
+    valid_len: u64,
+    /// The accepted final record had no newline terminator.
+    needs_separator: bool,
+    estimated_bytes: usize,
+    journal_hash: Sha256,
+    audit_offsets: Arc<HashMap<u64, (u64, u64)>>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedFile {
+    fingerprint: FileFingerprint,
+    loaded: LoadedFile,
+    touched: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedStamp {
+    fingerprint: FileFingerprint,
+    next_seq: u64,
+    revision: Revision,
+    valid_len: u64,
+    needs_separator: bool,
+    sha256: String,
+}
+impl ValidatedStamp {
+    fn new(fingerprint: FileFingerprint, loaded: &LoadedFile) -> Self {
+        Self {
+            fingerprint,
+            next_seq: loaded.session.next_seq(),
+            revision: loaded.session.revision(),
+            valid_len: loaded.valid_len,
+            needs_separator: loaded.needs_separator,
+            sha256: format!("{:x}", loaded.journal_hash.clone().finalize()),
+        }
+    }
+}
+
+/// Cache limits are accounted logical bytes, not a promise about allocator RSS.
+#[derive(Debug)]
+struct SnapshotCache {
+    entries: HashMap<PathBuf, CachedFile>,
+    scopes: replay_scope::Cache,
+    /// A bounded-size logical cursor independent of the heavyweight Session
+    /// cache. Large journals can be evicted while catalogue publication still
+    /// verifies it describes the exact file version the Host loaded.
+    catalog_stamps: HashMap<PathBuf, ValidatedStamp>,
+    max_bytes: usize,
+    max_entries: usize,
+    clock: u64,
+    runtime_audit_view: bool,
+    authoritative_replays: usize,
+}
+impl Default for SnapshotCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            scopes: replay_scope::Cache::default(),
+            catalog_stamps: HashMap::new(),
+            max_bytes: 128 * 1024 * 1024,
+            max_entries: 16,
+            clock: 0,
+            runtime_audit_view: false,
+            authoritative_replays: 0,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct CacheStats {
+    pub entries: usize,
+    pub accounted_bytes: usize,
+    pub max_bytes: usize,
+}
+fn event_weight(event: &LoggedEvent) -> usize {
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(b.len());
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    if serde_json::to_writer(&mut n, event).is_err() {
+        return usize::MAX;
+    }
+    n.0.saturating_mul(3)
+        .saturating_add(std::mem::size_of::<LoggedEvent>())
+        // EventData moved out of the vector into a shared allocation. Keep
+        // charging its fixed storage and ownership counters, not just the
+        // smaller pointer-bearing LoggedEvent. Shared cuts are conservatively
+        // over-accounted rather than making the LRU appear artificially cheap.
+        .saturating_add(std::mem::size_of_val(event.data()))
+        .saturating_add(2 * std::mem::size_of::<usize>())
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FileFingerprint {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    sample_hash: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CatalogRecord {
+    version: u32,
+    fingerprint: FileFingerprint,
+    entry: SessionCatalogEntry,
+}
+
+/// Optional display cache, separate from the lightweight startup catalogue.
+/// A catalogue scan never reads/deserializes this potentially larger snapshot.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresentationRecord {
+    version: u32,
+    fingerprint: FileFingerprint,
+    next_seq: u64,
+    presentation: xharness_session::HistoryPresentation,
+    sha256: String,
+}
+
+fn presentation_path(path: &Path) -> PathBuf {
+    path.with_extension("history-presentation")
+}
+
+fn read_presentation(
+    path: &Path,
+    catalog: &CatalogRecord,
+    schema: &str,
+) -> Option<xharness_session::HistoryPresentation> {
+    let sidecar = presentation_path(path);
+    let metadata = fs::symlink_metadata(&sidecar).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_CATALOG_BYTES
+    {
+        return None;
+    }
+    let file = secure_open_options().read(true).open(&sidecar).ok()?;
+    ensure_regular_file(&file, &sidecar, "history presentation").ok()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CATALOG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_CATALOG_BYTES {
+        return None;
+    }
+    let record: PresentationRecord = serde_json::from_slice(&bytes).ok()?;
+    if record.version != 1
+        || record.fingerprint != catalog.fingerprint
+        || record.next_seq != catalog.entry.next_seq
+        || record.presentation.schema != schema
+        || !record.presentation.values.is_object()
+    {
+        return None;
+    }
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&record.presentation).ok()?)
+    );
+    (digest == record.sha256).then_some(record.presentation)
+}
+
+fn write_projection_file(path: &Path, bytes: &[u8], label: &str) -> Result<(), StoreError> {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_file_name(format!(
+        ".{label}-{}-{}",
+        std::process::id(),
+        NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = secure_open_options()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| backend_error("stage projection", &tmp, e))?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| backend_error("write projection", &tmp, e))?;
+        // Close our staging handle before ReplaceFileW, not just before return.
+        drop(file);
+        if path.exists() {
+            replace_compacted_file(path, &tmp)?;
+        } else {
+            fs::rename(&tmp, path).map_err(|e| backend_error("publish projection", path, e))?;
+        }
+        sync_parent_directory(path)
+    })();
+    let _ = fs::remove_file(tmp);
+    result
+}
+
+fn read_catalog_record(
+    path: &Path,
+    requested_id: &str,
+) -> Result<Option<CatalogRecord>, StoreError> {
+    let sidecar = catalog_path(path);
+    // No index is a common first-run case. Avoid three random reads of
+    // a large cold journal merely to discover the sidecar is absent.
+    let metadata = match fs::symlink_metadata(&sidecar) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(backend_error("inspect session catalogue", &sidecar, error)),
+    };
+    let Some(fingerprint) = file_fingerprint(path)? else {
+        return Ok(None);
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_CATALOG_BYTES
+    {
+        return Ok(None);
+    }
+    let file = secure_open_options()
+        .read(true)
+        .open(&sidecar)
+        .map_err(|error| backend_error("open session catalogue", &sidecar, error))?;
+    ensure_regular_file(&file, &sidecar, "session catalogue")?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CATALOG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| backend_error("read session catalogue", &sidecar, error))?;
+    let Ok(record) = serde_json::from_slice::<CatalogRecord>(&bytes) else {
+        return Ok(None);
+    };
+    if record.version != CATALOG_FORMAT_VERSION
+        || record.fingerprint != fingerprint
+        || record.entry.header.id != requested_id
+        || record.entry.header.version != SessionHeader::FORMAT_VERSION
+    {
+        return Ok(None);
+    }
+    Ok(Some(record))
+}
+
+fn catalog_path(session_path: &Path) -> PathBuf {
+    session_path.with_extension("catalog")
+}
+
+impl JsonlSessionStore {
+    async fn publish_catalog_record(
+        &self,
+        entry: SessionCatalogEntry,
+        presentation: Option<xharness_session::HistoryPresentation>,
+    ) -> Result<(), StoreError> {
+        let (path, guard) = self.locked_path(&entry.header.id).await?;
+        let cache = Arc::clone(&self.cache);
+        run_blocking(move || {
+            let _guard = guard;
+            let _file_lock = acquire_file_lock(&path)?;
+            // The Host may have projected an older snapshot while another
+            // producer appended. Never stamp that older state with the new
+            // file fingerprint: a false `needs_recovery=false` would hide
+            // durable pending work after restart.
+            let fingerprint = file_fingerprint(&path)?.ok_or_else(|| StoreError::NotFound {
+                session_id: entry.header.id.clone(),
+            })?;
+            let matching_source = cache
+                .lock()
+                .map_err(|_| backend_message("session snapshot cache is poisoned"))?
+                .catalog_stamps
+                .get(&path)
+                .is_some_and(|stamp| {
+                    stamp.fingerprint == fingerprint && stamp.next_seq == entry.next_seq
+                });
+            // A verified idle recovery checkpoint can seed a display snapshot
+            // without a heavyweight load. This exception only adds disposable
+            // values to the IDENTICAL validated catalogue; no recovery bit or
+            // other metadata can be changed without a normal load/append stamp.
+            let same_catalog = !matching_source
+                && presentation.is_some()
+                && !entry.needs_recovery
+                && read_catalog_record(&path, &entry.header.id)?
+                    .is_some_and(|record| record.entry == entry);
+            if !matching_source && !same_catalog {
+                return Err(backend_message(format!(
+                    "session catalogue source changed while publishing {}",
+                    entry.header.id
+                )));
+            }
+            let presentation_path = presentation_path(&path);
+            let snapshot = presentation
+                .filter(|p| !entry.needs_recovery && p.values.is_object())
+                .and_then(|presentation| {
+                    let sha256 = format!(
+                        "{:x}",
+                        Sha256::digest(serde_json::to_vec(&presentation).ok()?)
+                    );
+                    let record = PresentationRecord {
+                        version: 1,
+                        fingerprint,
+                        next_seq: entry.next_seq,
+                        presentation,
+                        sha256,
+                    };
+                    let bytes = serde_json::to_vec(&record).ok()?;
+                    (bytes.len() as u64 <= MAX_CATALOG_BYTES).then_some(bytes)
+                });
+            // The optional snapshot never enlarges the startup catalogue. Any
+            // failure/oversize retains the original recovery path, not a lossy
+            // projection or a failed catalogue publication.
+            let published = snapshot.as_ref().is_some_and(|bytes| {
+                write_projection_file(&presentation_path, bytes, "presentation").is_ok()
+            });
+            if !published {
+                let _ = fs::remove_file(&presentation_path);
+            }
+            let record = CatalogRecord {
+                version: CATALOG_FORMAT_VERSION,
+                fingerprint,
+                entry,
+            };
+            let bytes = serde_json::to_vec(&record)
+                .map_err(|e| backend_message(format!("encode session catalogue: {e}")))?;
+            if bytes.len() as u64 > MAX_CATALOG_BYTES {
+                return Err(backend_message("session catalogue exceeds 1 MiB"));
+            }
+            write_projection_file(&catalog_path(&path), &bytes, "catalog")
+        })
+        .await
+    }
+
+    async fn read_request_header(
+        &self,
+        id: &str,
+        seq: u64,
+        harness_only: bool,
+    ) -> Result<Option<xharness_session::RequestHeader>, StoreError> {
+        let permit = self
+            .audit_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| backend_message("audit reader closed"))?;
+        let owned = id.to_owned();
+        let (path, guard) = self.locked_path(id).await?;
+        let root = self.root.clone();
+        let cache = self.cache.clone();
+        run_blocking(move || {
+            let _permit = permit;
+            let _guard = guard;
+            let _lock = acquire_file_lock(&path)?;
+            let Some(cut) = load_file_cached(&path, &owned, &cache)? else {
+                return Ok(None);
+            };
+            let Some((offset, len)) = cut.audit_offsets.get(&seq).copied() else {
+                return Ok(None);
+            };
+            let format_version = cut.format_version;
+            drop(cut);
+            if len > 128 * 1024 * 1024 {
+                return Err(backend_message("audit record exceeds 128 MiB"));
+            }
+            let mut file = secure_open_options()
+                .read(true)
+                .open(&path)
+                .map_err(|e| backend_error("open request audit", &path, e))?;
+            ensure_regular_file(&file, &path, "session audit")?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| backend_error("seek request audit", &path, e))?;
+            let mut bytes = vec![0; len as usize];
+            file.read_exact(&mut bytes)
+                .map_err(|e| backend_error("read request audit", &path, e))?;
+            let record = decode_batch_line(&bytes, format_version)
+                .map_err(|e| backend_message(e.to_string()))?;
+            for event in record.events {
+                if event.seq == seq {
+                    if let xharness_session::EventData::RequestHeader { header } =
+                        event.event.into_data()
+                    {
+                        return if harness_only {
+                            harness_snapshot::expand(&root, &owned, header)
+                        } else {
+                            audit::expand(&root, header)
+                        }
+                        .map(Some);
+                    }
+                }
+            }
+            Err(backend_message(
+                "audit index did not match authoritative sequence",
+            ))
+        })
+        .await
+    }
+    /// Open (or create) a storage directory.
+    ///
+    /// The directory is canonicalized once so independently constructed store
+    /// handles use the same process-wide lock keys.
+    pub fn new(root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let requested = root.as_ref();
+        fs::create_dir_all(requested)
+            .map_err(|error| backend_error("create storage directory", requested, error))?;
+        let root = fs::canonicalize(requested)
+            .map_err(|error| backend_error("canonicalize storage directory", requested, error))?;
+        let metadata = fs::metadata(&root)
+            .map_err(|error| backend_error("inspect storage directory", &root, error))?;
+        if !metadata.is_dir() {
+            return Err(backend_message(format!(
+                "storage root {} is not a directory",
+                root.display()
+            )));
+        }
+        Ok(Self {
+            root: Arc::new(root),
+            request_audit_mode: RequestAuditMode::MetadataOnly,
+            audit_reads: Arc::new(tokio::sync::Semaphore::new(2)),
+            cache: Arc::new(StdMutex::new(SnapshotCache::default())),
+            history_cache: Arc::new(StdMutex::new(history_index::Cache::default())),
+            maintenance: Arc::new(tokio::sync::Semaphore::new(1)),
+        })
+    }
+
+    pub fn with_request_audit_mode(mut self, mode: RequestAuditMode) -> Self {
+        self.request_audit_mode = mode;
+        self
+    }
+
+    /// Runtime replay omits only redundant legacy request audit bodies. On-disk
+    /// bytes, event identities and provider-message facts remain unchanged.
+    /// `request_header` resolves full audits; `inspect` returns exact on-disk
+    /// journal events (including archive references for new requests).
+    pub fn for_runtime(self) -> Self {
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.runtime_audit_view = true;
+            cache.entries.clear();
+            cache.scopes.clear_snapshots();
+        }
+        self
+    }
+    pub fn with_cache_limits(self, max_bytes: usize, max_entries: usize) -> Self {
+        {
+            let mut c = self.cache.lock().unwrap();
+            c.max_bytes = max_bytes;
+            c.max_entries = max_entries;
+            c.entries.clear();
+            c.scopes.clear_snapshots();
+        }
+        self
+    }
+    /// Parsed history indexes are independent of heavyweight runtime snapshots.
+    pub fn with_history_index_cache_limits(self, max_bytes: usize, max_entries: usize) -> Self {
+        {
+            let mut cache = self.history_cache.lock().unwrap();
+            cache.max_bytes = max_bytes;
+            cache.max_entries = max_entries;
+            cache.clear();
+        }
+        self
+    }
+    pub fn history_index_cache_stats(&self) -> CacheStats {
+        self.history_cache.lock().unwrap().stats()
+    }
+    pub fn cache_stats(&self) -> CacheStats {
+        let c = self.cache.lock().unwrap();
+        CacheStats {
+            entries: c.entries.len(),
+            accounted_bytes: c.entries.values().map(|e| e.loaded.estimated_bytes).sum(),
+            max_bytes: c.max_bytes,
+        }
+    }
+
+    /// Full authoritative cache-miss replays, for bounded performance diagnostics.
+    /// The counter never records message bodies or changes replay behavior.
+    pub fn authoritative_replay_count(&self) -> usize {
+        self.cache.lock().unwrap().authoritative_replays
+    }
+
+    /// Bound temporary admission reuse independently of the resident LRU. Zero
+    /// disables this optional acceleration; authoritative behavior is unchanged.
+    pub fn with_replay_scope_cache_limit(self, max_bytes: usize) -> Self {
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.scopes.clear_snapshots();
+            cache.scopes.max_bytes = max_bytes.min(replay_scope::MAX_BYTES);
+        }
+        self
+    }
+
+    /// Temporary admission snapshots are separately bounded and released with
+    /// their guards, never promoted into the resident LRU on scope completion.
+    pub fn replay_scope_cache_stats(&self) -> CacheStats {
+        self.cache.lock().unwrap().scopes.stats()
+    }
+
+    pub fn root(&self) -> &Path {
+        self.root.as_ref().as_path()
+    }
+
+    /// Losslessly compress old batches in one journal. This is deliberately
+    /// opt-in: the caller chooses a cold session, while the existing process
+    /// and cross-process locks serialize the rewrite with normal appends.
+    /// The original path is atomically replaced only after full replay of the
+    /// staged file equals the original logical session.
+    pub async fn compress_cold_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ColdCompressionReport, StoreError> {
+        let owned_id = session_id.to_owned();
+        let (path, guard) = self.locked_path(session_id).await?;
+        let cache = Arc::clone(&self.cache);
+        run_blocking(move || {
+            let _guard = guard;
+            let _file_lock = acquire_file_lock(&path)?;
+            let result = compress_cold_file(&path, &owned_id);
+            // A directory-sync failure can occur after the atomic replace.
+            // Clear the cache on both success and error; the next load always
+            // observes the authoritative path rather than a prior inode.
+            cache_remove(&cache, &path)?;
+            result
+        })
+        .await
+    }
+
+    fn session_path(&self, session_id: &str) -> Result<PathBuf, StoreError> {
+        validate_session_id(session_id)?;
+        Ok(self.root.join(format!("{session_id}{FILE_SUFFIX}")))
+    }
+
+    async fn locked_path(
+        &self,
+        session_id: &str,
+    ) -> Result<(PathBuf, OwnedMutexGuard<()>), StoreError> {
+        let path = self.session_path(session_id)?;
+        let lock = process_lock(&path)?;
+        let guard = lock.lock_owned().await;
+        Ok((path, guard))
+    }
+
+    async fn startup_header(&self, session_id: &str) -> Result<Option<SessionHeader>, StoreError> {
+        let (path, guard) = self.locked_path(session_id).await?;
+        let requested_id = session_id.to_owned();
+        run_blocking(move || {
+            let _guard = guard;
+            let _file_lock = acquire_file_lock(&path)?;
+            read_header_file(&path, &requested_id)
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Store for JsonlSessionStore {
+    fn read_scope(
+        &self,
+        session_id: &str,
+    ) -> Result<Box<dyn xharness_session::SessionReadScope>, StoreError> {
+        replay_scope::begin(self.session_path(session_id)?, Arc::clone(&self.cache))
+    }
+
+    async fn repair_catalog_metrics(
+        &self,
+        expected: SessionCatalogEntry,
+        mut fold: Box<dyn xharness_session::CatalogMetricsFold>,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        let permit = self
+            .maintenance
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| backend_message("session maintenance limiter closed"))?;
+        let (path, guard) = self.locked_path(&expected.header.id).await?;
+        run_blocking(move || {
+            let (_permit, _guard) = (permit, guard);
+            let _lock = acquire_file_lock(&path)?;
+            let Some(mut catalog) = read_catalog_record(&path, &expected.header.id)? else {
+                return Ok(None);
+            };
+            if catalog.entry != expected {
+                return Ok(None);
+            }
+            if catalog_scan::scan(&path, &catalog, |_, _, batch| {
+                fold.apply(&batch.events);
+                Ok(true)
+            })?
+            .is_none()
+            {
+                return Ok(None);
+            }
+            let snapshot = fold.snapshot();
+            catalog.entry.metric_snapshot = Some(snapshot.clone());
+            let bytes = serde_json::to_vec(&catalog).map_err(|e| backend_message(e.to_string()))?;
+            if bytes.len() as u64 > MAX_CATALOG_BYTES {
+                return Err(backend_message("session metrics catalogue exceeds 1 MiB"));
+            }
+            // The scan rechecked both identities. Never mint a Session cache or
+            // a validated recovery/checkpoint stamp from this display-only fold.
+            if file_fingerprint(&path)? != Some(catalog.fingerprint) {
+                return Ok(None);
+            }
+            write_projection_file(&catalog_path(&path), &bytes, "catalog")?;
+            Ok(Some(snapshot))
+        })
+        .await
+    }
+
+    async fn history_window(
+        &self,
+        session_id: &str,
+        expected_next_seq: u64,
+        before_seq: Option<u64>,
+        max_messages: usize,
+    ) -> Result<Option<xharness_session::SessionHistoryWindow>, StoreError> {
+        let permit = self
+            .audit_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| backend_message(e.to_string()))?;
+        let (path, guard) = self.locked_path(session_id).await?;
+        let id = session_id.to_owned();
+        let cache = self.cache.clone();
+        let history_cache = self.history_cache.clone();
+        run_blocking(move || {
+            let _permit = permit;
+            let _guard = guard;
+            let _file_lock = acquire_file_lock(&path)?;
+            // Warm authoritative snapshots are cheaper than re-reading disk
+            // batches. Keep that existing path rather than regressing small
+            // or recently used sessions in the name of cold paging speed.
+            if let Some(fingerprint) = file_fingerprint(&path)? {
+                let c = cache
+                    .lock()
+                    .map_err(|_| backend_message("session snapshot cache is poisoned"))?;
+                if c.entries.get(&path).is_some_and(|entry| {
+                    entry.fingerprint == fingerprint
+                        && entry.loaded.session.next_seq() == expected_next_seq
+                }) {
+                    return Ok(None);
+                }
+            }
+            // A damaged acceleration file must never replace normal errors or
+            // make the browser think that authoritative history disappeared.
+            Ok(history_index::read(
+                &path,
+                &id,
+                expected_next_seq,
+                before_seq,
+                max_messages,
+                &history_cache,
+            )
+            .unwrap_or(None))
+        })
+        .await
+    }
+
+    async fn recovery_tail(
+        &self,
+        session_id: &str,
+        schema: &str,
+    ) -> Result<Option<xharness_session::SessionRecoveryTail>, StoreError> {
+        let permit = self
+            .audit_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| backend_message("recovery read limiter closed"))?;
+        let (path, guard) = self.locked_path(session_id).await?;
+        let id = session_id.to_owned();
+        let schema = schema.to_owned();
+        run_blocking(move || {
+            let (_permit, _guard) = (permit, guard);
+            let _file_lock = acquire_file_lock(&path)?;
+            Ok(recovery_checkpoint::read(&path, &id, &schema).unwrap_or(None))
+        })
+        .await
+    }
+
+    async fn publish_recovery_checkpoint(
+        &self,
+        checkpoint: xharness_session::SessionRecoveryCheckpoint,
+    ) -> Result<(), StoreError> {
+        let (path, guard) = self.locked_path(&checkpoint.header.id).await?;
+        let cache = Arc::clone(&self.cache);
+        run_blocking(move || {
+            let _guard = guard;
+            let _file_lock = acquire_file_lock(&path)?;
+            let stamp = cache
+                .lock()
+                .map_err(|_| backend_message("session snapshot cache is poisoned"))?
+                .catalog_stamps
+                .get(&path)
+                .cloned();
+            let Some(stamp) = stamp else { return Ok(()) };
+            recovery_checkpoint::publish(&path, checkpoint, stamp)
+        })
+        .await
+    }
+
+    async fn cold_history_window(
+        &self,
+        session_id: &str,
+        schema: &str,
+        before_seq: Option<u64>,
+        max_messages: usize,
+    ) -> Result<Option<xharness_session::ColdHistoryWindow>, StoreError> {
+        // Ordinary indexed pages never queue behind unrelated maintenance.
+        // A miss releases both session locks before waiting for the single
+        // maintenance permit, then rechecks the complete source transaction.
+        for repair in [false, true] {
+            let maintenance = if repair {
+                Some(
+                    self.maintenance
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| backend_message("session maintenance limiter closed"))?,
+                )
+            } else {
+                None
+            };
+            let permit = self
+                .audit_reads
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| backend_message(e.to_string()))?;
+            let (path, guard) = self.locked_path(session_id).await?;
+            let id = session_id.to_owned();
+            let schema = schema.to_owned();
+            let history_cache = self.history_cache.clone();
+            let (cut, needs_repair) = run_blocking(move || {
+                let (_maintenance, _permit, _guard) = (maintenance, permit, guard);
+                let _file_lock = acquire_file_lock(&path)?;
+                let Some(record) = read_catalog_record(&path, &id)? else {
+                    return Ok((None, false));
+                };
+                if record.entry.needs_recovery {
+                    return Ok((None, false));
+                }
+                let Some(presentation) = read_presentation(&path, &record, &schema) else {
+                    return Ok((None, false));
+                };
+                let mut window = history_index::read(
+                    &path,
+                    &id,
+                    record.entry.next_seq,
+                    before_seq,
+                    max_messages,
+                    &history_cache,
+                )?;
+                if window.is_none()
+                    && !history_index::available(&path, &id, record.entry.next_seq, &history_cache)?
+                {
+                    if !repair {
+                        return Ok((None, true));
+                    }
+                    let Some(index) = history_index::repair(&path, &record)? else {
+                        return Ok((None, false));
+                    };
+                    window = history_index::read_prepared(&path, &index, before_seq, max_messages)?;
+                }
+                let Some(window) = window else {
+                    return Ok((None, false));
+                };
+                if file_fingerprint(&path)? != Some(record.fingerprint) {
+                    return Ok((None, false));
+                }
+                Ok((
+                    Some(xharness_session::ColdHistoryWindow {
+                        catalog: record.entry,
+                        presentation,
+                        window,
+                    }),
+                    false,
+                ))
+            })
+            .await?;
+            if !needs_repair {
+                return Ok(cut);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn catalog_entry(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionCatalogEntry>, StoreError> {
+        let (path, guard) = self.locked_path(session_id).await?;
+        let requested_id = session_id.to_owned();
+        run_blocking(move || {
+            let _guard = guard;
+            let _file_lock = acquire_file_lock(&path)?;
+            Ok(read_catalog_record(&path, &requested_id)?.map(|record| record.entry))
+        })
+        .await
+    }
+
+    async fn publish_catalog_entry(&self, entry: SessionCatalogEntry) -> Result<(), StoreError> {
+        self.publish_catalog_record(entry, None).await
+    }
+
+    async fn publish_catalog_presentation(
+        &self,
+        entry: SessionCatalogEntry,
+        presentation: xharness_session::HistoryPresentation,
+    ) -> Result<(), StoreError> {
+        self.publish_catalog_record(entry, Some(presentation)).await
+    }
+
+    async fn archive_tool_result(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<xharness_session::ToolArchiveRef, StoreError> {
+        if self.load(session_id).await?.is_none() {
+            return Err(StoreError::NotFound {
+                session_id: session_id.into(),
+            });
+        }
+        let root = self.root.clone();
+        let session_id = session_id.to_owned();
+        let text = text.to_owned();
+        let permit = self
+            .audit_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| backend_message(e.to_string()))?;
+        run_blocking(move || {
+            let _permit = permit;
+            results::put(&root, &session_id, &text)
+        })
+        .await
+    }
+
+    async fn tool_result_archive(
+        &self,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, StoreError> {
+        validate_session_id(session_id)?;
+        xharness_session::ToolArchiveRef::validate_key(key)?;
+        let root = self.root.clone();
+        let session_id = session_id.to_owned();
+        let key = key.to_owned();
+        let permit = self
+            .audit_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| backend_message(e.to_string()))?;
+        run_blocking(move || {
+            let _permit = permit;
+            results::read(&root, &session_id, &key)
+        })
+        .await
+    }
+
+    async fn list_headers(&self) -> Result<Vec<SessionHeader>, StoreError> {
+        let root = Arc::clone(&self.root);
+        let mut session_ids = run_blocking(move || discover_session_ids(root.as_path())).await?;
+        session_ids.sort();
+
+        let mut headers = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            // `create` publishes the name before the header, so a crash inside
+            // that window leaves a zero-byte regular file. It provably carries
+            // no event and cannot be resumed, so enumeration skips it instead
+            // of failing closed: one such writer artifact must never make every
+            // healthy session undiscoverable. Symlinks and non-regular files
+            // are deliberately not covered here — they still reach `load` and
+            // keep their existing validation errors.
+            if is_zero_byte_regular_file(&self.session_path(&session_id)?) {
+                continue;
+            }
+            let session = self.load(&session_id).await?.ok_or_else(|| {
+                backend_message(format!(
+                    "session {session_id:?} disappeared during startup enumeration"
+                ))
+            })?;
+            headers.push(session.header().clone());
+        }
+        Ok(headers)
+    }
+
+    async fn scan_sessions(
+        &self,
+    ) -> Result<(Vec<SessionHeader>, Vec<UnreadableSession>), StoreError> {
+        let root = Arc::clone(&self.root);
+        let mut session_ids = run_blocking(move || discover_session_ids(root.as_path())).await?;
+        session_ids.sort();
+
+        let mut headers = Vec::with_capacity(session_ids.len());
+        let mut unreadable = Vec::new();
+        for session_id in session_ids {
+            match self.load(&session_id).await {
+                Ok(Some(session)) => headers.push(session.header().clone()),
+                Ok(None) => unreadable.push(UnreadableSession {
+                    session_id,
+                    reason: "session disappeared during startup enumeration".to_owned(),
+                }),
+                Err(error) => unreadable.push(UnreadableSession {
+                    session_id,
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        Ok((headers, unreadable))
+    }
+
+    async fn scan_startup_candidates(
+        &self,
+    ) -> Result<(Vec<SessionHeader>, Vec<UnreadableSession>), StoreError> {
+        let root = Arc::clone(&self.root);
+        let mut session_ids = run_blocking(move || discover_session_ids(root.as_path())).await?;
+        session_ids.sort();
+
+        let mut headers = Vec::with_capacity(session_ids.len());
+        let mut unreadable = Vec::new();
+        for session_id in session_ids {
+            let result = self.startup_header(&session_id).await;
+            match result {
+                Ok(Some(header)) => headers.push(header),
+                Ok(None) => unreadable.push(UnreadableSession {
+                    session_id,
+                    reason: "session disappeared during startup enumeration".to_owned(),
+                }),
+                Err(error) => unreadable.push(UnreadableSession {
+                    session_id,
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        Ok((headers, unreadable))
+    }
+
+    async fn stream_startup_candidates(
+        &self,
+        sender: mpsc::Sender<StartupCandidate>,
+    ) -> Result<(), StoreError> {
+        let root = Arc::clone(&self.root);
+        let mut session_ids = run_blocking(move || discover_session_ids(root.as_path())).await?;
+        // Start recent conversations first, but never let a locked/cold file
+        // head-of-line block all later entries. The bounded scan also keeps
+        // open file descriptors and blocking workers under control.
+        session_ids.sort();
+        let mut remaining = session_ids.into_iter().rev();
+        let mut scans = tokio::task::JoinSet::new();
+        loop {
+            while scans.len() < 8 {
+                let Some(session_id) = remaining.next() else {
+                    break;
+                };
+                let store = self.clone();
+                scans.spawn(async move {
+                    match store.startup_header(&session_id).await {
+                        Ok(Some(header)) => StartupCandidate::Header(header),
+                        Ok(None) => StartupCandidate::Unreadable(UnreadableSession {
+                            session_id,
+                            reason: "session disappeared during startup enumeration".to_owned(),
+                        }),
+                        Err(error) => StartupCandidate::Unreadable(UnreadableSession {
+                            session_id,
+                            reason: error.to_string(),
+                        }),
+                    }
+                });
+            }
+            let Some(candidate) = scans.join_next().await else {
+                break;
+            };
+            let candidate = candidate.map_err(|error| {
+                backend_message(format!("session startup header worker failed: {error}"))
+            })?;
+            if sender.send(candidate).await.is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    async fn create(&self, header: SessionHeader) -> Result<Session, StoreError> {
+        validate_session_id(&header.id)?;
+        self.create_seeded(Session::new(header)?).await
+    }
+
+    async fn create_seeded(&self, session: Session) -> Result<Session, StoreError> {
+        self.publish_new_session(session).await
+    }
+
+    async fn load(&self, session_id: &str) -> Result<Option<Session>, StoreError> {
+        let owned_id = session_id.to_owned();
+        let (path, guard) = self.locked_path(session_id).await?;
+        let cache = Arc::clone(&self.cache);
+        run_blocking(move || {
+            let _guard = guard;
+            let _file_lock = acquire_file_lock(&path)?;
+            load_file_cached(&path, &owned_id, &cache)
+                .map(|loaded| loaded.map(|state| state.session))
+        })
+        .await
+    }
+
+    async fn delete_session_data(&self, session_id: &str) -> Result<(), StoreError> {
+        let (path, guard) = self.locked_path(session_id).await?;
+        let root = self.root.clone();
+        let cache = self.cache.clone();
+        let session_id = session_id.to_owned();
+        run_blocking(move || {
+            let _guard = guard;
+            let _file_lock = acquire_file_lock(&path)?;
+            for file in [&path, &catalog_path(&path)] {
+                match fs::remove_file(file) {
+                    Ok(()) => sync_parent_directory(file)?,
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(backend_error("delete session data", file, error)),
+                }
+            }
+            // An optional acceleration sidecar must not block authoritative
+            // deletion or leave tool archives behind if it is unremovable.
+            if fs::remove_file(history_index::path(&path)).is_ok() {
+                let _ = sync_parent_directory(&path);
+            }
+            if fs::remove_file(presentation_path(&path)).is_ok() {
+                let _ = sync_parent_directory(&path);
+            }
+            if fs::remove_file(recovery_checkpoint::path(&path)).is_ok() {
+                let _ = sync_parent_directory(&path);
+            }
+            results::delete(&root, &session_id)?;
+            harness_snapshot::delete(&root, &session_id)?;
+            cache_remove(&cache, &path)
+        })
+        .await
+    }
+
+    async fn append(
+        &self,
+        session_id: &str,
+        expected_revision: Revision,
+        events: Vec<SessionEvent>,
+    ) -> Result<AppendReceipt, StoreError> {
+        let owned_id = session_id.to_owned();
+        let (path, guard) = self.locked_path(session_id).await?;
+        let cache = Arc::clone(&self.cache);
+        run_blocking(move || {
+            let _guard = guard;
+            let _file_lock = acquire_file_lock(&path)?;
+            // Appends own the per-path process lock, so they can move the
+            // cached snapshot out instead of cloning a potentially huge
+            // Session before every stream checkpoint. A failed append may
+            // simply leave the cache cold; the next operation reparses the
+            // authoritative file under the same advisory lock.
+            let Some(mut loaded) = take_file_cached(&path, &owned_id, &cache)? else {
+                return Err(StoreError::NotFound {
+                    session_id: owned_id,
+                });
+            };
+
+            let actual_revision = loaded.session.revision();
+            if actual_revision != expected_revision {
+                let fingerprint = file_fingerprint(&path)?.ok_or_else(|| {
+                    backend_message(format!(
+                        "session {} disappeared during revision check",
+                        path.display()
+                    ))
+                })?;
+                cache_store(&cache, &path, fingerprint, loaded)?;
+                return Err(StoreError::RevisionConflict {
+                    session_id: owned_id,
+                    expected: expected_revision,
+                    actual: actual_revision,
+                });
+            }
+
+            let receipt = loaded
+                .session
+                .append_batch(expected_revision, events)
+                .map_err(StoreError::from)?;
+            if receipt.events.is_empty() {
+                let fingerprint = file_fingerprint(&path)?.ok_or_else(|| {
+                    backend_message(format!(
+                        "session {} disappeared during empty append",
+                        path.display()
+                    ))
+                })?;
+                cache_store(&cache, &path, fingerprint, loaded)?;
+                return Ok(receipt);
+            }
+
+            loaded.estimated_bytes = loaded
+                .estimated_bytes
+                .saturating_add(receipt.events.iter().map(event_weight).sum::<usize>());
+            let record = BatchRecord {
+                record: BATCH_RECORD.to_owned(),
+                previous_revision: receipt.previous_revision,
+                revision: receipt.revision,
+                events: receipt.events.clone(),
+            };
+            let bytes = encode_line(&record, &path)?;
+            let mut file = secure_open_options()
+                .read(true)
+                .append(true)
+                .open(&path)
+                .map_err(|error| backend_error("open session for append", &path, error))?;
+            ensure_regular_file(&file, &path, "session log")?;
+
+            let current_len = file
+                .metadata()
+                .map_err(|error| backend_error("inspect session before append", &path, error))?
+                .len();
+            if current_len != loaded.valid_len {
+                truncate_torn_tail(&path, loaded.valid_len)?;
+            }
+            if loaded.needs_separator {
+                file.write_all(b"\n").map_err(|error| {
+                    backend_error("terminate prior session record", &path, error)
+                })?;
+            }
+            file.write_all(&bytes)
+                .map_err(|error| backend_error("append session batch", &path, error))?;
+            file.flush()
+                .map_err(|error| backend_error("flush appended session batch", &path, error))?;
+            let fingerprint = fingerprint_from_metadata(
+                &path,
+                &file
+                    .metadata()
+                    .map_err(|error| backend_error("inspect appended session", &path, error))?,
+            )?;
+            for event in &receipt.events {
+                if matches!(
+                    event.data(),
+                    xharness_session::EventData::RequestHeader { .. }
+                ) {
+                    Arc::make_mut(&mut loaded.audit_offsets).insert(
+                        event.seq,
+                        (
+                            loaded.valid_len + u64::from(loaded.needs_separator),
+                            bytes.len() as u64,
+                        ),
+                    );
+                    loaded.estimated_bytes = loaded.estimated_bytes.saturating_add(64);
+                }
+            }
+            if loaded.needs_separator {
+                loaded.journal_hash.update(b"\n");
+            }
+            loaded.journal_hash.update(&bytes);
+            loaded.valid_len = fingerprint.len;
+            loaded.needs_separator = false;
+            cache_store(&cache, &path, fingerprint, loaded)?;
+            Ok(receipt)
+        })
+        .await
+    }
+
+    async fn flush(&self, session_id: &str) -> Result<Revision, StoreError> {
+        let owned_id = session_id.to_owned();
+        let (path, guard) = self.locked_path(session_id).await?;
+        let cache = Arc::clone(&self.cache);
+        run_blocking(move || {
+            let _guard = guard;
+            let _file_lock = acquire_file_lock(&path)?;
+            let Some(source_fingerprint) = file_fingerprint(&path)? else {
+                cache_remove(&cache, &path)?;
+                return Err(StoreError::NotFound {
+                    session_id: owned_id,
+                });
+            };
+            // Append/load already validated this exact file. Keep the tiny
+            // stamp even when its Session exceeds the snapshot LRU budget:
+            // durability needs an fsync, not another O(history) replay.
+            let validated_revision = cache
+                .lock()
+                .map_err(|_| backend_message("session snapshot cache is poisoned"))?
+                .catalog_stamps
+                .get(&path)
+                .filter(|stamp| stamp.fingerprint == source_fingerprint)
+                .map(|stamp| stamp.revision);
+            let (loaded, revision) = if let Some(revision) = validated_revision {
+                (None, revision)
+            } else {
+                let loaded = take_file_cached(&path, &owned_id, &cache)?.ok_or_else(|| {
+                    StoreError::NotFound {
+                        session_id: owned_id.clone(),
+                    }
+                })?;
+                let revision = loaded.session.revision();
+                (Some(loaded), revision)
+            };
+            let file = secure_open_options()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|error| {
+                    backend_error("open session for durability flush", &path, error)
+                })?;
+            ensure_regular_file(&file, &path, "session log")?;
+            let opened_fingerprint = fingerprint_from_metadata(
+                &path,
+                &file
+                    .metadata()
+                    .map_err(|error| backend_error("inspect session before flush", &path, error))?,
+            )?;
+            if opened_fingerprint != source_fingerprint {
+                cache_remove(&cache, &path)?;
+                return Err(backend_message("session changed before durability flush"));
+            }
+
+            file.sync_all()
+                .map_err(|error| backend_error("sync session data", &path, error))?;
+            sync_parent_directory(&path)?;
+            let fingerprint = fingerprint_from_metadata(
+                &path,
+                &file
+                    .metadata()
+                    .map_err(|error| backend_error("inspect flushed session", &path, error))?,
+            )?;
+            if fingerprint != source_fingerprint {
+                cache_remove(&cache, &path)?;
+                return Err(backend_message("session changed during durability flush"));
+            }
+            if let Some(loaded) = loaded {
+                cache_store(&cache, &path, fingerprint, loaded)?;
+            }
+            Ok(revision)
+        })
+        .await
+    }
+
+    fn captures_full_request_audit(&self) -> bool {
+        self.request_audit_mode == RequestAuditMode::Full
+    }
+
+    async fn archive_request(
+        &self,
+        header: xharness_session::RequestHeader,
+    ) -> Result<xharness_session::RequestHeader, StoreError> {
+        if self.request_audit_mode == RequestAuditMode::MetadataOnly {
+            return Ok(header.metadata_only(serde_json::json!({
+                "kind": "omitted", "reason": "capture_disabled",
+            })));
+        }
+        let root = self.root.clone();
+        run_blocking(move || audit::archive(&root, header)).await
+    }
+    async fn archive_harness_snapshot(
+        &self,
+        id: &str,
+        header: &xharness_session::RequestHeader,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        let (path, guard) = self.locked_path(id).await?;
+        let root = self.root.clone();
+        let id = id.to_owned();
+        let header = header.harness_view();
+        run_blocking(move || {
+            let _guard = guard;
+            let _lock = acquire_file_lock(&path)?;
+            let file = secure_open_options()
+                .read(true)
+                .open(&path)
+                .map_err(|e| backend_error("open Harness session", &path, e))?;
+            ensure_regular_file(&file, &path, "Harness session")?;
+            harness_snapshot::archive(&root, &id, &header).map(Some)
+        })
+        .await
+    }
+
+    async fn request_header(
+        &self,
+        id: &str,
+        seq: u64,
+    ) -> Result<Option<xharness_session::RequestHeader>, StoreError> {
+        self.read_request_header(id, seq, false).await
+    }
+
+    async fn harness_header(
+        &self,
+        id: &str,
+        seq: u64,
+    ) -> Result<Option<xharness_session::RequestHeader>, StoreError> {
+        self.read_request_header(id, seq, true).await
+    }
+    async fn inspect(&self, session_id: &str) -> Result<Option<SessionInspection>, StoreError> {
+        let owned = session_id.to_owned();
+        let (path, guard) = self.locked_path(session_id).await?;
+        run_blocking(move || {
+            let _guard = guard;
+            let _lock = acquire_file_lock(&path)?;
+            Ok(load_file_mode(&path, &owned, false)?.map(|s| s.session.inspect()))
+        })
+        .await
+    }
+}
+
+/// True only for a regular file that is exactly zero bytes. Symlinks are
+/// resolved by `symlink_metadata` rather than followed, so a symlink is never
+/// treated as empty just because its target is.
+fn is_zero_byte_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file() && metadata.len() == 0)
+        .unwrap_or(false)
+}
+
+fn discover_session_ids(root: &Path) -> Result<Vec<String>, StoreError> {
+    let mut session_ids = Vec::new();
+    let entries = fs::read_dir(root)
+        .map_err(|error| backend_error("enumerate session directory", root, error))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| backend_error("read session directory entry", root, error))?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        // A name that cannot denote a session id is not a session of this
+        // store, because `load`/`create` reject such ids outright. Skipping it
+        // keeps stray artifacts (`.tmp`, `.hidden`, cloud-sync conflict copies
+        // like `session-1 copy.jsonl`) from making startup enumeration fail.
+        let Some(session_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|file_name| file_name.strip_suffix(FILE_SUFFIX))
+        else {
+            continue;
+        };
+        if validate_session_id(session_id).is_err() {
+            continue;
+        }
+        session_ids.push(session_id.to_owned());
+    }
+    Ok(session_ids)
+}
+
+async fn run_blocking<T, F>(operation: F) -> Result<T, StoreError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, StoreError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| backend_message(format!("storage worker failed: {error}")))?
+}
+
+fn process_lock(path: &Path) -> Result<Arc<SessionLock>, StoreError> {
+    let table = PROCESS_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut table = table
+        .lock()
+        .map_err(|_| backend_message("process session-lock table is poisoned"))?;
+    if let Some(lock) = table.get(path).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    table.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(AsyncMutex::new(()));
+    table.insert(path.to_owned(), Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+/// Acquire the inter-process side of the session lock. The lock file is kept
+/// separate from the append-only log so creation and replacement cannot
+/// silently move a held lock to a stale inode.
+fn acquire_file_lock(session_path: &Path) -> Result<File, StoreError> {
+    let lock_path = session_path.with_extension("lock");
+    let file = secure_open_options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|error| backend_error("open session lock", &lock_path, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| backend_error("inspect session lock", &lock_path, error))?;
+    if !metadata.is_file() {
+        return Err(backend_message(format!(
+            "session lock {} is not a regular file",
+            lock_path.display()
+        )));
+    }
+    fs2::FileExt::lock_exclusive(&file)
+        .map_err(|error| backend_error("lock session", &lock_path, error))?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), StoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| backend_message(format!("session path {} has no parent", path.display())))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| backend_error("sync session directory", parent, error))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(path: &Path) -> Result<(), StoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| backend_message(format!("session path {} has no parent", path.display())))?;
+    if fs::metadata(parent)
+        .map_err(|error| backend_error("inspect session directory", parent, error))?
+        .is_dir()
+    {
+        Ok(())
+    } else {
+        Err(backend_message(format!(
+            "session directory {} is not a directory",
+            parent.display()
+        )))
+    }
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), StoreError> {
+    let valid_length = !session_id.is_empty() && session_id.len() <= MAX_SESSION_ID_BYTES;
+    let valid_shape = !session_id.starts_with('.')
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if valid_length && valid_shape {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidSessionId {
+            session_id: session_id.to_owned(),
+        })
+    }
+}
+
+fn encode_line<T: Serialize>(record: &T, path: &Path) -> Result<Vec<u8>, StoreError> {
+    let mut bytes = serde_json::to_vec(record).map_err(|error| {
+        backend_message(format!("encode session record {}: {error}", path.display()))
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn load_file_cached(
+    path: &Path,
+    session_id: &str,
+    cache: &StdMutex<SnapshotCache>,
+) -> Result<Option<LoadedFile>, StoreError> {
+    let Some(fingerprint) = file_fingerprint(path)? else {
+        cache_remove(cache, path)?;
+        return Ok(None);
+    };
+    let source_fingerprint = fingerprint;
+    let runtime_audit_view;
+    {
+        let mut c = cache
+            .lock()
+            .map_err(|_| backend_message("session snapshot cache is poisoned"))?;
+        c.clock = c.clock.wrapping_add(1);
+        let touched = c.clock;
+        runtime_audit_view = c.runtime_audit_view;
+        if let Some(loaded) = c.scopes.load(path, fingerprint) {
+            return Ok(Some(loaded));
+        }
+        if let Some(entry) = c
+            .entries
+            .get_mut(path)
+            .filter(|e| e.fingerprint == fingerprint)
+        {
+            entry.touched = touched;
+            let loaded = entry.loaded.clone();
+            c.catalog_stamps
+                .insert(path.to_owned(), ValidatedStamp::new(fingerprint, &loaded));
+            return Ok(Some(loaded));
+        }
+        c.authoritative_replays = c.authoritative_replays.saturating_add(1);
+    }
+    let loaded = load_file_mode(path, session_id, runtime_audit_view)?;
+    let Some(loaded) = loaded else {
+        cache_remove(cache, path)?;
+        return Ok(None);
+    };
+    // A cooperating writer cannot mutate the file while the caller holds the
+    // advisory lock. Re-read metadata after parsing so a non-cooperating
+    // replacement never poisons the cache with a stale identity.
+    let fingerprint = file_fingerprint(path)?.ok_or_else(|| {
+        backend_message(format!(
+            "session {} disappeared while loading",
+            path.display()
+        ))
+    })?;
+    if fingerprint != source_fingerprint {
+        return Err(backend_message(
+            "session changed during authoritative replay",
+        ));
+    }
+    cache_store(cache, path, fingerprint, loaded.clone())?;
+    Ok(Some(loaded))
+}
+
+fn take_file_cached(
+    path: &Path,
+    session_id: &str,
+    cache: &StdMutex<SnapshotCache>,
+) -> Result<Option<LoadedFile>, StoreError> {
+    let Some(fingerprint) = file_fingerprint(path)? else {
+        cache_remove(cache, path)?;
+        return Ok(None);
+    };
+    let mut c = cache
+        .lock()
+        .map_err(|_| backend_message("session snapshot cache is poisoned"))?;
+    if let Some(loaded) = c.scopes.take(path, fingerprint) {
+        return Ok(Some(loaded));
+    }
+    if let Some(entry) = c
+        .entries
+        .remove(path)
+        .filter(|e| e.fingerprint == fingerprint)
+    {
+        return Ok(Some(entry.loaded));
+    }
+    let runtime_audit_view = c.runtime_audit_view;
+    c.authoritative_replays = c.authoritative_replays.saturating_add(1);
+    drop(c);
+    load_file_mode(path, session_id, runtime_audit_view)
+}
+
+fn cache_store(
+    cache: &StdMutex<SnapshotCache>,
+    path: &Path,
+    fingerprint: FileFingerprint,
+    loaded: LoadedFile,
+) -> Result<(), StoreError> {
+    let mut c = cache
+        .lock()
+        .map_err(|_| backend_message("session snapshot cache is poisoned"))?;
+    c.entries.remove(path);
+    c.scopes.remove_snapshot(path);
+    // The stamp is tiny and retained even when a multi-gigabyte snapshot is
+    // too large for the LRU. Failed/stale publishers simply leave the index
+    // unknown; the journal remains authoritative.
+    if c.catalog_stamps.len() >= 4096 && !c.catalog_stamps.contains_key(path) {
+        c.catalog_stamps.clear();
+    }
+    c.catalog_stamps
+        .insert(path.to_owned(), ValidatedStamp::new(fingerprint, &loaded));
+    if loaded.estimated_bytes > c.max_bytes || c.max_entries == 0 {
+        c.scopes.store(path, fingerprint, loaded);
+        return Ok(());
+    }
+    while c.entries.len() >= c.max_entries
+        || c.entries
+            .values()
+            .map(|e| e.loaded.estimated_bytes)
+            .sum::<usize>()
+            .saturating_add(loaded.estimated_bytes)
+            > c.max_bytes
+    {
+        let Some(old) = c
+            .entries
+            .iter()
+            .min_by_key(|(_, e)| e.touched)
+            .map(|(p, _)| p.clone())
+        else {
+            break;
+        };
+        c.entries.remove(&old);
+    }
+    c.clock = c.clock.wrapping_add(1);
+    let touched = c.clock;
+    c.entries.insert(
+        path.to_owned(),
+        CachedFile {
+            fingerprint,
+            loaded,
+            touched,
+        },
+    );
+    Ok(())
+}
+
+fn cache_remove(cache: &StdMutex<SnapshotCache>, path: &Path) -> Result<(), StoreError> {
+    let mut cache = cache
+        .lock()
+        .map_err(|_| backend_message("session snapshot cache is poisoned"))?;
+    cache.entries.remove(path);
+    cache.scopes.remove_snapshot(path);
+    cache.catalog_stamps.remove(path);
+    Ok(())
+}
+
+fn file_fingerprint(path: &Path) -> Result<Option<FileFingerprint>, StoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(backend_error("inspect session path", path, error)),
+    };
+    fingerprint_from_metadata(path, &metadata).map(Some)
+}
+
+fn fingerprint_from_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<FileFingerprint, StoreError> {
+    if metadata.file_type().is_symlink() {
+        return Err(corrupt(path, 1, "session path must not be a symbolic link"));
+    }
+    if !metadata.is_file() {
+        return Err(corrupt(path, 1, "session path is not a regular file"));
+    }
+    #[cfg(unix)]
+    let identity = (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    );
+    #[cfg(windows)]
+    let identity = {
+        let modified = system_time_parts(metadata.modified());
+        let created = system_time_parts(metadata.created());
+        (0, 0, modified.0, modified.1, created.0, created.1)
+    };
+    Ok(FileFingerprint {
+        dev: identity.0,
+        ino: identity.1,
+        len: metadata.len(),
+        modified_seconds: identity.2,
+        modified_nanoseconds: identity.3,
+        changed_seconds: identity.4,
+        changed_nanoseconds: identity.5,
+        sample_hash: sample_file_hash(path, metadata.len())?,
+    })
+}
+
+#[cfg(windows)]
+fn system_time_parts(value: std::io::Result<SystemTime>) -> (i64, i64) {
+    let Ok(value) = value else {
+        return (0, 0);
+    };
+    match value.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+            i64::from(duration.subsec_nanos()),
+        ),
+        Err(error) => {
+            let duration = error.duration();
+            (
+                -i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+                -i64::from(duration.subsec_nanos()),
+            )
+        }
+    }
+}
+
+/// Metadata catches normal cooperating appends in O(1). A small positional
+/// sample also invalidates rapid same-length rewrites on filesystems whose
+/// timestamp granularity cannot distinguish two writes. Sampling remains
+/// bounded (at most 12 KiB) and therefore cannot regress into full-log replay.
+fn sample_file_hash(path: &Path, len: u64) -> Result<u64, StoreError> {
+    let file = secure_open_options()
+        .read(true)
+        .open(path)
+        .map_err(|error| backend_error("open session fingerprint sample", path, error))?;
+    ensure_regular_file(&file, path, "session log")?;
+    let sample_len = u64::try_from(FINGERPRINT_SAMPLE_BYTES).expect("sample size fits in u64");
+    let offsets = [
+        0,
+        (len / 2).saturating_sub(sample_len / 2),
+        len.saturating_sub(sample_len),
+    ];
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut buffer = [0u8; FINGERPRINT_SAMPLE_BYTES];
+    for offset in offsets {
+        for byte in offset.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        let count = read_file_at(&file, &mut buffer, offset)
+            .map_err(|error| backend_error("read session fingerprint sample", path, error))?;
+        for byte in &buffer[..count] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash ^= u64::try_from(count).expect("sample count fits in u64");
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    Ok(hash)
+}
+
+fn load_file_mode(
+    path: &Path,
+    session_id: &str,
+    runtime_audit_view: bool,
+) -> Result<Option<LoadedFile>, StoreError> {
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(backend_error("inspect session path", path, error)),
+    };
+    if path_metadata.file_type().is_symlink() {
+        return Err(corrupt(path, 1, "session path must not be a symbolic link"));
+    }
+    if !path_metadata.is_file() {
+        return Err(corrupt(path, 1, "session path is not a regular file"));
+    }
+
+    let file = match secure_open_options().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(backend_error("open session", path, error)),
+    };
+    ensure_regular_file(&file, path, "session log")?;
+
+    parse_reader(path, session_id, BufReader::new(file), runtime_audit_view).map(Some)
+}
+
+/// Read only the immutable first record. The Host verifies the event tail on
+/// its single full `load` before the candidate becomes visible. Old JSONL
+/// files need no migration and no sidecar allocation for this fast path.
+fn read_header_file(path: &Path, session_id: &str) -> Result<Option<SessionHeader>, StoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(backend_error("inspect session path", path, error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(corrupt(path, 1, "session path must not be a symbolic link"));
+    }
+    if !metadata.is_file() {
+        return Err(corrupt(path, 1, "session path is not a regular file"));
+    }
+    let file = match secure_open_options().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(backend_error("open session", path, error)),
+    };
+    ensure_regular_file(&file, path, "session log")?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    if read_record(&mut reader, &mut line, path)? == 0 {
+        return Err(corrupt(path, 1, "missing header record"));
+    }
+    let record: HeaderRecord = decode_owned_json(&line)
+        .map_err(|e| corrupt(path, 1, format!("invalid header JSON: {e}")))?;
+    validate_header_record(path, session_id, &record)?;
+    Ok(Some(record.header))
+}
+
+// Bound a single corrupt/hostile record, not the number of history records.
+fn read_record(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    path: &Path,
+) -> Result<usize, StoreError> {
+    let n = reader
+        .take(MAX_RECORD_BYTES + 1)
+        .read_until(b'\n', line)
+        .map_err(|e| backend_error("read session record", path, e))?;
+    if n as u64 > MAX_RECORD_BYTES {
+        return Err(backend_message(
+            "session record exceeds 128 MiB; file left unchanged",
+        ));
+    }
+    Ok(n)
+}
+
+fn parse_reader(
+    path: &Path,
+    session_id: &str,
+    mut reader: impl BufRead,
+    runtime_audit_view: bool,
+) -> Result<LoadedFile, StoreError> {
+    let original_fingerprint = file_fingerprint(path).ok().flatten();
+    let mut history_index = history_index::Builder::default();
+    let mut line = Vec::new();
+    let read = read_record(&mut reader, &mut line, path)?;
+    if read == 0 {
+        return Err(corrupt(path, 1, "missing header record"));
+    }
+    let header_record: HeaderRecord = decode_owned_json(&line)
+        .map_err(|e| corrupt(path, 1, format!("invalid header JSON: {e}")))?;
+    validate_header_record(path, session_id, &header_record)?;
+    let header = header_record.header;
+    let mut valid_len = read as u64;
+    let header_len = valid_len;
+    let mut journal_hash = Sha256::new_with_prefix(&line);
+    let mut needs_separator = !line.ends_with(b"\n");
+    let mut revision = Revision::ZERO;
+    let mut events = Vec::new();
+    let mut line_number = 1;
+    let mut estimated_bytes = 1024usize;
+    let mut audit_offsets = HashMap::new();
+    loop {
+        line.clear();
+        let count = read_record(&mut reader, &mut line, path)?;
+        if count == 0 {
+            break;
+        }
+        line_number += 1;
+        let terminated = line.ends_with(b"\n");
+        match decode_batch_line(&line, header_record.format_version) {
+            Ok(mut record) => {
+                history_index.record(valid_len, &line, &record);
+                for event in &record.events {
+                    if matches!(
+                        event.data(),
+                        xharness_session::EventData::RequestHeader { .. }
+                    ) {
+                        audit_offsets.insert(event.seq, (valid_len, count as u64));
+                        estimated_bytes = estimated_bytes.saturating_add(64);
+                    }
+                }
+                if runtime_audit_view {
+                    for e in &mut record.events {
+                        audit::elide(e);
+                    }
+                }
+                estimated_bytes = estimated_bytes
+                    .saturating_add(record.events.iter().map(event_weight).sum::<usize>());
+                extend_batch_record(path, line_number, &mut revision, &mut events, record)?;
+                journal_hash.update(&line);
+                valid_len += count as u64;
+                needs_separator = !terminated;
+            }
+            // Only syntactically truncated final JSON is recoverable. Complete
+            // unknown versions/events must never be silently discarded.
+            Err(BatchDecodeError::Json(e)) if !terminated && e.is_eof() => break,
+            Err(e) => {
+                return Err(corrupt(
+                    path,
+                    line_number,
+                    format!("invalid batch JSON: {e}"),
+                ))
+            }
+        }
+    }
+    if let Some(original) = original_fingerprint {
+        if file_fingerprint(path)? != Some(original) {
+            return Err(backend_message("session changed while parsing the journal"));
+        }
+    }
+    let session = Session::restore(header, revision, events)
+        .map_err(|e| corrupt(path, line_number, format!("invalid event log: {e}")))?;
+    history_index.publish(
+        path,
+        &session,
+        history_index::ReplayedSource {
+            format_version: header_record.format_version,
+            header_len,
+            fingerprint: original_fingerprint,
+            valid_len,
+            needs_separator,
+        },
+    );
+    Ok(LoadedFile {
+        session,
+        format_version: header_record.format_version,
+        valid_len,
+        needs_separator,
+        estimated_bytes,
+        journal_hash,
+        audit_offsets: Arc::new(audit_offsets),
+    })
+}
+
+fn decode_batch_line(line: &[u8], format_version: u32) -> Result<BatchRecord, BatchDecodeError> {
+    if format_version == FILE_FORMAT_VERSION {
+        return decode_owned_json(line).map_err(BatchDecodeError::Json);
+    }
+    let tag: RecordTag = decode_owned_json(line).map_err(BatchDecodeError::Json)?;
+    if tag.record == BATCH_RECORD {
+        return decode_owned_json(line).map_err(BatchDecodeError::Json);
+    }
+    if tag.record != COMPRESSED_BATCH_RECORD {
+        return Err(BatchDecodeError::Invalid(format!(
+            "unsupported session record {:?}",
+            tag.record
+        )));
+    }
+    let record: CompressedBatchRecord = decode_owned_json(line).map_err(BatchDecodeError::Json)?;
+    if record.uncompressed_len > MAX_RECORD_BYTES {
+        return Err(BatchDecodeError::Invalid(
+            "compressed batch expands beyond 128 MiB".to_owned(),
+        ));
+    }
+    let compressed = BASE64
+        .decode(record.data.as_bytes())
+        .map_err(|e| BatchDecodeError::Invalid(format!("invalid compressed batch base64: {e}")))?;
+    if format!("{:x}", Sha256::digest(&compressed)) != record.compressed_sha256 {
+        return Err(BatchDecodeError::Invalid(
+            "compressed batch digest mismatch".to_owned(),
+        ));
+    }
+    let mut decoder = GzDecoder::new(compressed.as_slice());
+    let mut expanded = Vec::new();
+    decoder
+        .by_ref()
+        .take(record.uncompressed_len + 1)
+        .read_to_end(&mut expanded)
+        .map_err(|e| BatchDecodeError::Invalid(format!("decompress batch: {e}")))?;
+    if expanded.len() as u64 != record.uncompressed_len
+        || format!("{:x}", Sha256::digest(&expanded)) != record.sha256
+    {
+        return Err(BatchDecodeError::Invalid(
+            "uncompressed batch size or digest mismatch".to_owned(),
+        ));
+    }
+    decode_owned_json(&expanded)
+        .map_err(|e| BatchDecodeError::Invalid(format!("invalid expanded batch JSON: {e}")))
+}
+
+fn encode_compressed_batch(line: &[u8], path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
+    if line.len() < MIN_COMPRESS_BYTES {
+        return Ok(None);
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(line)
+        .map_err(|e| backend_error("compress session batch", path, e))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|e| backend_error("finish compressed batch", path, e))?;
+    let record = CompressedBatchRecord {
+        record: COMPRESSED_BATCH_RECORD.to_owned(),
+        uncompressed_len: line.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(line)),
+        compressed_sha256: format!("{:x}", Sha256::digest(&compressed)),
+        data: BASE64.encode(compressed),
+    };
+    let encoded = encode_line(&record, path)?;
+    // An incompressible record stays plain. Avoid format churn for a marginal
+    // saving and preserve the existing 128 MiB physical-record limit.
+    if encoded.len() as u64 > MAX_RECORD_BYTES || encoded.len().saturating_mul(10) >= line.len() * 9
+    {
+        return Ok(None);
+    }
+    Ok(Some(encoded))
+}
+
+fn logical_session_digest(session: &Session) -> Result<[u8; 32], StoreError> {
+    let mut digest = Sha256::new();
+    let header = serde_json::to_vec(session.header())
+        .map_err(|e| backend_message(format!("encode session header for verification: {e}")))?;
+    digest.update((header.len() as u64).to_le_bytes());
+    digest.update(header);
+    digest.update(session.revision().get().to_le_bytes());
+    digest.update((session.events().len() as u64).to_le_bytes());
+    for event in session.events() {
+        let bytes = serde_json::to_vec(event)
+            .map_err(|e| backend_message(format!("encode session event for verification: {e}")))?;
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Ok(digest.finalize().into())
+}
+
+/// Stage and validate a complete single-file rewrite before atomic publish.
+/// Invalid, dirty, or non-beneficial inputs leave the original unchanged.
+/// A post-publish directory-sync error is outcome-unknown and must be checked
+/// by reloading the authoritative path. The caller holds both locks.
+fn compress_cold_file(path: &Path, session_id: &str) -> Result<ColdCompressionReport, StoreError> {
+    let before = file_fingerprint(path)?.ok_or_else(|| StoreError::NotFound {
+        session_id: session_id.to_owned(),
+    })?;
+    let original =
+        load_file_mode(path, session_id, false)?.ok_or_else(|| StoreError::NotFound {
+            session_id: session_id.to_owned(),
+        })?;
+    if original.valid_len != before.len || original.needs_separator {
+        return Err(backend_message(
+            "cold compression requires a complete newline-terminated journal",
+        ));
+    }
+    // Do not retain two full event vectors during validation. Large legacy
+    // journals are exactly why this maintenance operation must bound peak RSS.
+    let original_digest = logical_session_digest(&original.session)?;
+    drop(original);
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_file_name(format!(
+        ".compact-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let source = secure_open_options()
+            .read(true)
+            .open(path)
+            .map_err(|e| backend_error("open cold journal", path, e))?;
+        ensure_regular_file(&source, path, "session log")?;
+        let mut reader = BufReader::new(source);
+        let mut target = secure_open_options()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| backend_error("create compacted journal", &tmp, e))?;
+        let mut line = Vec::new();
+        read_record(&mut reader, &mut line, path)?;
+        let mut header: HeaderRecord = decode_owned_json(&line)
+            .map_err(|e| corrupt(path, 1, format!("invalid header JSON: {e}")))?;
+        validate_header_record(path, session_id, &header)?;
+        let source_version = header.format_version;
+        header.format_version = COMPRESSED_FILE_FORMAT_VERSION;
+        target
+            .write_all(&encode_line(&header, &tmp)?)
+            .map_err(|e| backend_error("write compacted header", &tmp, e))?;
+        let mut batches_compressed = 0u64;
+        loop {
+            line.clear();
+            if read_record(&mut reader, &mut line, path)? == 0 {
+                break;
+            }
+            // The source was fully validated under this session lock before
+            // staging. The final source fingerprint and complete staged replay
+            // guard against any non-cooperating mutation during the rewrite.
+            let already_compressed = source_version == COMPRESSED_FILE_FORMAT_VERSION
+                && decode_owned_json::<RecordTag>(&line)
+                    .map_err(|e| backend_message(format!("decode cold batch tag: {e}")))?
+                    .record
+                    == COMPRESSED_BATCH_RECORD;
+            let encoded = if already_compressed {
+                None
+            } else {
+                encode_compressed_batch(&line, &tmp)?
+            };
+            if let Some(encoded) = encoded {
+                target
+                    .write_all(&encoded)
+                    .map_err(|e| backend_error("write compacted batch", &tmp, e))?;
+                batches_compressed += 1;
+            } else {
+                target
+                    .write_all(&line)
+                    .map_err(|e| backend_error("copy cold batch", &tmp, e))?;
+            }
+        }
+        target
+            .sync_all()
+            .map_err(|e| backend_error("sync compacted journal", &tmp, e))?;
+        drop(target);
+        drop(reader);
+        let after = fs::metadata(&tmp)
+            .map_err(|e| backend_error("inspect compacted journal", &tmp, e))?
+            .len();
+        if batches_compressed == 0 || after >= before.len {
+            return Ok(ColdCompressionReport {
+                bytes_before: before.len,
+                bytes_after: before.len,
+                batches_compressed: 0,
+                changed: false,
+            });
+        }
+        let staged = load_file_mode(&tmp, session_id, false)?
+            .ok_or_else(|| backend_message("compacted journal disappeared before validation"))?;
+        if logical_session_digest(&staged.session)? != original_digest
+            || staged.valid_len != after
+            || staged.needs_separator
+        {
+            return Err(backend_message(
+                "compacted journal failed complete logical replay validation",
+            ));
+        }
+        if file_fingerprint(path)? != Some(before) {
+            return Err(backend_message(
+                "journal changed during cold compression; original left unchanged",
+            ));
+        }
+        replace_compacted_file(path, &tmp)?;
+        sync_parent_directory(path)?;
+        Ok(ColdCompressionReport {
+            bytes_before: before.len,
+            bytes_after: after,
+            batches_compressed,
+            changed: true,
+        })
+    })();
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
+#[cfg(unix)]
+fn replace_compacted_file(path: &Path, tmp: &Path) -> Result<(), StoreError> {
+    fs::rename(tmp, path).map_err(|e| backend_error("publish compacted journal", path, e))
+}
+
+#[cfg(windows)]
+fn replace_compacted_file(path: &Path, tmp: &Path) -> Result<(), StoreError> {
+    xharness_win32::replace_file(path, tmp)
+        .map_err(|e| backend_error("publish compacted journal", path, e))
+}
+
+fn validate_header_record(
+    path: &Path,
+    requested_id: &str,
+    record: &HeaderRecord,
+) -> Result<(), StoreError> {
+    if record.record != HEADER_RECORD {
+        return Err(corrupt(
+            path,
+            1,
+            format!("expected {HEADER_RECORD:?} record, got {:?}", record.record),
+        ));
+    }
+    if record.format != FILE_FORMAT {
+        return Err(corrupt(
+            path,
+            1,
+            format!("unsupported file format {:?}", record.format),
+        ));
+    }
+    if record.format_version != FILE_FORMAT_VERSION
+        && record.format_version != COMPRESSED_FILE_FORMAT_VERSION
+    {
+        return Err(corrupt(
+            path,
+            1,
+            format!(
+                "unsupported JSONL format version {}; expected {} or {}",
+                record.format_version, FILE_FORMAT_VERSION, COMPRESSED_FILE_FORMAT_VERSION
+            ),
+        ));
+    }
+    if record.header.id != requested_id {
+        return Err(corrupt(
+            path,
+            1,
+            format!(
+                "header session id {:?} does not match requested id {requested_id:?}",
+                record.header.id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_batch_record(
+    path: &Path,
+    line_number: usize,
+    revision: Revision,
+    record: &BatchRecord,
+) -> Result<(), StoreError> {
+    if record.record != BATCH_RECORD {
+        return Err(corrupt(
+            path,
+            line_number,
+            format!("expected {BATCH_RECORD:?} record, got {:?}", record.record),
+        ));
+    }
+    if record.events.is_empty() {
+        return Err(corrupt(path, line_number, "persisted batch is empty"));
+    }
+    if record.previous_revision != revision {
+        return Err(corrupt(
+            path,
+            line_number,
+            format!(
+                "batch previous revision {:?} is not continuous from {:?}",
+                record.previous_revision, revision
+            ),
+        ));
+    }
+    let expected_revision = record
+        .previous_revision
+        .get()
+        .checked_add(1)
+        .map(Revision)
+        .ok_or_else(|| corrupt(path, line_number, "batch revision overflow"))?;
+    if record.revision != expected_revision {
+        return Err(corrupt(
+            path,
+            line_number,
+            format!(
+                "batch revision {:?} is not the successor of {:?}",
+                record.revision, record.previous_revision
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn extend_batch_record(
+    path: &Path,
+    line_number: usize,
+    revision: &mut Revision,
+    events: &mut Vec<LoggedEvent>,
+    record: BatchRecord,
+) -> Result<(), StoreError> {
+    validate_batch_record(path, line_number, *revision, &record)?;
+    events.extend(record.events);
+    *revision = record.revision;
+    Ok(())
+}
+
+fn backend_error(action: &str, path: &Path, error: std::io::Error) -> StoreError {
+    backend_message(format!("{action} {}: {error}", path.display()))
+}
+
+fn secure_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options
+}
+
+fn truncate_torn_tail(path: &Path, valid_len: u64) -> Result<(), StoreError> {
+    // Windows append-only handles have FILE_APPEND_DATA but not the
+    // FILE_WRITE_DATA access required by SetEndOfFile. Keep the append handle
+    // open for append semantics and use a short-lived writable handle for
+    // crash-tail repair. The per-path and inter-process locks serialize all
+    // cooperating writers around both operations.
+    let file = secure_open_options()
+        .write(true)
+        .open(path)
+        .map_err(|error| backend_error("open session for tail repair", path, error))?;
+    ensure_regular_file(&file, path, "session log")?;
+    file.set_len(valid_len)
+        .map_err(|error| backend_error("truncate torn session tail", path, error))
+}
+
+fn ensure_regular_file(file: &File, path: &Path, label: &str) -> Result<(), StoreError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| backend_error(&format!("inspect opened {label}"), path, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(backend_message(format!(
+            "{label} {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    file.read_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    file.seek_read(buffer, offset)
+}
+
+fn backend_message(message: impl Into<String>) -> StoreError {
+    StoreError::Backend {
+        message: message.into(),
+    }
+}
+
+fn corrupt(path: &Path, line: usize, message: impl AsRef<str>) -> StoreError {
+    backend_message(format!(
+        "corrupt session {} at line {line}: {}",
+        path.display(),
+        message.as_ref()
+    ))
+}
+
+#[cfg(test)]
+mod shared_payload_weight_tests {
+    #![forbid(unsafe_code)]
+    use super::*;
+
+    #[test]
+    fn snapshot_budget_charges_the_shared_payload_outside_the_event_vector() {
+        let event = LoggedEvent {
+            seq: 0,
+            revision: Revision(1),
+            timestamp_ms: 1,
+            event: xharness_session::EventData::StepStart { turn: 1, step: 1 }.into(),
+        };
+        let encoded = serde_json::to_vec(&event).unwrap();
+        assert_eq!(
+            event_weight(&event),
+            encoded.len() * 3
+                + std::mem::size_of::<LoggedEvent>()
+                + std::mem::size_of::<xharness_session::EventData>()
+                + 2 * std::mem::size_of::<usize>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests;

@@ -1,0 +1,3391 @@
+mod observer;
+use observer::DurableRunningTurn;
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock as StdRwLock,
+    },
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use futures::StreamExt;
+use serde_json::Value;
+use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
+use xharness_agent::{
+    AgentCommandError, AgentEvent, AgentRegistry, AgentShutdownReport, AgentSupervisor,
+    DurableAgentHandle, InboxMessage, LeaseManager, RegistryError, TurnRequestFactory,
+};
+use xharness_compaction::CompactionConfig;
+use xharness_core::{
+    AgentMessage, ContextPolicy, ContextWindowCapability, InjectionMode, LoopCommand,
+    LoopControlError, LoopEngine, LoopEvent, LoopRequest, LoopResult, LoopRun, LoopStatus,
+    ModelProvider, Role,
+};
+use xharness_debug::DebugRecorder;
+use xharness_prompt::PromptAssembly;
+use xharness_schedule::{ScheduleDeliveryNotice, ScheduleManager};
+use xharness_session::{Session, SessionEvent, SessionHeader, Store, StoreError};
+use xharness_token::TokenGuard;
+
+use crate::{PermissionPreset, SessionToolFactory};
+
+/// Provider/model selection requested by one Host session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelRoute {
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    /// Optional session-selected soft budget. The Provider capability remains
+    /// the hard ceiling and is not modified by this value.
+    pub context_window_tokens: Option<u64>,
+}
+
+/// Browser-visible metadata for one model route accepted by the runtime.
+///
+/// The route identity is intentionally separate from the adapter's upstream
+/// model string. For example, `llama-v100/qwen` and
+/// `llama-4080/qwen` may both use the OpenAI-compatible adapter while pointing
+/// at different endpoints and wire-level model names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelDescriptor {
+    pub provider: String,
+    pub provider_display_name: String,
+    pub model: String,
+    pub model_display_name: String,
+    /// Exact-model reasoning controls exposed to the browser. Absence can mean
+    /// unknown or explicitly disabled; consult reasoning_capability.
+    pub reasoning: Option<ModelReasoning>,
+    /// Provenance/state for discovery; no vendor wire patches enter the UI.
+    pub reasoning_capability: serde_json::Value,
+    /// Effective image admission for the exact active route. None means unknown.
+    pub image_input: Option<bool>,
+    /// Separate modality provenance; reasoning overrides never affect this field.
+    pub image_input_capability: serde_json::Value,
+    /// Capability snapshot reported by the exact deployment, or an explicitly
+    /// labelled deployment fallback when the Provider cannot advertise it.
+    pub context_window: ContextWindowCapability,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelReasoningEffort {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+impl ModelReasoningEffort {
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelReasoning {
+    /// Provider-owned effort levels ordered from lowest to highest cost. The
+    /// first entry is used for internal compaction unless a later policy
+    /// explicitly selects another level.
+    pub efforts: Vec<ModelReasoningEffort>,
+    pub default_effort: Option<String>,
+}
+
+impl ModelReasoning {
+    pub fn new(efforts: Vec<ModelReasoningEffort>) -> Self {
+        Self {
+            efforts,
+            default_effort: None,
+        }
+    }
+
+    pub fn with_default(mut self, effort: impl Into<String>) -> Self {
+        self.default_effort = Some(effort.into());
+        self
+    }
+
+    fn supports(&self, effort: &str) -> bool {
+        self.efforts.iter().any(|candidate| candidate.id == effort)
+    }
+
+    pub fn lowest_effort(&self) -> Option<&str> {
+        self.efforts.first().map(|effort| effort.id.as_str())
+    }
+}
+
+impl ModelDescriptor {
+    pub fn new(
+        provider: impl Into<String>,
+        provider_display_name: impl Into<String>,
+        model: impl Into<String>,
+        model_display_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            provider_display_name: provider_display_name.into(),
+            model: model.into(),
+            model_display_name: model_display_name.into(),
+            reasoning: None,
+            reasoning_capability: serde_json::json!({"state":"unknown"}),
+            image_input: None,
+            image_input_capability: serde_json::json!({"state":"unknown","source":"unknown"}),
+            context_window: ContextWindowCapability::default(),
+        }
+    }
+
+    pub fn with_reasoning(mut self, reasoning: ModelReasoning) -> Self {
+        self.reasoning = Some(reasoning);
+        self
+    }
+
+    pub fn with_context_window(mut self, context_window: ContextWindowCapability) -> Self {
+        self.context_window = context_window;
+        self
+    }
+
+    pub fn with_image_input(
+        mut self,
+        supported: Option<bool>,
+        provenance: serde_json::Value,
+    ) -> Self {
+        self.image_input = supported;
+        self.image_input_capability = provenance;
+        self
+    }
+
+    fn supports_reasoning_effort(&self, effort: Option<&str>) -> bool {
+        match (effort, &self.reasoning) {
+            (None, _) => true,
+            (Some(effort), Some(reasoning)) => reasoning.supports(effort),
+            (Some(_), None) => false,
+        }
+    }
+
+    fn supports_context_window(&self, selected: Option<u64>) -> bool {
+        match selected {
+            None => true,
+            Some(0) => false,
+            Some(selected) => self
+                .context_window
+                .effective_hard_max()
+                .is_none_or(|maximum| selected <= maximum),
+        }
+    }
+
+    pub fn route(&self) -> ModelRoute {
+        ModelRoute::new(&self.provider, &self.model)
+    }
+}
+
+/// One immutable Provider/Model binding used by [`ModelRegistry`].
+#[derive(Clone)]
+pub struct RegisteredModel {
+    descriptor: ModelDescriptor,
+    provider: Arc<dyn ModelProvider>,
+    inner_provider: Arc<dyn ModelProvider>,
+    token_guard: Option<TokenGuard>,
+}
+
+impl RegisteredModel {
+    pub fn new(descriptor: ModelDescriptor, provider: Arc<dyn ModelProvider>) -> Self {
+        Self {
+            descriptor,
+            provider: Arc::clone(&provider),
+            inner_provider: provider,
+            token_guard: None,
+        }
+    }
+
+    pub fn with_token_guard(mut self, token_guard: Option<TokenGuard>) -> Self {
+        self.token_guard = token_guard;
+        self
+    }
+
+    pub fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ModelRegistryError {
+    #[error("provider and model route identifiers must be non-empty")]
+    EmptyRoute,
+    #[error("provider and model display names must be non-empty")]
+    EmptyDisplayName,
+    #[error("model route {provider}/{model} is registered more than once")]
+    DuplicateRoute { provider: String, model: String },
+    #[error("model route {provider}/{model} has an invalid reasoning profile: {message}")]
+    InvalidReasoning {
+        provider: String,
+        model: String,
+        message: String,
+    },
+    #[error("default model route {provider}/{model} is not registered")]
+    DefaultRouteUnavailable { provider: String, model: String },
+}
+
+/// Provider-neutral registry that resolves a selected Host route to one bound
+/// adapter and its context budget.
+///
+/// Registry order is stable and is reused by the Web model picker. Adapters
+/// are wrapped so durable request headers retain the public route identity,
+/// while the inner adapter remains free to use a different upstream model
+/// string in its wire request.
+#[derive(Clone, Default)]
+pub struct ModelRegistry {
+    entries: HashMap<(String, String), RegisteredModel>,
+    order: Vec<(String, String)>,
+}
+
+impl ModelRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, mut model: RegisteredModel) -> Result<(), ModelRegistryError> {
+        let descriptor = &model.descriptor;
+        if descriptor.provider.trim().is_empty() || descriptor.model.trim().is_empty() {
+            return Err(ModelRegistryError::EmptyRoute);
+        }
+        if descriptor.provider_display_name.trim().is_empty()
+            || descriptor.model_display_name.trim().is_empty()
+        {
+            return Err(ModelRegistryError::EmptyDisplayName);
+        }
+        if let Some(reasoning) = &descriptor.reasoning {
+            if reasoning.efforts.is_empty() {
+                return Err(ModelRegistryError::InvalidReasoning {
+                    provider: descriptor.provider.clone(),
+                    model: descriptor.model.clone(),
+                    message: "at least one effort is required".to_owned(),
+                });
+            }
+            let mut ids = std::collections::HashSet::new();
+            for effort in &reasoning.efforts {
+                if effort.id.trim().is_empty() || effort.name.trim().is_empty() {
+                    return Err(ModelRegistryError::InvalidReasoning {
+                        provider: descriptor.provider.clone(),
+                        model: descriptor.model.clone(),
+                        message: "effort id and display name must be non-empty".to_owned(),
+                    });
+                }
+                if !ids.insert(effort.id.as_str()) {
+                    return Err(ModelRegistryError::InvalidReasoning {
+                        provider: descriptor.provider.clone(),
+                        model: descriptor.model.clone(),
+                        message: format!("effort {:?} is declared more than once", effort.id),
+                    });
+                }
+            }
+            if let Some(default) = reasoning.default_effort.as_deref() {
+                if !reasoning.supports(default) {
+                    return Err(ModelRegistryError::InvalidReasoning {
+                        provider: descriptor.provider.clone(),
+                        model: descriptor.model.clone(),
+                        message: format!("default effort {default:?} is not declared"),
+                    });
+                }
+            }
+        }
+        let key = (descriptor.provider.clone(), descriptor.model.clone());
+        if self.entries.contains_key(&key) {
+            return Err(ModelRegistryError::DuplicateRoute {
+                provider: key.0,
+                model: key.1,
+            });
+        }
+        model.provider = Arc::new(RouteBoundProvider {
+            provider_id: descriptor.provider.clone(),
+            model_id: descriptor.model.clone(),
+            inner: Arc::clone(&model.inner_provider),
+            context_override: None,
+        });
+        self.order.push(key.clone());
+        self.entries.insert(key, model);
+        Ok(())
+    }
+
+    pub fn can_route(&self, route: &ModelRoute) -> bool {
+        self.entries
+            .get(&(route.provider.clone(), route.model.clone()))
+            .is_some_and(|model| {
+                model
+                    .descriptor
+                    .supports_reasoning_effort(route.reasoning_effort.as_deref())
+                    && model
+                        .descriptor
+                        .supports_context_window(route.context_window_tokens)
+                    && route.context_window_tokens.is_none_or(|tokens| {
+                        model
+                            .token_guard
+                            .as_ref()
+                            .is_some_and(|guard| guard.with_context_window(tokens).is_ok())
+                    })
+            })
+    }
+
+    pub fn models(&self) -> Vec<ModelDescriptor> {
+        self.order
+            .iter()
+            .filter_map(|key| self.entries.get(key))
+            .map(|model| model.descriptor.clone())
+            .collect()
+    }
+
+    /// Replace deployment evidence and its request guard atomically. An unknown
+    /// capacity may have a temporary guard, but must not advertise that guard
+    /// as a model maximum. Existing automatic routes (None) use the new guard.
+    pub fn replace_context_capability(
+        &mut self,
+        route: &ModelRoute,
+        capability: ContextWindowCapability,
+    ) -> Result<(), xharness_token::TokenBudgetError> {
+        if let Some(model) = self
+            .entries
+            .get_mut(&(route.provider.clone(), route.model.clone()))
+        {
+            if let (Some(maximum), Some(guard)) =
+                (capability.effective_hard_max(), model.token_guard.as_ref())
+            {
+                model.token_guard = Some(guard.with_context_window(maximum)?);
+            }
+            // Replace the immutable route binding rather than mutating the
+            // adapter held by an in-flight turn or an older registry snapshot.
+            model.provider = Arc::new(RouteBoundProvider {
+                provider_id: model.descriptor.provider.clone(),
+                model_id: model.descriptor.model.clone(),
+                inner: Arc::clone(&model.inner_provider),
+                context_override: Some(capability.clone()),
+            });
+            model.descriptor.context_window = capability;
+        }
+        Ok(())
+    }
+
+    pub fn token_guard(&self, route: &ModelRoute) -> Option<TokenGuard> {
+        let guard = self
+            .resolve(route)
+            .and_then(|model| model.token_guard.clone())?;
+        match route.context_window_tokens {
+            Some(tokens) => guard.with_context_window(tokens).ok(),
+            None => Some(guard),
+        }
+    }
+
+    /// Resolve the lowest-cost reasoning effort declared by the exact model
+    /// route. Route-level interactive effort is intentionally ignored.
+    pub fn compaction_reasoning_effort(&self, route: &ModelRoute) -> Option<String> {
+        self.resolve(route)
+            .and_then(|model| model.descriptor.reasoning.as_ref())
+            .and_then(ModelReasoning::lowest_effort)
+            .map(str::to_owned)
+    }
+
+    fn resolve(&self, route: &ModelRoute) -> Option<&RegisteredModel> {
+        self.entries
+            .get(&(route.provider.clone(), route.model.clone()))
+    }
+
+    fn set_token_guard(&mut self, route: &ModelRoute, token_guard: Option<TokenGuard>) {
+        if let Some(model) = self
+            .entries
+            .get_mut(&(route.provider.clone(), route.model.clone()))
+        {
+            model.token_guard = token_guard;
+        }
+    }
+}
+
+struct RouteBoundProvider {
+    provider_id: String,
+    model_id: String,
+    inner: Arc<dyn ModelProvider>,
+    context_override: Option<ContextWindowCapability>,
+}
+
+#[async_trait]
+impl ModelProvider for RouteBoundProvider {
+    fn input_counter_failed(&self) {
+        self.inner.input_counter_failed();
+    }
+    fn provider_name(&self) -> &str {
+        &self.provider_id
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.model_id)
+    }
+
+    fn estimate_input_tokens(
+        &self,
+        request: &xharness_core::ProviderRequest,
+    ) -> Option<xharness_core::ProviderInputTokenCount> {
+        self.inner.estimate_input_tokens(request)
+    }
+    async fn count_input_tokens(
+        &self,
+        request: &xharness_core::ProviderRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<xharness_core::ProviderInputTokenCount>, xharness_core::ProviderError> {
+        self.inner.count_input_tokens(request, cancellation).await
+    }
+
+    async fn capabilities(
+        &self,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<xharness_core::ModelCapabilities, xharness_core::ProviderError> {
+        if let Some(context) = &self.context_override {
+            return Ok(xharness_core::ModelCapabilities {
+                context_window: context.clone(),
+            });
+        }
+        self.inner.capabilities(cancellation).await
+    }
+
+    async fn stream(
+        &self,
+        request: xharness_core::ProviderRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<xharness_core::ProviderStream, xharness_core::ProviderError> {
+        self.inner.stream(request, cancellation).await
+    }
+}
+
+impl xharness_projection::ProjectionRoute for ModelRoute {
+    fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+impl ModelRoute {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            reasoning_effort: None,
+            context_window_tokens: None,
+        }
+    }
+}
+
+/// Complete provider-neutral input needed to start one Host turn.
+#[derive(Clone, Debug)]
+pub struct AgentTurnRequest {
+    pub session_id: String,
+    pub cwd: String,
+    pub route: ModelRoute,
+    pub permission: PermissionPreset,
+    /// Deterministic System Prompt selected by the Host for this turn.
+    pub prompt: Option<PromptAssembly>,
+    pub messages: Vec<AgentMessage>,
+    /// Optional product/transport metadata retained beside the durable inbox
+    /// item. The Web Host stores its structured content blocks and source here
+    /// so queue replay does not collapse attachments into plain text.
+    pub input_metadata: Option<serde_json::Value>,
+}
+
+/// Stable configuration needed to reactivate one durable Agent session after
+/// Host startup. Pending input is discovered from the Session log rather than
+/// copied through this control-plane request.
+#[derive(Clone, Debug)]
+pub struct AgentSessionRequest {
+    pub session_id: String,
+    pub cwd: String,
+    pub route: ModelRoute,
+    pub permission: PermissionPreset,
+    /// Prompt restored for already-durable pending turns.
+    pub prompt: Option<PromptAssembly>,
+}
+
+/// Durable work attached during one startup-resume operation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentResumeReport {
+    /// Ordinary pending input observers, including user-authored next-step steering.
+    pub pending_turns: usize,
+    pub pending_next_step: usize,
+    /// Stable internal work id for one open approval turn that was attached
+    /// and woken during startup recovery.
+    pub recovered_approval_work_id: Option<String>,
+    /// Stable internal work id for one replay-safe user-question turn.
+    pub recovered_question_work_id: Option<String>,
+    /// One unfinished `/compact` command reattached after process restart.
+    pub recovered_compaction_work_id: Option<String>,
+}
+
+/// A live turn owned by the Host driver. This seam prevents Web control-plane
+/// code from depending on a particular loop or future long-lived Agent
+/// implementation.
+#[async_trait]
+pub trait RunningTurn: Send + 'static {
+    async fn next_event(&mut self) -> Option<LoopEvent>;
+
+    async fn send(&mut self, command: LoopCommand) -> Result<(), LoopControlError>;
+
+    /// Send one control command with optional durable product metadata. Plain
+    /// Loop runtimes ignore the metadata; durable runtimes retain it beside
+    /// injected/steering inbox input for restart receipt reconstruction.
+    async fn send_with_metadata(
+        &mut self,
+        command: LoopCommand,
+        _input_metadata: Option<serde_json::Value>,
+    ) -> Result<(), LoopControlError> {
+        self.send(command).await
+    }
+
+    async fn result(&mut self) -> LoopResult;
+}
+
+#[async_trait]
+impl RunningTurn for LoopRun {
+    async fn next_event(&mut self) -> Option<LoopEvent> {
+        self.next().await
+    }
+
+    async fn send(&mut self, command: LoopCommand) -> Result<(), LoopControlError> {
+        LoopRun::send(self, command).await
+    }
+
+    async fn result(&mut self) -> LoopResult {
+        LoopRun::result(self).await
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AgentRuntimeError {
+    #[error("model route {provider}/{model} is unavailable")]
+    ModelUnavailable { provider: String, model: String },
+    #[error("agent turn preparation failed: {message}")]
+    Preparation { message: String },
+}
+
+/// Read-only binding for auxiliary Host requests, independent of the main turn's settings.
+#[derive(Clone)]
+pub struct AuxiliaryModel {
+    pub provider: Arc<dyn ModelProvider>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// Host-facing Agent execution seam. The Web Host owns queues and projections;
+/// the runtime owns model routing, tool preparation, context policy and the
+/// actual turn implementation.
+#[async_trait]
+pub trait AgentRuntime: Send + Sync + 'static {
+    async fn process_runs(
+        &self,
+        _session_id: &str,
+    ) -> Result<Vec<xharness_jobs::protocol::JobRun>, String> {
+        Ok(Vec::new())
+    }
+    async fn process_output(
+        &self,
+        _session_id: &str,
+        _id: &str,
+        _cursor: xharness_jobs::JobOutputCursor,
+    ) -> Result<xharness_jobs::JobRead, String> {
+        Err("process output unavailable".into())
+    }
+    async fn cancel_process_run(&self, _session_id: &str, _id: &str) -> Result<(), String> {
+        Err("process cancellation unavailable".into())
+    }
+    /// Fixed read-only Git operation; no shell or model-selected argv.
+    async fn read_display_diff(
+        &self,
+        _session_id: &str,
+        _cwd: &str,
+        _path: &std::path::Path,
+        _scope: xharness_api::display::GitDiffScope,
+        _cancellation: CancellationToken,
+    ) -> Result<xharness_api::display::DisplayFile, String> {
+        Err("Git diff display is unavailable on this deployment".into())
+    }
+
+    /// Deployment-owned read-only file display; independent of executing a turn.
+    async fn inspect_display_file(
+        &self,
+        _session_id: &str,
+        _cwd: &str,
+        _permission: PermissionPreset,
+        _path: &std::path::Path,
+        _thumbnail: bool,
+    ) -> Result<xharness_api::display::DisplayInspection, String> {
+        Err("File inspection is unavailable on this deployment".into())
+    }
+
+    async fn read_display_file(
+        &self,
+        _session_id: &str,
+        _cwd: &str,
+        _permission: PermissionPreset,
+        _path: &std::path::Path,
+    ) -> Result<xharness_api::display::DisplayFile, String> {
+        Err("file display is unavailable on this runtime".into())
+    }
+
+    /// Bind host-owned tools without a strong runtime/Host reference cycle.
+    fn bind_host(&self, _host: std::sync::Weak<crate::BasicHost>) {}
+
+    /// Prepare an independent automation worker without waking pending input.
+    /// Schedule installs its observer before it admits the saved user task.
+    async fn prepare_automation_worker(
+        &self,
+        _request: AgentSessionRequest,
+    ) -> Result<DurableAgentHandle, AgentRuntimeError> {
+        Err(AgentRuntimeError::Preparation {
+            message: "independent automation chats are unavailable".into(),
+        })
+    }
+
+    /// Schedule owns automation transitions; Host exposes this shared seam to UI.
+    async fn automation_command(
+        &self,
+        _session_id: &str,
+        _invocation: &str,
+        _command: xharness_schedule::AutomationCommand,
+    ) -> Result<Value, AgentRuntimeError> {
+        Err(AgentRuntimeError::Preparation {
+            message: "automation management is unavailable".into(),
+        })
+    }
+
+    async fn saved_automation_control(
+        &self,
+        _session: &str,
+        _request: xharness_schedule::SavedAutomationInvocation,
+    ) -> Result<xharness_schedule::SavedAutomationApplied, xharness_schedule::SavedAutomationError>
+    {
+        Err(xharness_schedule::SavedAutomationError::Unavailable)
+    }
+    async fn saved_automation_receipt(
+        &self,
+        _session: &str,
+        _request: &xharness_schedule::SavedAutomationInvocation,
+    ) -> Result<
+        Option<xharness_schedule::SavedAutomationApplied>,
+        xharness_schedule::SavedAutomationError,
+    > {
+        Err(xharness_schedule::SavedAutomationError::Unavailable)
+    }
+    async fn saved_automation_read(
+        &self,
+        _session: &str,
+        _command: xharness_schedule::AutomationCommand,
+        _after: Option<String>,
+    ) -> Result<Value, xharness_schedule::SavedAutomationError> {
+        Err(xharness_schedule::SavedAutomationError::Unavailable)
+    }
+
+    fn auxiliary_model(&self, _route: &ModelRoute) -> Option<AuxiliaryModel> {
+        None
+    }
+
+    fn auxiliary_token_guard(&self, _route: &ModelRoute) -> Option<TokenGuard> {
+        None
+    }
+
+    fn has_available_route(&self) -> bool;
+
+    fn can_route(&self, route: &ModelRoute) -> bool;
+
+    /// Stable model catalog exposed to the Web picker. A route returned here
+    /// must also be accepted by [`Self::can_route`].
+    fn model_catalog(&self) -> Vec<ModelDescriptor> {
+        Vec::new()
+    }
+
+    /// Whether this runtime owns an append-only Session log that is the
+    /// authoritative source for browser history and restart projection.
+    fn has_authoritative_sessions(&self) -> bool {
+        false
+    }
+
+    /// Called only after a durable Host tombstone fences new admissions.
+    async fn delete_session_data(&self, _session_id: &str) -> Result<(), AgentRuntimeError> {
+        Ok(())
+    }
+
+    /// Optional admission-lifetime reuse; not a lock or a durability receipt.
+    fn admission_read_scope(
+        &self,
+        _session_id: &str,
+    ) -> Result<Box<dyn xharness_session::SessionReadScope>, AgentRuntimeError> {
+        Ok(Box::new(()))
+    }
+
+    /// Load one immutable authoritative cut. Ephemeral runtimes return `None`;
+    /// durable runtimes return the current Session when it has been created.
+    async fn authoritative_session(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<Session>, AgentRuntimeError> {
+        Ok(None)
+    }
+
+    /// Certify an original creation receipt across its durability barrier.
+    /// Logical read visibility alone is not proof after a failed flush.
+    async fn flush_session_revision(
+        &self,
+        _session_id: &str,
+        _minimum: xharness_session::Revision,
+    ) -> Result<(), AgentRuntimeError> {
+        Err(AgentRuntimeError::Preparation {
+            message: "session durability certification unavailable".into(),
+        })
+    }
+
+    /// Read the inspector surface without exposing full request inputs.
+    async fn harness_header(
+        &self,
+        session_id: &str,
+        seq: u64,
+    ) -> Result<Option<xharness_session::RequestHeader>, AgentRuntimeError> {
+        Ok(self
+            .request_header(session_id, seq)
+            .await?
+            .map(|h| h.harness_view()))
+    }
+
+    async fn request_header(
+        &self,
+        session_id: &str,
+        seq: u64,
+    ) -> Result<Option<xharness_session::RequestHeader>, AgentRuntimeError> {
+        Ok(self.authoritative_session(session_id).await?.and_then(|s| {
+            s.events().iter().find_map(|e| {
+                if e.seq == seq {
+                    if let xharness_session::EventData::RequestHeader { header } = e.data() {
+                        return Some(header.clone());
+                    }
+                }
+                None
+            })
+        }))
+    }
+
+    /// Persist product/control-plane session facts outside an active model
+    /// turn. Returns `true` only when this runtime owns and flushed an
+    /// authoritative Session log; ephemeral runtimes leave projection to the
+    /// Host's compatibility cache.
+    async fn persist_session_events(
+        &self,
+        _session_id: &str,
+        _cwd: &str,
+        _events: Vec<SessionEvent>,
+    ) -> Result<bool, AgentRuntimeError> {
+        Ok(false)
+    }
+
+    /// Publish a complete, independently owned fork in one storage transaction.
+    /// The validated snapshot retains the original history revision boundaries.
+    async fn persist_fork_session(&self, _session: Session) -> Result<(), AgentRuntimeError> {
+        Err(AgentRuntimeError::Preparation {
+            message: "atomic fork persistence is unsupported by this runtime".into(),
+        })
+    }
+
+    /// Opt in only if an idle, closed Session has no custom recovery work
+    /// beyond the standard durable inbox/interactions/Goal/schedules. Unknown
+    /// runtime implementations keep authoritative full replay by default.
+    fn supports_idle_restore_checkpoint(&self) -> bool {
+        false
+    }
+
+    /// Whether startup must activate a session even when its ordinary inbox
+    /// and human-interaction recovery sets are empty.
+    fn needs_session_resume(&self, _session: &Session) -> Result<bool, AgentRuntimeError> {
+        Ok(false)
+    }
+
+    /// Reattach already-durable work after a Host restart. Ephemeral runtimes
+    /// have no authoritative inbox and therefore report no recovered work.
+    async fn resume_session(
+        &self,
+        _request: AgentSessionRequest,
+    ) -> Result<AgentResumeReport, AgentRuntimeError> {
+        Ok(AgentResumeReport::default())
+    }
+
+    /// Take a startup-recovered live turn after `resume_session` attached its
+    /// event subscriber. Ephemeral runtimes never return one.
+    async fn take_resumed_turn(
+        &self,
+        _session_id: &str,
+        _work_id: &str,
+    ) -> Result<Option<Box<dyn RunningTurn>>, AgentRuntimeError> {
+        Ok(None)
+    }
+
+    /// Admit one input-free, durable manual compaction maintenance turn.
+    async fn start_manual_compaction(
+        &self,
+        _session_id: &str,
+        _command_id: &str,
+    ) -> Result<Box<dyn RunningTurn>, AgentRuntimeError> {
+        Err(AgentRuntimeError::Preparation {
+            message: "manual compaction is unavailable for this runtime".to_owned(),
+        })
+    }
+
+    /// Subscribe to runtime-originated ordinary turns such as due Schedule
+    /// reminders. The notice is emitted only after an event receiver has been
+    /// installed, so the Host can safely attach live projection.
+    fn subscribe_background_turns(&self) -> Option<broadcast::Receiver<ScheduleDeliveryNotice>> {
+        None
+    }
+
+    fn subscribe_goal_changes(&self) -> Option<broadcast::Receiver<String>> {
+        None
+    }
+
+    /// Durably admit one future turn before the Host acknowledges the client.
+    /// Ephemeral runtimes use the default no-op and construct work in
+    /// `start_turn`; durable runtimes must flush the input before returning.
+    async fn admit_turn(&self, _request: AgentTurnRequest) -> Result<(), AgentRuntimeError> {
+        Ok(())
+    }
+
+    /// Admit user steering through the Agent actor, not a possibly stale Host
+    /// RunningTurn. Durable adapters subscribe before the actor can wake and
+    /// retain an input-scoped observer for either current- or next-turn use.
+    async fn admit_steering(&self, request: AgentTurnRequest) -> Result<(), AgentRuntimeError> {
+        self.admit_turn(request).await
+    }
+
+    /// Remove a still-pending input. The default is a no-op for ephemeral
+    /// runtimes whose queue is owned entirely by the Host.
+    async fn remove_pending_input(
+        &self,
+        _session_id: &str,
+        _input_id: &str,
+    ) -> Result<(), AgentRuntimeError> {
+        Ok(())
+    }
+
+    /// Replace a still-pending input in place while preserving its identity.
+    async fn replace_pending_input(
+        &self,
+        _session_id: &str,
+        _message: AgentMessage,
+        _input_metadata: Option<serde_json::Value>,
+    ) -> Result<(), AgentRuntimeError> {
+        Ok(())
+    }
+
+    /// Stop admitting work and wait for every runtime-owned Agent/Loop to
+    /// quiesce. Stateless/ephemeral adapters have no shared supervisor and
+    /// therefore return an empty graceful report.
+    async fn shutdown(&self, _grace: Duration) -> AgentShutdownReport {
+        AgentShutdownReport::default()
+    }
+
+    async fn start_turn(
+        &self,
+        request: AgentTurnRequest,
+    ) -> Result<Box<dyn RunningTurn>, AgentRuntimeError>;
+}
+
+/// Adapter from the v0 [`LoopEngine`] to the Host-facing Agent runtime seam.
+/// It is intentionally replaceable by a durable Agent/Inbox runtime later.
+pub struct LoopAgentRuntime {
+    provider_id: String,
+    model_id: String,
+    provider: Option<Arc<dyn ModelProvider>>,
+    tool_factory: Arc<dyn SessionToolFactory>,
+    context_policy: Arc<dyn ContextPolicy>,
+    token_guard: Option<TokenGuard>,
+    debug: DebugRecorder,
+}
+
+impl LoopAgentRuntime {
+    pub fn new(
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        provider: Option<Arc<dyn ModelProvider>>,
+        tool_factory: Arc<dyn SessionToolFactory>,
+        context_policy: Arc<dyn ContextPolicy>,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            provider,
+            tool_factory,
+            context_policy,
+            token_guard: None,
+            debug: DebugRecorder::disabled(),
+        }
+    }
+
+    pub fn with_debug(mut self, debug: DebugRecorder) -> Self {
+        self.debug = debug;
+        self
+    }
+
+    pub fn with_token_guard(mut self, token_guard: Option<TokenGuard>) -> Self {
+        self.token_guard = token_guard;
+        self
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for LoopAgentRuntime {
+    async fn read_display_diff(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        path: &std::path::Path,
+        scope: xharness_api::display::GitDiffScope,
+        cancellation: CancellationToken,
+    ) -> Result<xharness_api::display::DisplayFile, String> {
+        self.tool_factory
+            .read_display_diff(session_id, cwd, path, scope, cancellation)
+            .await
+    }
+
+    async fn inspect_display_file(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        permission: PermissionPreset,
+        path: &std::path::Path,
+        thumbnail: bool,
+    ) -> Result<xharness_api::display::DisplayInspection, String> {
+        self.tool_factory
+            .inspect_display_file(session_id, cwd, permission, path, thumbnail)
+            .await
+    }
+
+    async fn read_display_file(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        permission: PermissionPreset,
+        path: &std::path::Path,
+    ) -> Result<xharness_api::display::DisplayFile, String> {
+        self.tool_factory
+            .read_display_file(session_id, cwd, permission, path)
+            .await
+    }
+
+    fn has_available_route(&self) -> bool {
+        self.provider.is_some()
+    }
+
+    fn can_route(&self, route: &ModelRoute) -> bool {
+        self.provider.is_some()
+            && route.provider == self.provider_id
+            && route.model == self.model_id
+            && route.reasoning_effort.is_none()
+            && match route.context_window_tokens {
+                None => true,
+                Some(tokens) => self
+                    .token_guard
+                    .as_ref()
+                    .is_some_and(|guard| guard.with_context_window(tokens).is_ok()),
+            }
+    }
+
+    fn model_catalog(&self) -> Vec<ModelDescriptor> {
+        if self.provider.is_none() {
+            return Vec::new();
+        }
+        vec![ModelDescriptor::new(
+            &self.provider_id,
+            &self.provider_id,
+            &self.model_id,
+            &self.model_id,
+        )]
+    }
+
+    async fn start_turn(
+        &self,
+        request: AgentTurnRequest,
+    ) -> Result<Box<dyn RunningTurn>, AgentRuntimeError> {
+        if !self.can_route(&request.route) {
+            return Err(AgentRuntimeError::ModelUnavailable {
+                provider: request.route.provider,
+                model: request.route.model,
+            });
+        }
+        let provider = Arc::clone(self.provider.as_ref().expect("route checked provider"));
+        let token_guard = match request.route.context_window_tokens {
+            Some(tokens) => self
+                .token_guard
+                .as_ref()
+                .and_then(|guard| guard.with_context_window(tokens).ok()),
+            None => self.token_guard.clone(),
+        };
+        let tool_executor = self
+            .tool_factory
+            .executor(&request.session_id, &request.cwd, request.permission)
+            .await
+            .map_err(|message| AgentRuntimeError::Preparation { message })?;
+        self.tool_factory
+            .validate_executor(&tool_executor)
+            .await
+            .map_err(|message| AgentRuntimeError::Preparation { message })?;
+        let mut loop_request = LoopRequest::new(provider, request.messages);
+        loop_request.reasoning_effort = request.route.reasoning_effort;
+        loop_request.debug = self.debug.clone();
+        loop_request.session_id = Some(request.session_id);
+        loop_request.prompt = request.prompt;
+        loop_request.tool_executor = Some(tool_executor);
+        loop_request.context_policy = Arc::clone(&self.context_policy);
+        loop_request.token_guard = token_guard;
+        Ok(Box::new(LoopEngine.start(loop_request)))
+    }
+}
+
+#[derive(Clone)]
+struct DurableSessionConfig {
+    cwd: String,
+    permission: PermissionPreset,
+    prompt: Option<PromptAssembly>,
+    route: ModelRoute,
+}
+
+struct DurableTurnFactory {
+    execution: crate::execution::ExecutionBoundary,
+    goals: Arc<crate::goals::GoalBridge>,
+    store: Arc<dyn Store>,
+    delegation_slots: Arc<tokio::sync::Semaphore>,
+    models: Arc<StdRwLock<ModelRegistry>>,
+    tool_factory: Arc<dyn SessionToolFactory>,
+    context_policy: Arc<dyn ContextPolicy>,
+    compaction: Arc<StdRwLock<Option<CompactionConfig>>>,
+    sessions: Arc<RwLock<HashMap<String, DurableSessionConfig>>>,
+    debug: Arc<StdRwLock<DebugRecorder>>,
+}
+
+#[async_trait]
+impl TurnRequestFactory for DurableTurnFactory {
+    async fn goal_dependencies(&self, id: &str) -> Result<bool, String> {
+        let session = self.store.load(id).await.map_err(|e| e.to_string())?;
+        let refs = session
+            .as_ref()
+            .and_then(xharness_session::goal::execution_state)
+            .and_then(|s| s.latest_turn)
+            .and_then(|t| t.report)
+            .map_or_else(Vec::new, |r| r.evidence);
+        self.tool_factory.goal_dependencies(id, &refs).await
+    }
+    async fn goal_changed(&self, id: &str) {
+        let _ = self.goals.changes.send(id.to_owned());
+    }
+    async fn prepare_goal_turn(
+        &self,
+        id: &str,
+        input: &str,
+        events: broadcast::Receiver<AgentEvent>,
+    ) -> Result<(), String> {
+        self.execution.check()?;
+        self.goals.prepare(id, input, events).await
+    }
+    async fn goal_report(
+        &self,
+        id: &str,
+        _result: &LoopResult,
+    ) -> Result<Option<xharness_agent::GoalReportBody>, String> {
+        let session = self.store.load(id).await.map_err(|e| e.to_string())?;
+        Ok(session
+            .as_ref()
+            .and_then(xharness_agent::recorded_goal_report))
+    }
+
+    async fn acquire(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, String> {
+        self.execution.check()?;
+        let session = self.store.load(agent_id).await.map_err(|e| e.to_string())?;
+        if session
+            .as_ref()
+            .and_then(crate::delegation::restored_delegation)
+            .is_some()
+        {
+            self.delegation_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map(Some)
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(None)
+        }
+    }
+    async fn build(&self, agent_id: &str, input: Vec<AgentMessage>) -> Result<LoopRequest, String> {
+        self.execution.check()?;
+        let mut config = self
+            .sessions
+            .read()
+            .await
+            .get(agent_id)
+            .cloned()
+            .ok_or_else(|| format!("durable agent {agent_id:?} has no Host configuration"))?;
+        // Prepared inbox entries and autonomous Goal/Schedule turns must not
+        // reuse the permission/prompt captured when an input was queued.
+        if let Some(host) = self.goals.host.get().and_then(std::sync::Weak::upgrade) {
+            let (permission, prompt) = host
+                .capture_turn_permission(agent_id)
+                .await
+                .map_err(|e| e.message)?;
+            config.permission = permission;
+            config.prompt = Some(prompt);
+            if let Some(session) = host.state.read().await.sessions.get(agent_id) {
+                config.route = ModelRoute {
+                    provider: session.model.provider.clone(),
+                    model: session.model.model.clone(),
+                    reasoning_effort: session.model.reasoning_effort.clone(),
+                    context_window_tokens: session.model.context_window_tokens,
+                };
+            }
+        }
+        let (provider, token_guard, compaction_reasoning_effort) = {
+            let models = self.models.read().expect("model registry lock poisoned");
+            let model = models.resolve(&config.route).ok_or_else(|| {
+                format!(
+                    "model route {}/{} is unavailable",
+                    config.route.provider, config.route.model
+                )
+            })?;
+            (
+                Arc::clone(&model.provider),
+                models.token_guard(&config.route),
+                models.compaction_reasoning_effort(&config.route),
+            )
+        };
+        let tool_executor = self
+            .tool_factory
+            .executor(agent_id, &config.cwd, config.permission)
+            .await?;
+        let tool_executor = self.execution.executor(tool_executor);
+        let snapshot = self.store.load(agent_id).await.map_err(|e| e.to_string())?;
+        if self.tool_factory.allows_host_tool("history") {
+            tool_executor
+                .registry()
+                .register(crate::history_tool::spec(
+                    Arc::clone(&self.store),
+                    agent_id.into(),
+                ))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        if self.tool_factory.allows_host_tool("goal_report") {
+            if let Some(fence) = snapshot
+                .as_ref()
+                .and_then(|session| crate::goal_report_tool::fence(session, &input))
+            {
+                tool_executor
+                    .registry()
+                    .register(crate::goal_report_tool::spec(
+                        Arc::clone(&self.store),
+                        Arc::clone(&self.tool_factory),
+                        agent_id.into(),
+                        fence,
+                    ))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        self.tool_factory.validate_executor(&tool_executor).await?;
+        let mut request = LoopRequest::new(self.execution.provider(provider), input);
+        request.reasoning_effort = config.route.reasoning_effort;
+        request.compaction_reasoning_effort = compaction_reasoning_effort;
+        request.debug = self
+            .debug
+            .read()
+            .expect("debug recorder lock poisoned")
+            .clone();
+        request.prompt = config.prompt;
+        request.tool_executor = Some(tool_executor);
+        request.context_policy = Arc::clone(&self.context_policy);
+        request.token_guard = token_guard;
+        request.compaction = self
+            .compaction
+            .read()
+            .expect("compaction config lock poisoned")
+            .clone();
+        Ok(request)
+    }
+}
+
+/// Event-sourced adapter used by the Web Host while the HTTP/RPC projection is
+/// migrated away from its legacy in-memory queue. Every turn passed to this
+/// adapter first enters [`xharness_agent::DurableInbox`]; the Agent driver then atomically
+/// claims it beside `turn/start` and the durable `user/message`.
+///
+/// The Web DTO cache is not authoritative. A later Host-store migration can
+/// rebuild it from this runtime's Session log without changing [`AgentRuntime`].
+pub struct DurableLoopAgentRuntime {
+    execution: crate::execution::ExecutionBoundary,
+    goals: Arc<crate::goals::GoalBridge>,
+    models: Arc<StdRwLock<ModelRegistry>>,
+    default_route: ModelRoute,
+    store: Arc<dyn Store>,
+    sessions: Arc<RwLock<HashMap<String, DurableSessionConfig>>>,
+    supervisor: AgentSupervisor,
+    tool_factory: Arc<dyn SessionToolFactory>,
+    prepared: Mutex<HashMap<(String, String), PreparedDurableTurn>>,
+    input_admission: InputAdmissionGates,
+    next_control_id: Arc<AtomicU64>,
+    debug: Arc<StdRwLock<DebugRecorder>>,
+    compaction: Arc<StdRwLock<Option<CompactionConfig>>>,
+    schedules: Option<Arc<ScheduleManager>>,
+}
+
+type InputAdmissionGates = Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>;
+
+pub(crate) struct PreparedDurableTurn {
+    pub(crate) handle: DurableAgentHandle,
+    pub(crate) events: broadcast::Receiver<AgentEvent>,
+    pub(crate) input_id: String,
+}
+
+impl DurableLoopAgentRuntime {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        provider: Option<Arc<dyn ModelProvider>>,
+        tool_factory: Arc<dyn SessionToolFactory>,
+        context_policy: Arc<dyn ContextPolicy>,
+        store: Arc<dyn Store>,
+        leases: Arc<dyn LeaseManager>,
+        event_capacity: usize,
+    ) -> Self {
+        let provider_id = provider_id.into();
+        let model_id = model_id.into();
+        let default_route = ModelRoute::new(&provider_id, &model_id);
+        let mut models = ModelRegistry::new();
+        if let Some(provider) = provider {
+            models
+                .register(RegisteredModel::new(
+                    ModelDescriptor::new(&provider_id, &provider_id, &model_id, &model_id),
+                    provider,
+                ))
+                .expect("single model registry entry is valid");
+        }
+        Self::from_registry(
+            default_route,
+            models,
+            tool_factory,
+            context_policy,
+            store,
+            leases,
+            event_capacity,
+        )
+        .expect("single model registry default route is valid")
+    }
+
+    /// Build one durable runtime that can route every registered model while
+    /// retaining a single Agent supervisor and Session authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_registry(
+        default_route: ModelRoute,
+        models: ModelRegistry,
+        tool_factory: Arc<dyn SessionToolFactory>,
+        context_policy: Arc<dyn ContextPolicy>,
+        store: Arc<dyn Store>,
+        leases: Arc<dyn LeaseManager>,
+        event_capacity: usize,
+    ) -> Result<Self, ModelRegistryError> {
+        Self::from_registry_with_delegation_concurrency(
+            default_route,
+            models,
+            tool_factory,
+            context_policy,
+            store,
+            leases,
+            event_capacity,
+            crate::DelegationConcurrency::default(),
+        )
+    }
+
+    /// Select child-turn capacity before activation. Existing constructors use
+    /// four; all sessions share this pool and primary turns bypass it.
+    /// No live resize or change to durable ownership/admission semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_registry_with_delegation_concurrency(
+        default_route: ModelRoute,
+        models: ModelRegistry,
+        tool_factory: Arc<dyn SessionToolFactory>,
+        context_policy: Arc<dyn ContextPolicy>,
+        store: Arc<dyn Store>,
+        leases: Arc<dyn LeaseManager>,
+        event_capacity: usize,
+        delegation_concurrency: crate::DelegationConcurrency,
+    ) -> Result<Self, ModelRegistryError> {
+        if !models.entries.is_empty() && !models.can_route(&default_route) {
+            return Err(ModelRegistryError::DefaultRouteUnavailable {
+                provider: default_route.provider,
+                model: default_route.model,
+            });
+        }
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let models = Arc::new(StdRwLock::new(models));
+        let debug = Arc::new(StdRwLock::new(DebugRecorder::disabled()));
+        let compaction = Arc::new(StdRwLock::new(None));
+        let goals = Arc::new(crate::goals::GoalBridge::default());
+        let execution = crate::execution::ExecutionBoundary::default();
+        let factory = Arc::new(DurableTurnFactory {
+            execution: execution.clone(),
+            goals: Arc::clone(&goals),
+            store: Arc::clone(&store),
+            delegation_slots: Arc::new(tokio::sync::Semaphore::new(delegation_concurrency.limit())),
+            models: Arc::clone(&models),
+            tool_factory: Arc::clone(&tool_factory),
+            context_policy,
+            compaction: Arc::clone(&compaction),
+            sessions: Arc::clone(&sessions),
+            debug: Arc::clone(&debug),
+        });
+        let registry = Arc::new(AgentRegistry::new(Arc::clone(&store), leases));
+        Ok(Self {
+            execution,
+            models,
+            default_route,
+            store,
+            sessions,
+            supervisor: AgentSupervisor::new(registry, factory, event_capacity),
+            goals,
+            tool_factory,
+            prepared: Mutex::new(HashMap::new()),
+            input_admission: Mutex::new(HashMap::new()),
+            next_control_id: Arc::new(AtomicU64::new(1)),
+            debug,
+            compaction,
+            schedules: None,
+        })
+    }
+
+    pub fn with_debug(self, debug: DebugRecorder) -> Self {
+        *self.debug.write().expect("debug recorder lock poisoned") = debug;
+        self
+    }
+
+    /// Install before any session is resumed/admitted. All autonomous turns
+    /// share the same factory; auxiliary providers and handler entry are gated.
+    pub fn with_execution_gate(self, gate: Arc<dyn crate::ExecutionGate>) -> Result<Self, String> {
+        self.execution.install(gate)?;
+        Ok(self)
+    }
+
+    fn require_execution(&self) -> Result<(), AgentRuntimeError> {
+        self.execution
+            .check()
+            .map_err(|message| AgentRuntimeError::Preparation { message })
+    }
+
+    /// Future turns use the new immutable provider instances. Active turns
+    /// already own their provider Arc and are never cancelled by configuration.
+    pub fn replace_model_registry(&self, registry: ModelRegistry) {
+        *self.models.write().expect("model registry lock poisoned") = registry;
+    }
+
+    pub fn with_token_guard(self, token_guard: Option<TokenGuard>) -> Self {
+        self.models
+            .write()
+            .expect("model registry lock poisoned")
+            .set_token_guard(&self.default_route, token_guard);
+        self
+    }
+
+    /// Enable or disable durable context compaction for all subsequently
+    /// built turns. Existing active turns retain the config they started with.
+    pub fn with_compaction(self, compaction: Option<CompactionConfig>) -> Self {
+        *self
+            .compaction
+            .write()
+            .expect("compaction config lock poisoned") = compaction;
+        self
+    }
+
+    /// Install the durable session-local Schedule projection. Deployments
+    /// must pass this same manager to their Tool factory.
+    pub fn with_schedules(mut self, schedules: Arc<ScheduleManager>) -> Self {
+        let mut deliveries = schedules.subscribe_deliveries();
+        let goals = Arc::clone(&self.goals);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _=goals.shutdown.cancelled()=>break,
+                    notice=deliveries.recv()=>match notice {Ok(n)=>{let _=goals.notices.send(n);},Err(broadcast::error::RecvError::Lagged(_))=>continue,Err(_)=>break}
+                }
+            }
+        });
+        self.schedules = Some(schedules);
+        self
+    }
+
+    async fn attach_schedules(&self, handle: &DurableAgentHandle) -> Result<(), AgentRuntimeError> {
+        self.require_execution()?;
+        self.goals
+            .handles
+            .write()
+            .await
+            .insert(handle.id().into(), handle.clone());
+        let has_goal = self
+            .store
+            .load(handle.id())
+            .await
+            .map_err(|e| AgentRuntimeError::Preparation {
+                message: e.to_string(),
+            })?
+            .as_ref()
+            .and_then(xharness_session::goal::execution_state)
+            .is_some_and(|s| s.definition.execution_enabled || s.pending.is_some());
+        if has_goal && self.goals.watched.lock().await.insert(handle.id().into()) {
+            let handle = handle.clone();
+            let goals = Arc::clone(&self.goals);
+            let store = Arc::clone(&self.store);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        biased;
+                        _=goals.shutdown.cancelled()=>break,
+                        _=handle.closed()=>break,
+                        _=tick.tick()=>{
+                            if handle.status()!=xharness_agent::AgentStatus::Idle {continue}
+                            // Serialize retirement with re-attachment so resume cannot lose its watcher.
+                            let mut watched=goals.watched.lock().await;
+                            let Ok(Some(session))=store.load(handle.id()).await else {continue};
+                            let state=xharness_session::goal::execution_state(&session);
+                            let needs_wake=state.is_some_and(|s| {
+                                let review_wait=s.definition.verification==xharness_session::goal::VerificationMode::UserConfirm && s.latest_turn.as_ref().filter(|t|t.outcome==xharness_session::goal::GoalTurnOutcome::Completed).and_then(|t|t.report.as_ref()).is_some_and(|r|r.status==xharness_session::goal::GoalReportStatus::Complete) && s.review.is_none();
+                                (s.definition.execution_enabled && s.definition.snapshot.phase==xharness_session::GoalPhase::Active && !review_wait) || s.pending.is_some()
+                            });
+                            if !needs_wake {watched.remove(handle.id());break}
+                            drop(watched);
+                            // A failed wake is transient: the worker may be mid-replacement,
+                            // or the activation may already be shutting down. Retiring here
+                            // would strand this id in `watched`, so no later
+                            // `attach_schedules` could recreate the watcher. Retry next tick
+                            // instead — this loop is the only thing that wakes an idle
+                            // Goal, and it is already gated on `needs_wake`.
+                            let _ = handle.wake().await;
+
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(schedules) = &self.schedules {
+            schedules
+                .attach(handle.clone())
+                .await
+                .map_err(|message| AgentRuntimeError::Preparation { message })?;
+        }
+        Ok(())
+    }
+
+    fn validate_turn_input(
+        &self,
+        request: &AgentTurnRequest,
+    ) -> Result<(AgentMessage, String), AgentRuntimeError> {
+        self.require_execution()?;
+        if self.supervisor.is_closed() {
+            return Err(AgentRuntimeError::Preparation {
+                message: "agent runtime is shutting down".to_owned(),
+            });
+        }
+        if !self.can_route(&request.route) {
+            return Err(AgentRuntimeError::ModelUnavailable {
+                provider: request.route.provider.clone(),
+                model: request.route.model.clone(),
+            });
+        }
+        let input = request
+            .messages
+            .last()
+            .cloned()
+            .filter(|message| message.role == Role::User)
+            .ok_or_else(|| AgentRuntimeError::Preparation {
+                message: "durable turn requires a final user message".to_owned(),
+            })?;
+        let input_id = input
+            .id
+            .clone()
+            .ok_or_else(|| AgentRuntimeError::Preparation {
+                message: "durable turn user message requires a stable id".to_owned(),
+            })?;
+        Ok((input, input_id))
+    }
+
+    async fn prepare_turn(
+        &self,
+        request: AgentTurnRequest,
+    ) -> Result<PreparedDurableTurn, AgentRuntimeError> {
+        self.prepare_input(request, false).await
+    }
+
+    async fn prepare_input(
+        &self,
+        request: AgentTurnRequest,
+        steer: bool,
+    ) -> Result<PreparedDurableTurn, AgentRuntimeError> {
+        let (input, input_id) = self.validate_turn_input(&request)?;
+        let mut header = SessionHeader::new(&request.session_id);
+        header.cwd = Some(request.cwd.clone());
+        let handle = self
+            .supervisor
+            .activate(header)
+            .await
+            .map_err(registry_error)?;
+        self.sessions.write().await.insert(
+            request.session_id.clone(),
+            DurableSessionConfig {
+                cwd: request.cwd.clone(),
+                permission: request.permission,
+                prompt: request.prompt.clone(),
+                route: request.route,
+            },
+        );
+        let events = handle.subscribe();
+        let input = InboxMessage {
+            id: input_id.clone(),
+            message: input,
+            source: request.input_metadata,
+        };
+        if steer {
+            // The actor atomically promotes an existing queue item or admits
+            // fresh steering, and suppresses delivery of already used IDs.
+            handle.steer(input).await.map_err(agent_command_error)?;
+        } else {
+            handle
+                .inbox()
+                .append(xharness_session::InboxTarget::NextTurn, input)
+                .await
+                .map_err(|error| AgentRuntimeError::Preparation {
+                    message: error.to_string(),
+                })?;
+        }
+        self.attach_schedules(&handle).await?;
+        Ok(PreparedDurableTurn {
+            handle,
+            events,
+            input_id,
+        })
+    }
+
+    async fn lock_input_admission(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self.input_admission.lock().await;
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            match gates.get(id).and_then(std::sync::Weak::upgrade) {
+                Some(gate) => gate,
+                None => {
+                    let gate = Arc::new(Mutex::new(()));
+                    gates.insert(id.to_owned(), Arc::downgrade(&gate));
+                    gate
+                }
+            }
+        };
+        gate.lock_owned().await
+    }
+
+    async fn admit_input(
+        &self,
+        request: AgentTurnRequest,
+        steer: bool,
+    ) -> Result<(), AgentRuntimeError> {
+        let (_, input_id) = self.validate_turn_input(&request)?;
+        let key = (request.session_id.clone(), input_id);
+        let _admission = self.lock_input_admission(&request.session_id).await;
+        if self.prepared.lock().await.contains_key(&key) && !steer {
+            return Ok(());
+        }
+        // Waiting for one actor must not hold the global observer-map lock
+        // and stall admission/control in unrelated conversations.
+        let prepared = self.prepare_input(request, steer).await?;
+        self.prepared.lock().await.entry(key).or_insert(prepared);
+        Ok(())
+    }
+
+    fn running_from_prepared(&self, prepared: PreparedDurableTurn) -> Box<dyn RunningTurn> {
+        Box::new(DurableRunningTurn::new(
+            prepared,
+            Arc::clone(&self.next_control_id),
+        ))
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for DurableLoopAgentRuntime {
+    async fn read_display_diff(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        path: &std::path::Path,
+        scope: xharness_api::display::GitDiffScope,
+        cancellation: CancellationToken,
+    ) -> Result<xharness_api::display::DisplayFile, String> {
+        self.tool_factory
+            .read_display_diff(session_id, cwd, path, scope, cancellation)
+            .await
+    }
+
+    async fn inspect_display_file(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        permission: PermissionPreset,
+        path: &std::path::Path,
+        thumbnail: bool,
+    ) -> Result<xharness_api::display::DisplayInspection, String> {
+        self.tool_factory
+            .inspect_display_file(session_id, cwd, permission, path, thumbnail)
+            .await
+    }
+
+    async fn read_display_file(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        permission: PermissionPreset,
+        path: &std::path::Path,
+    ) -> Result<xharness_api::display::DisplayFile, String> {
+        self.tool_factory
+            .read_display_file(session_id, cwd, permission, path)
+            .await
+    }
+
+    async fn delete_session_data(&self, session_id: &str) -> Result<(), AgentRuntimeError> {
+        // The Host has committed its tombstone and still owns the session's
+        // admission fence. Reap the actor before removing files or caches.
+        self.supervisor
+            .retire(session_id, Duration::from_secs(8))
+            .await
+            .map_err(registry_error)?;
+        if let Some(schedules) = &self.schedules {
+            schedules
+                .retire_session(session_id)
+                .await
+                .map_err(|message| AgentRuntimeError::Preparation { message })?;
+        }
+        self.goals.handles.write().await.remove(session_id);
+        self.goals
+            .prepared
+            .lock()
+            .await
+            .retain(|(id, _), _| id != session_id);
+        self.goals.watched.lock().await.remove(session_id);
+        self.goals.retire_announcements(session_id).await;
+        self.prepared
+            .lock()
+            .await
+            .retain(|(id, _), _| id != session_id);
+        self.sessions.write().await.remove(session_id);
+        self.tool_factory
+            .release_session(session_id)
+            .await
+            .map_err(|message| AgentRuntimeError::Preparation { message })?;
+        self.store
+            .delete_session_data(session_id)
+            .await
+            .map_err(|error| AgentRuntimeError::Preparation {
+                message: format!("could not delete durable session {session_id:?}: {error}"),
+            })
+    }
+    fn bind_host(&self, host: std::sync::Weak<crate::BasicHost>) {
+        if let Some(schedules) = &self.schedules {
+            let _ = schedules.bind_targets(Arc::new(crate::automation::HostAutomationTargets(
+                host.clone(),
+            )));
+        }
+        let _ = self.goals.host.set(host);
+    }
+
+    fn auxiliary_token_guard(&self, route: &ModelRoute) -> Option<TokenGuard> {
+        self.models.read().ok()?.token_guard(route)
+    }
+    async fn automation_command(
+        &self,
+        session_id: &str,
+        invocation: &str,
+        command: xharness_schedule::AutomationCommand,
+    ) -> Result<Value, AgentRuntimeError> {
+        let schedules = self
+            .schedules
+            .as_ref()
+            .ok_or_else(|| AgentRuntimeError::Preparation {
+                message: "automation management is unavailable".into(),
+            })?;
+        Ok(schedules.execute(session_id, invocation, command).await)
+    }
+
+    async fn saved_automation_control(
+        &self,
+        session: &str,
+        request: xharness_schedule::SavedAutomationInvocation,
+    ) -> Result<xharness_schedule::SavedAutomationApplied, xharness_schedule::SavedAutomationError>
+    {
+        self.schedules
+            .as_ref()
+            .ok_or(xharness_schedule::SavedAutomationError::Unavailable)?
+            .saved_control_once(session, request)
+            .await
+    }
+    async fn saved_automation_receipt(
+        &self,
+        session: &str,
+        request: &xharness_schedule::SavedAutomationInvocation,
+    ) -> Result<
+        Option<xharness_schedule::SavedAutomationApplied>,
+        xharness_schedule::SavedAutomationError,
+    > {
+        self.schedules
+            .as_ref()
+            .ok_or(xharness_schedule::SavedAutomationError::Unavailable)?
+            .saved_control_receipt(session, request)
+            .await
+    }
+    async fn saved_automation_read(
+        &self,
+        session: &str,
+        command: xharness_schedule::AutomationCommand,
+        after: Option<String>,
+    ) -> Result<Value, xharness_schedule::SavedAutomationError> {
+        self.schedules
+            .as_ref()
+            .ok_or(xharness_schedule::SavedAutomationError::Unavailable)?
+            .saved_read(session, command, after)
+            .await
+    }
+
+    async fn process_runs(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<xharness_jobs::protocol::JobRun>, String> {
+        self.tool_factory.process_runs(session_id).await
+    }
+    async fn process_output(
+        &self,
+        session_id: &str,
+        id: &str,
+        cursor: xharness_jobs::JobOutputCursor,
+    ) -> Result<xharness_jobs::JobRead, String> {
+        self.tool_factory
+            .process_output(session_id, id, cursor)
+            .await
+    }
+    async fn cancel_process_run(&self, session_id: &str, id: &str) -> Result<(), String> {
+        self.tool_factory.cancel_process_run(session_id, id).await
+    }
+
+    async fn prepare_automation_worker(
+        &self,
+        request: AgentSessionRequest,
+    ) -> Result<DurableAgentHandle, AgentRuntimeError> {
+        self.require_execution()?;
+        if !self.can_route(&request.route) {
+            return Err(AgentRuntimeError::ModelUnavailable {
+                provider: request.route.provider,
+                model: request.route.model,
+            });
+        }
+        let mut header = SessionHeader::new(&request.session_id);
+        header.cwd = Some(request.cwd.clone());
+        let handle = self
+            .supervisor
+            .activate(header)
+            .await
+            .map_err(registry_error)?;
+        self.sessions.write().await.insert(
+            request.session_id.clone(),
+            DurableSessionConfig {
+                cwd: request.cwd.clone(),
+                permission: request.permission,
+                prompt: request.prompt,
+                route: request.route,
+            },
+        );
+        self.attach_schedules(&handle).await?;
+        Ok(handle)
+    }
+
+    fn auxiliary_model(&self, route: &ModelRoute) -> Option<AuxiliaryModel> {
+        self.execution.check().ok()?;
+        let models = self.models.read().expect("model registry lock poisoned");
+        let model = models.resolve(route)?;
+        Some(AuxiliaryModel {
+            provider: self.execution.provider(model.provider.clone()),
+            reasoning_effort: model
+                .descriptor
+                .reasoning
+                .as_ref()
+                .and_then(ModelReasoning::lowest_effort)
+                .map(str::to_owned),
+        })
+    }
+
+    fn has_available_route(&self) -> bool {
+        !self
+            .models
+            .read()
+            .expect("model registry lock poisoned")
+            .entries
+            .is_empty()
+    }
+
+    fn can_route(&self, route: &ModelRoute) -> bool {
+        self.models
+            .read()
+            .expect("model registry lock poisoned")
+            .can_route(route)
+    }
+
+    fn model_catalog(&self) -> Vec<ModelDescriptor> {
+        self.models
+            .read()
+            .expect("model registry lock poisoned")
+            .models()
+    }
+
+    fn has_authoritative_sessions(&self) -> bool {
+        true
+    }
+
+    fn supports_idle_restore_checkpoint(&self) -> bool {
+        true
+    }
+
+    fn needs_session_resume(&self, session: &Session) -> Result<bool, AgentRuntimeError> {
+        if self.execution.check().is_err() {
+            return Ok(false);
+        }
+        let inbox = xharness_agent::InboxProjection::from_session(session).map_err(|error| {
+            AgentRuntimeError::Preparation {
+                message: error.to_string(),
+            }
+        })?;
+        if inbox.dispatch_inputs().next().is_some()
+            && xharness_agent::DispatchState::from_session(session)
+                .decide(&inbox)
+                .can_run()
+        {
+            return Ok(true);
+        }
+        if pending_manual_compaction(session).is_some()
+            || crate::job_continuation::has_pending(session)
+        {
+            return Ok(true);
+        }
+        if xharness_session::goal::execution_state(session).is_some_and(|s| {
+            let awaiting_review = s.definition.verification
+                == xharness_session::goal::VerificationMode::UserConfirm
+                && s.latest_turn
+                    .as_ref()
+                    .filter(|t| t.outcome == xharness_session::goal::GoalTurnOutcome::Completed)
+                    .and_then(|t| t.report.as_ref())
+                    .is_some_and(|r| {
+                        r.status == xharness_session::goal::GoalReportStatus::Complete
+                    })
+                && s.review.is_none();
+            (s.definition.execution_enabled
+                && s.definition.snapshot.phase == xharness_session::GoalPhase::Active
+                && !awaiting_review)
+                || s.pending.is_some()
+                || s.running.is_some()
+        }) || xharness_agent::InboxProjection::from_session(session)
+            .map_err(|e| AgentRuntimeError::Preparation {
+                message: e.to_string(),
+            })?
+            .next_turn()
+            .iter()
+            .any(xharness_agent::is_goal_message)
+        {
+            return Ok(true);
+        }
+        match &self.schedules {
+            Some(_) => xharness_schedule::has_active_schedules(session)
+                .map_err(|message| AgentRuntimeError::Preparation { message }),
+            None => Ok(false),
+        }
+    }
+
+    fn subscribe_background_turns(&self) -> Option<broadcast::Receiver<ScheduleDeliveryNotice>> {
+        Some(self.goals.notices.subscribe())
+    }
+
+    fn subscribe_goal_changes(&self) -> Option<broadcast::Receiver<String>> {
+        Some(self.goals.changes.subscribe())
+    }
+
+    fn admission_read_scope(
+        &self,
+        session_id: &str,
+    ) -> Result<Box<dyn xharness_session::SessionReadScope>, AgentRuntimeError> {
+        self.store
+            .read_scope(session_id)
+            .map_err(|error| AgentRuntimeError::Preparation {
+                message: error.to_string(),
+            })
+    }
+
+    async fn authoritative_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Session>, AgentRuntimeError> {
+        self.store
+            .load(session_id)
+            .await
+            .map_err(|error| AgentRuntimeError::Preparation {
+                message: format!("could not load durable session {session_id:?}: {error}"),
+            })
+    }
+
+    async fn flush_session_revision(
+        &self,
+        session_id: &str,
+        minimum: xharness_session::Revision,
+    ) -> Result<(), AgentRuntimeError> {
+        let revision =
+            self.store
+                .flush(session_id)
+                .await
+                .map_err(|_| AgentRuntimeError::Preparation {
+                    message: "creation receipt durability barrier failed".into(),
+                })?;
+        if revision < minimum {
+            return Err(AgentRuntimeError::Preparation {
+                message: "creation receipt durability revision regressed".into(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn harness_header(
+        &self,
+        session_id: &str,
+        seq: u64,
+    ) -> Result<Option<xharness_session::RequestHeader>, AgentRuntimeError> {
+        self.store
+            .harness_header(session_id, seq)
+            .await
+            .map_err(|e| AgentRuntimeError::Preparation {
+                message: format!("Harness snapshot unavailable: {e}"),
+            })
+    }
+
+    async fn request_header(
+        &self,
+        session_id: &str,
+        seq: u64,
+    ) -> Result<Option<xharness_session::RequestHeader>, AgentRuntimeError> {
+        self.store
+            .request_header(session_id, seq)
+            .await
+            .map_err(|e| AgentRuntimeError::Preparation {
+                message: format!("request audit unavailable: {e}"),
+            })
+    }
+
+    async fn persist_fork_session(&self, session: Session) -> Result<(), AgentRuntimeError> {
+        self.store.create_seeded(session).await.map_err(|error| {
+            AgentRuntimeError::Preparation {
+                message: format!("could not publish fork history: {error}"),
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn persist_session_events(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        events: Vec<SessionEvent>,
+    ) -> Result<bool, AgentRuntimeError> {
+        if events.is_empty() {
+            return Ok(true);
+        }
+        let mut conflicts = 0usize;
+        loop {
+            let session = match self.store.load(session_id).await.map_err(|error| {
+                AgentRuntimeError::Preparation {
+                    message: format!("could not load durable session {session_id:?}: {error}"),
+                }
+            })? {
+                Some(session) => session,
+                None => {
+                    let mut header = SessionHeader::new(session_id);
+                    header.cwd = Some(cwd.to_owned());
+                    match self.store.create(header).await {
+                        Ok(session) => session,
+                        Err(StoreError::AlreadyExists { .. }) => continue,
+                        Err(error) => {
+                            return Err(AgentRuntimeError::Preparation {
+                                message: format!(
+                                    "could not create durable session {session_id:?}: {error}"
+                                ),
+                            });
+                        }
+                    }
+                }
+            };
+            match self
+                .store
+                .append(session_id, session.revision(), events.clone())
+                .await
+            {
+                Ok(_) => {
+                    self.store.flush(session_id).await.map_err(|error| {
+                        AgentRuntimeError::Preparation {
+                            message: format!(
+                                "could not flush durable session {session_id:?}: {error}"
+                            ),
+                        }
+                    })?;
+                    return Ok(true);
+                }
+                Err(StoreError::RevisionConflict { .. }) if conflicts < 16 => {
+                    conflicts += 1;
+                }
+                Err(error) => {
+                    return Err(AgentRuntimeError::Preparation {
+                        message: format!(
+                            "could not append durable session events for {session_id:?}: {error}"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn resume_session(
+        &self,
+        request: AgentSessionRequest,
+    ) -> Result<AgentResumeReport, AgentRuntimeError> {
+        self.require_execution()?;
+        if !self.can_route(&request.route) {
+            return Err(AgentRuntimeError::ModelUnavailable {
+                provider: request.route.provider,
+                model: request.route.model,
+            });
+        }
+        let mut header = SessionHeader::new(&request.session_id);
+        header.cwd = Some(request.cwd.clone());
+        let handle = self
+            .supervisor
+            .activate(header)
+            .await
+            .map_err(registry_error)?;
+        self.sessions.write().await.insert(
+            request.session_id.clone(),
+            DurableSessionConfig {
+                cwd: request.cwd.clone(),
+                permission: request.permission,
+                prompt: request.prompt,
+                route: request.route,
+            },
+        );
+        // Ready is published only after startup reconcile_consumed finishes.
+        // Reading the inbox while Starting can count an already-consumed steer
+        // that the worker is concurrently deleting and fail Host reattachment.
+        handle.when_ready().await.map_err(agent_command_error)?;
+        if handle.status() == xharness_agent::AgentStatus::Idle {
+            xharness_agent::GoalController::new(Arc::clone(&self.store), &request.session_id)
+                .recover_abandoned()
+                .await
+                .map_err(|e| AgentRuntimeError::Preparation {
+                    message: e.to_string(),
+                })?;
+        }
+        let snapshot =
+            handle
+                .inbox()
+                .snapshot()
+                .await
+                .map_err(|error| AgentRuntimeError::Preparation {
+                    message: error.to_string(),
+                })?;
+        let pending_turns = snapshot.dispatch_inputs().count();
+        let pending_next_step = snapshot.next_step().len();
+        let session = self
+            .store
+            .load(&request.session_id)
+            .await
+            .map_err(|error| AgentRuntimeError::Preparation {
+                message: format!(
+                    "could not inspect durable approval recovery for {:?}: {error}",
+                    request.session_id
+                ),
+            })?
+            .ok_or_else(|| AgentRuntimeError::Preparation {
+                message: format!("durable session {:?} disappeared", request.session_id),
+            })?;
+        let pending_approvals = session.pending_tool_approvals();
+        let recoverable_questions = session.recoverable_user_questions();
+        let recovered_approval_work_id = pending_approvals
+            .first()
+            .map(|first| xharness_agent::approval_recovery_work_id(&first.id));
+        let recovered_question_work_id = recoverable_questions.first().map(|first| {
+            xharness_agent::question_recovery_work_id(&first.invocation.interaction_id)
+        });
+        let recovered_compaction_work_id = pending_manual_compaction(&session);
+        if let Some(first) = pending_approvals.first() {
+            if pending_approvals
+                .iter()
+                .any(|approval| approval.turn != first.turn || approval.step != first.step)
+            {
+                return Err(AgentRuntimeError::Preparation {
+                    message: "pending approvals span more than one open tool batch".to_owned(),
+                });
+            }
+        }
+        if let Some(first) = recoverable_questions.first() {
+            if recoverable_questions
+                .iter()
+                .any(|question| question.turn != first.turn || question.step != first.step)
+                || pending_approvals
+                    .iter()
+                    .any(|approval| approval.turn != first.turn || approval.step != first.step)
+            {
+                return Err(AgentRuntimeError::Preparation {
+                    message: "recoverable interactions span more than one open tool batch"
+                        .to_owned(),
+                });
+            }
+        }
+
+        // Subscribe once per stable input before the worker is allowed to
+        // wake. Each later Web driver can then consume only the turn whose
+        // TurnStarted frame names that input ID, even if the Agent completes
+        // several turns before the browser reconnects.
+        let mut prepared = self.prepared.lock().await;
+        for input in snapshot.dispatch_inputs() {
+            if input
+                .source
+                .as_ref()
+                .and_then(|s| s.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                == Some("goal")
+            {
+                continue;
+            }
+            prepared
+                .entry((request.session_id.clone(), input.id.clone()))
+                .or_insert_with(|| PreparedDurableTurn {
+                    handle: handle.clone(),
+                    events: handle.subscribe(),
+                    input_id: input.id.clone(),
+                });
+        }
+        if let Some(work_id) = &recovered_approval_work_id {
+            prepared
+                .entry((request.session_id.clone(), work_id.clone()))
+                .or_insert_with(|| PreparedDurableTurn {
+                    handle: handle.clone(),
+                    events: handle.subscribe(),
+                    input_id: work_id.clone(),
+                });
+        }
+        if let Some(work_id) = &recovered_question_work_id {
+            prepared
+                .entry((request.session_id.clone(), work_id.clone()))
+                .or_insert_with(|| PreparedDurableTurn {
+                    handle: handle.clone(),
+                    events: handle.subscribe(),
+                    input_id: work_id.clone(),
+                });
+        }
+        if let Some(work_id) = &recovered_compaction_work_id {
+            prepared
+                .entry((request.session_id.clone(), work_id.clone()))
+                .or_insert_with(|| PreparedDurableTurn {
+                    handle: handle.clone(),
+                    events: handle.subscribe(),
+                    input_id: work_id.clone(),
+                });
+        }
+        drop(prepared);
+        // Attaching a Goal while an ordinary turn is live must never replay
+        // its currently waiting approval/question as a crashed turn.
+        if handle.status() == xharness_agent::AgentStatus::Idle
+            && (recovered_approval_work_id.is_some() || recovered_question_work_id.is_some())
+        {
+            handle
+                .recover_open_turn()
+                .await
+                .map_err(agent_command_error)?;
+        }
+        if let Some(work_id) = &recovered_compaction_work_id {
+            handle
+                .compact(work_id.clone())
+                .await
+                .map_err(agent_command_error)?;
+        }
+        self.attach_schedules(&handle).await?;
+        if handle.status() == xharness_agent::AgentStatus::Idle
+            && xharness_agent::DispatchState::from_session(&session)
+                .decide(&snapshot)
+                .can_run()
+        {
+            handle.wake().await.map_err(agent_command_error)?;
+        }
+        self.attach_schedules(&handle).await?;
+        Ok(AgentResumeReport {
+            pending_turns,
+            pending_next_step,
+            recovered_approval_work_id,
+            recovered_question_work_id,
+            recovered_compaction_work_id,
+        })
+    }
+
+    async fn take_resumed_turn(
+        &self,
+        session_id: &str,
+        work_id: &str,
+    ) -> Result<Option<Box<dyn RunningTurn>>, AgentRuntimeError> {
+        if let Some(prepared) = self
+            .goals
+            .prepared
+            .lock()
+            .await
+            .remove(&(session_id.into(), work_id.into()))
+        {
+            return Ok(Some(self.running_from_prepared(prepared)));
+        }
+        if let Some(prepared) = self
+            .prepared
+            .lock()
+            .await
+            .remove(&(session_id.to_owned(), work_id.to_owned()))
+        {
+            return Ok(Some(self.running_from_prepared(prepared)));
+        }
+        let Some(schedules) = &self.schedules else {
+            return Ok(None);
+        };
+        Ok(schedules
+            .take_delivery(session_id, work_id)
+            .await
+            .map(|delivery| {
+                self.running_from_prepared(PreparedDurableTurn {
+                    handle: delivery.handle,
+                    events: delivery.events,
+                    input_id: delivery.input_id,
+                })
+            }))
+    }
+
+    async fn start_manual_compaction(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<Box<dyn RunningTurn>, AgentRuntimeError> {
+        self.require_execution()?;
+        let handle = self.supervisor.get(session_id).await.ok_or_else(|| {
+            AgentRuntimeError::Preparation {
+                message: format!("durable agent {session_id:?} is not active"),
+            }
+        })?;
+        let prepared = PreparedDurableTurn {
+            events: handle.subscribe(),
+            handle: handle.clone(),
+            input_id: command_id.to_owned(),
+        };
+        handle
+            .compact(command_id.to_owned())
+            .await
+            .map_err(agent_command_error)?;
+        Ok(self.running_from_prepared(prepared))
+    }
+
+    async fn admit_turn(&self, request: AgentTurnRequest) -> Result<(), AgentRuntimeError> {
+        self.admit_input(request, false).await
+    }
+
+    async fn admit_steering(&self, request: AgentTurnRequest) -> Result<(), AgentRuntimeError> {
+        self.admit_input(request, true).await
+    }
+
+    async fn remove_pending_input(
+        &self,
+        session_id: &str,
+        input_id: &str,
+    ) -> Result<(), AgentRuntimeError> {
+        let handle = self.supervisor.get(session_id).await.ok_or_else(|| {
+            AgentRuntimeError::Preparation {
+                message: format!("durable agent {session_id:?} is not active"),
+            }
+        })?;
+        let removed = handle.inbox().remove(input_id).await.map_err(|error| {
+            AgentRuntimeError::Preparation {
+                message: error.to_string(),
+            }
+        })?;
+        if removed.is_none() {
+            return Err(AgentRuntimeError::Preparation {
+                message: format!("durable input {input_id:?} is no longer pending"),
+            });
+        }
+        self.prepared
+            .lock()
+            .await
+            .remove(&(session_id.to_owned(), input_id.to_owned()));
+        Ok(())
+    }
+
+    async fn replace_pending_input(
+        &self,
+        session_id: &str,
+        mut message: AgentMessage,
+        input_metadata: Option<serde_json::Value>,
+    ) -> Result<(), AgentRuntimeError> {
+        if message.role != Role::User {
+            return Err(AgentRuntimeError::Preparation {
+                message: "durable queued input must have the user role".to_owned(),
+            });
+        }
+        let input_id = message
+            .id
+            .clone()
+            .ok_or_else(|| AgentRuntimeError::Preparation {
+                message: "durable queued input requires a stable id".to_owned(),
+            })?;
+        message.id = Some(input_id.clone());
+        let handle = self.supervisor.get(session_id).await.ok_or_else(|| {
+            AgentRuntimeError::Preparation {
+                message: format!("durable agent {session_id:?} is not active"),
+            }
+        })?;
+        let replaced = handle
+            .inbox()
+            .replace(
+                &input_id,
+                InboxMessage {
+                    id: input_id.clone(),
+                    message,
+                    source: input_metadata,
+                },
+            )
+            .await
+            .map_err(|error| AgentRuntimeError::Preparation {
+                message: error.to_string(),
+            })?;
+        if replaced.is_none() {
+            return Err(AgentRuntimeError::Preparation {
+                message: format!("durable input {input_id:?} is no longer pending"),
+            });
+        }
+        Ok(())
+    }
+
+    async fn start_turn(
+        &self,
+        request: AgentTurnRequest,
+    ) -> Result<Box<dyn RunningTurn>, AgentRuntimeError> {
+        let (_, input_id) = self.validate_turn_input(&request)?;
+        let admission = self.lock_input_admission(&request.session_id).await;
+        let key = (request.session_id.clone(), input_id.clone());
+        let prepared = self.prepared.lock().await.remove(&key);
+        let prepared = match prepared {
+            Some(prepared) => prepared,
+            None => self.prepare_turn(request).await?,
+        };
+        drop(admission);
+        self.require_execution()?;
+        prepared.handle.wake().await.map_err(agent_command_error)?;
+        Ok(self.running_from_prepared(prepared))
+    }
+
+    async fn shutdown(&self, grace: Duration) -> AgentShutdownReport {
+        self.goals.shutdown.cancel();
+        let deadline = tokio::time::Instant::now() + grace;
+        let mut schedule_errors = Vec::new();
+        if let Some(schedules) = &self.schedules {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, schedules.shutdown()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => schedule_errors.push(error),
+                Err(_) => schedule_errors
+                    .push("schedule cleanup exceeded the runtime shutdown grace".to_owned()),
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let mut report = self.supervisor.shutdown(remaining).await;
+        report.cleanup_errors.append(&mut schedule_errors);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, self.tool_factory.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => report.cleanup_errors.push(error),
+            Err(_) => report
+                .cleanup_errors
+                .push("tool factory cleanup exceeded the runtime shutdown grace".to_owned()),
+        }
+        report
+    }
+}
+
+fn registry_error(error: RegistryError) -> AgentRuntimeError {
+    AgentRuntimeError::Preparation {
+        message: error.to_string(),
+    }
+}
+
+fn agent_command_error(error: AgentCommandError) -> AgentRuntimeError {
+    AgentRuntimeError::Preparation {
+        message: error.to_string(),
+    }
+}
+
+fn loop_control_error(error: AgentCommandError) -> LoopControlError {
+    match error {
+        AgentCommandError::Closed => LoopControlError::Closed,
+        AgentCommandError::Unavailable => {
+            LoopControlError::Rejected("agent worker is recovering; retry when ready".to_owned())
+        }
+        AgentCommandError::NoActiveTurn => {
+            LoopControlError::Rejected("durable Agent has no active turn".to_owned())
+        }
+        AgentCommandError::Busy => {
+            LoopControlError::Rejected("durable Agent is busy with another activity".to_owned())
+        }
+        AgentCommandError::Failed(message) => LoopControlError::Rejected(message),
+    }
+}
+
+fn pending_manual_compaction(session: &Session) -> Option<String> {
+    let mut settled = HashSet::new();
+    for event in session.events().iter().rev() {
+        match event.data() {
+            xharness_session::EventData::CommandDone { command_id, .. } => {
+                settled.insert(command_id.as_str());
+            }
+            xharness_session::EventData::CommandRun {
+                command_id, name, ..
+            } if name == "compact" && !settled.contains(command_id.as_str()) => {
+                return Some(command_id.clone());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    mod admission_performance_tests;
+    mod dispatch_tests;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Mutex,
+        },
+    };
+
+    use super::*;
+    use crate::NoTools;
+    use futures::stream;
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
+    use xharness_agent::MemoryLeaseManager;
+    use xharness_core::{
+        FinishReason, IdentityContextPolicy, ProviderError, ProviderEvent, ProviderRequest,
+        ProviderStream,
+    };
+    use xharness_session::{
+        CommandResultKind, CommandSource, EventData as SessionEventData, MemorySessionStore,
+        Revision, SessionHeader, TurnEndReason,
+    };
+    use xharness_token::{TokenBudget, TokenGuard};
+
+    mod max_tokens_diagnostic;
+    mod observer_tests;
+    mod retirement_tests;
+
+    struct ScriptProvider {
+        answers: Mutex<VecDeque<String>>,
+    }
+
+    #[test]
+    fn automatic_budget_refreshes_but_explicit_small_windows_are_preserved() {
+        let mut models = ModelRegistry::new();
+        let provider = Arc::new(ScriptProvider {
+            answers: Mutex::new(VecDeque::new()),
+        });
+        let guard = TokenGuard::conservative(TokenBudget::new(34_816, 4_096)).unwrap();
+        models
+            .register(
+                RegisteredModel::new(
+                    ModelDescriptor::new("p", "Provider", "m", "Model"),
+                    provider,
+                )
+                .with_token_guard(Some(guard)),
+            )
+            .unwrap();
+        let auto = ModelRoute::new("p", "m");
+        let mut manual = auto.clone();
+        manual.context_window_tokens = Some(8_192);
+        let mut large = auto.clone();
+        large.context_window_tokens = Some(262_144);
+        assert!(
+            models.can_route(&large),
+            "unknown capacity must not treat the temporary guard as a maximum"
+        );
+        assert_eq!(models.models()[0].context_window.effective_hard_max(), None);
+        models
+            .replace_context_capability(
+                &auto,
+                ContextWindowCapability::deployment_reported(262_144),
+            )
+            .unwrap();
+        assert_eq!(
+            models
+                .token_guard(&auto)
+                .unwrap()
+                .budget()
+                .context_window_tokens,
+            262_144
+        );
+        assert_eq!(
+            models
+                .token_guard(&manual)
+                .unwrap()
+                .budget()
+                .context_window_tokens,
+            8_192
+        );
+        models
+            .replace_context_capability(&auto, ContextWindowCapability::deployment_reported(65_536))
+            .unwrap();
+        assert_eq!(
+            models
+                .token_guard(&auto)
+                .unwrap()
+                .budget()
+                .context_window_tokens,
+            65_536
+        );
+        assert!(models.can_route(&manual));
+        assert!(!models.can_route(&large));
+    }
+
+    #[tokio::test]
+    async fn discovered_capabilities_match_the_guard_without_mutating_older_bindings() {
+        let mut models = ModelRegistry::new();
+        let provider = Arc::new(ScriptProvider {
+            answers: Mutex::new(VecDeque::new()),
+        });
+        models
+            .register(
+                RegisteredModel::new(
+                    ModelDescriptor::new("p", "Provider", "m", "Model"),
+                    provider,
+                )
+                .with_token_guard(Some(
+                    TokenGuard::conservative(TokenBudget::new(34_816, 4_096)).unwrap(),
+                )),
+            )
+            .unwrap();
+        let route = ModelRoute::new("p", "m");
+        let previous = models.clone();
+        models
+            .replace_context_capability(
+                &route,
+                ContextWindowCapability::deployment_reported(262_144),
+            )
+            .unwrap();
+        let live = models
+            .resolve(&route)
+            .unwrap()
+            .provider
+            .capabilities(CancellationToken::new())
+            .await
+            .unwrap();
+        let old = previous
+            .resolve(&route)
+            .unwrap()
+            .provider
+            .capabilities(CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(live.context_window.effective_hard_max(), Some(262_144));
+        assert_eq!(old.context_window.effective_hard_max(), None);
+        assert_eq!(
+            previous
+                .token_guard(&route)
+                .unwrap()
+                .budget()
+                .context_window_tokens,
+            34_816
+        );
+    }
+
+    struct BlockingFirstProvider {
+        attempts: AtomicUsize,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ScriptProvider {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> Option<&str> {
+            Some("test-model")
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let answer = self.answers.lock().unwrap().pop_front().unwrap();
+            Ok(Box::pin(stream::iter([
+                Ok(ProviderEvent::TextDelta(answer)),
+                Ok(ProviderEvent::Completed {
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: None,
+                    provider_items: Vec::new(),
+                }),
+            ])))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for BlockingFirstProvider {
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            if self.attempts.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                self.release.notified().await;
+            }
+            Ok(Box::pin(stream::iter([
+                Ok(ProviderEvent::TextDelta("released".to_owned())),
+                Ok(ProviderEvent::Completed {
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: None,
+                    provider_items: Vec::new(),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_runtime_rejects_before_turn_construction() {
+        let runtime = LoopAgentRuntime::new(
+            "provider-a",
+            "model-a",
+            None,
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+        );
+        let route = ModelRoute::new("provider-a", "model-a");
+        assert!(!runtime.has_available_route());
+        assert!(!runtime.can_route(&route));
+        let error = runtime
+            .start_turn(AgentTurnRequest {
+                session_id: "session".to_owned(),
+                cwd: "/workspace".to_owned(),
+                route,
+                permission: PermissionPreset::WorkspaceWrite,
+                prompt: None,
+                messages: vec![AgentMessage::user("hello")],
+                input_metadata: None,
+            })
+            .await
+            .err()
+            .expect("missing provider must reject the turn");
+        assert_eq!(
+            error,
+            AgentRuntimeError::ModelUnavailable {
+                provider: "provider-a".to_owned(),
+                model: "model-a".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_one_open_manual_compaction_as_a_maintenance_turn() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        store
+            .create(SessionHeader::new("manual-compact-recovery"))
+            .await
+            .unwrap();
+        store
+            .append(
+                "manual-compact-recovery",
+                Revision::ZERO,
+                vec![
+                    SessionEventData::TurnStart { turn: 1 }.into(),
+                    SessionEventData::UserMessage {
+                        message: AgentMessage::user(format!("OLD-CONTEXT:{}", "x".repeat(6_000))),
+                        surface_replace: None,
+                    }
+                    .into(),
+                    SessionEventData::StepStart { turn: 1, step: 1 }.into(),
+                    SessionEventData::RequestHeader {
+                        header: xharness_session::RequestHeader::new("test", "test-model"),
+                    }
+                    .into(),
+                    SessionEventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message: AgentMessage::assistant("old answer"),
+                        usage: None,
+                    }
+                    .into(),
+                    SessionEventData::StepEnd { turn: 1, step: 1 }.into(),
+                    SessionEventData::TurnEnd {
+                        turn: 1,
+                        reason: TurnEndReason::Completed,
+                    }
+                    .into(),
+                    SessionEventData::CommandRun {
+                        command_id: "manual-command".to_owned(),
+                        name: "compact".to_owned(),
+                        args: None,
+                        source: CommandSource::User,
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptProvider {
+            answers: Mutex::new(VecDeque::from([
+                "## Current Work\n- restored compact command".to_owned(),
+            ])),
+        });
+        let guard = TokenGuard::conservative(TokenBudget {
+            context_window_tokens: 10_000,
+            reserved_output_tokens: 256,
+            minimum_output_tokens: 256,
+            safety_margin_tokens: 64,
+        })
+        .unwrap();
+        let runtime = DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        )
+        .with_token_guard(Some(guard))
+        .with_compaction(Some(CompactionConfig {
+            retain_ratio: None,
+            retain_tokens: Some(10),
+            max_tokens: 256,
+            ..CompactionConfig::default()
+        }));
+
+        let report = runtime
+            .resume_session(AgentSessionRequest {
+                session_id: "manual-compact-recovery".to_owned(),
+                cwd: "/workspace".to_owned(),
+                route: ModelRoute::new("test", "test-model"),
+                permission: PermissionPreset::WorkspaceWrite,
+                prompt: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            report.recovered_compaction_work_id.as_deref(),
+            Some("manual-command")
+        );
+        let mut turn = runtime
+            .take_resumed_turn("manual-compact-recovery", "manual-command")
+            .await
+            .unwrap()
+            .expect("recovered compaction observer");
+        while turn.next_event().await.is_some() {}
+        let result = turn.result().await;
+        assert_eq!(result.status, xharness_core::LoopStatus::Completed);
+
+        let session = store
+            .load("manual-compact-recovery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.events().iter().any(|event| matches!(
+            event.data(),
+            SessionEventData::CompactionStart {
+                source_command_id: Some(id),
+                ..
+            } if id == "manual-command"
+        )));
+        assert!(session.events().iter().any(|event| matches!(
+            event.data(),
+            SessionEventData::CommandDone {
+                command_id,
+                kind: CommandResultKind::Success,
+                ..
+            } if command_id == "manual-command"
+        )));
+        runtime.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn durable_runtime_replays_journal_history_across_host_turns() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptProvider {
+            answers: Mutex::new(VecDeque::from([
+                "first answer".to_owned(),
+                "second answer".to_owned(),
+            ])),
+        });
+        let runtime = DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        );
+
+        let first_request = AgentTurnRequest {
+            session_id: "durable-host".to_owned(),
+            cwd: "/workspace".to_owned(),
+            route: ModelRoute::new("test", "test-model"),
+            permission: PermissionPreset::WorkspaceWrite,
+            prompt: None,
+            messages: vec![AgentMessage::user("first").with_id("prompt-1")],
+            input_metadata: None,
+        };
+        runtime.admit_turn(first_request.clone()).await.unwrap();
+        let admitted = store.load("durable-host").await.unwrap().unwrap();
+        assert!(admitted.events().iter().any(|event| {
+            matches!(
+                event.data(),
+                xharness_session::EventData::AgentInboxSpliced { inserted, .. }
+                    if inserted.iter().any(|message| message.id == "prompt-1")
+            )
+        }));
+        let mut first = runtime.start_turn(first_request).await.unwrap();
+        while first.next_event().await.is_some() {}
+        assert_eq!(first.result().await.final_text, "first answer");
+
+        let second_request = AgentTurnRequest {
+            session_id: "durable-host".to_owned(),
+            cwd: "/workspace".to_owned(),
+            route: ModelRoute::new("test", "test-model"),
+            permission: PermissionPreset::WorkspaceWrite,
+            prompt: None,
+            // The durable Session, not this compatibility DTO, supplies the
+            // prior turn to the second model request.
+            messages: vec![AgentMessage::user("second").with_id("prompt-2")],
+            input_metadata: None,
+        };
+        runtime.admit_turn(second_request.clone()).await.unwrap();
+        let mut second = runtime.start_turn(second_request).await.unwrap();
+        while second.next_event().await.is_some() {}
+        assert_eq!(second.result().await.final_text, "second answer");
+
+        let session = store.load("durable-host").await.unwrap().unwrap();
+        let contents = session
+            .derive_messages()
+            .into_iter()
+            .map(|message| message.content)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            ["first", "first answer", "second", "second answer"]
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_runtime_exposes_due_schedule_as_a_background_running_turn() {
+        use chrono::{SecondsFormat, Utc};
+        use xharness_session::{EventData, ScheduleChange, ScheduleKind, ScheduleRecord};
+
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let session = store
+            .create(SessionHeader::new("scheduled-runtime"))
+            .await
+            .unwrap();
+        let overdue = (Utc::now() - chrono::Duration::seconds(1))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        store
+            .append(
+                "scheduled-runtime",
+                session.revision(),
+                vec![SessionEvent::new(EventData::ScheduleChange {
+                    change: ScheduleChange::Create {
+                        version: 1,
+                        schedule: ScheduleRecord {
+                            automation: None,
+                            id: "schedule-1".to_owned(),
+                            kind: ScheduleKind::After,
+                            prompt: "runtime reminder".to_owned(),
+                            after_seconds: Some(1),
+                            every_seconds: None,
+                            scheduled_at: overdue,
+                        },
+                    },
+                })],
+            )
+            .await
+            .unwrap();
+        store.flush("scheduled-runtime").await.unwrap();
+
+        let schedules = ScheduleManager::new(Arc::clone(&store));
+        let runtime = DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(Arc::new(ScriptProvider {
+                answers: Mutex::new(VecDeque::from(["scheduled answer".to_owned()])),
+            })),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        )
+        .with_schedules(Arc::clone(&schedules));
+        let session = store.load("scheduled-runtime").await.unwrap().unwrap();
+        assert!(runtime.needs_session_resume(&session).unwrap());
+        let mut notices = runtime.subscribe_background_turns().unwrap();
+        runtime
+            .resume_session(AgentSessionRequest {
+                session_id: "scheduled-runtime".to_owned(),
+                cwd: "/workspace".to_owned(),
+                route: ModelRoute::new("test", "test-model"),
+                permission: PermissionPreset::WorkspaceWrite,
+                prompt: None,
+            })
+            .await
+            .unwrap();
+        let notice = tokio::time::timeout(Duration::from_secs(2), notices.recv())
+            .await
+            .expect("schedule did not publish a background turn")
+            .unwrap();
+        let mut running = runtime
+            .take_resumed_turn(&notice.session_id, &notice.work_id)
+            .await
+            .unwrap()
+            .expect("schedule background receiver disappeared");
+        while running.next_event().await.is_some() {}
+        assert_eq!(running.result().await.final_text, "scheduled answer");
+        assert!(runtime.shutdown(Duration::from_secs(1)).await.is_graceful());
+    }
+
+    #[test]
+    fn registry_validates_reasoning_per_exact_model_route() {
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptProvider {
+            answers: Mutex::new(VecDeque::new()),
+        });
+        let descriptor = ModelDescriptor::new("gpu", "GPU", "thinker", "Thinker").with_reasoning(
+            ModelReasoning::new(vec![
+                ModelReasoningEffort::new("off", "Off"),
+                ModelReasoningEffort::new("high", "High"),
+            ])
+            .with_default("high"),
+        );
+        let mut registry = ModelRegistry::new();
+        registry
+            .register(RegisteredModel::new(descriptor, Arc::clone(&provider)))
+            .unwrap();
+
+        let mut high = ModelRoute::new("gpu", "thinker");
+        high.reasoning_effort = Some("high".to_owned());
+        assert!(registry.can_route(&high));
+        let mut unsupported = ModelRoute::new("gpu", "thinker");
+        unsupported.reasoning_effort = Some("max".to_owned());
+        assert!(!registry.can_route(&unsupported));
+        assert!(registry.can_route(&ModelRoute::new("gpu", "thinker")));
+        assert_eq!(
+            registry.models()[0]
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.default_effort.as_deref()),
+            Some("high")
+        );
+        assert_eq!(
+            registry.models()[0]
+                .reasoning
+                .as_ref()
+                .and_then(ModelReasoning::lowest_effort),
+            Some("off"),
+            "internal compaction uses the first, lowest-cost declared effort"
+        );
+        assert_eq!(
+            registry.compaction_reasoning_effort(&high).as_deref(),
+            Some("off"),
+            "the main route's high effort must not leak into compaction"
+        );
+
+        let invalid = ModelDescriptor::new("gpu", "GPU", "broken", "Broken").with_reasoning(
+            ModelReasoning::new(vec![ModelReasoningEffort::new("low", "Low")])
+                .with_default("missing"),
+        );
+        let error = registry
+            .register(RegisteredModel::new(invalid, provider))
+            .unwrap_err();
+        assert!(error.to_string().contains("default effort \"missing\""));
+    }
+
+    #[tokio::test]
+    async fn durable_registry_routes_each_turn_and_journals_public_route_identity() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut models = ModelRegistry::new();
+        models
+            .register(RegisteredModel::new(
+                ModelDescriptor::new("gpu-4080", "RTX 4080", "qwen", "Qwen on 4080"),
+                Arc::new(ScriptProvider {
+                    answers: Mutex::new(VecDeque::from(["answer-4080".to_owned()])),
+                }),
+            ))
+            .unwrap();
+        models
+            .register(RegisteredModel::new(
+                ModelDescriptor::new("gpu-v100", "V100 Server", "qwen", "Qwen on V100"),
+                Arc::new(ScriptProvider {
+                    answers: Mutex::new(VecDeque::from(["answer-v100".to_owned()])),
+                }),
+            ))
+            .unwrap();
+        let runtime = DurableLoopAgentRuntime::from_registry(
+            ModelRoute::new("gpu-4080", "qwen"),
+            models,
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        )
+        .unwrap();
+        assert_eq!(runtime.model_catalog().len(), 2);
+        assert!(runtime.can_route(&ModelRoute::new("gpu-v100", "qwen")));
+
+        for (ordinal, provider, expected) in [
+            (1, "gpu-4080", "answer-4080"),
+            (2, "gpu-v100", "answer-v100"),
+        ] {
+            let request = AgentTurnRequest {
+                session_id: "routed-host".to_owned(),
+                cwd: "/workspace".to_owned(),
+                route: ModelRoute::new(provider, "qwen"),
+                permission: PermissionPreset::WorkspaceWrite,
+                prompt: None,
+                messages: vec![AgentMessage::user(format!("prompt-{ordinal}"))
+                    .with_id(format!("prompt-{ordinal}"))],
+                input_metadata: None,
+            };
+            runtime.admit_turn(request.clone()).await.unwrap();
+            let mut running = runtime.start_turn(request).await.unwrap();
+            while running.next_event().await.is_some() {}
+            assert_eq!(running.result().await.final_text, expected);
+        }
+
+        let session = store.load("routed-host").await.unwrap().unwrap();
+        let routes = session
+            .events()
+            .iter()
+            .filter_map(|event| match event.data() {
+                xharness_session::EventData::RequestHeader { header } => {
+                    Some((header.provider.as_str(), header.model.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(routes, [("gpu-4080", "qwen"), ("gpu-v100", "qwen")]);
+    }
+
+    #[tokio::test]
+    async fn multiple_pre_admitted_turns_keep_their_own_buffered_event_streams() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptProvider {
+            answers: Mutex::new(VecDeque::from([
+                "answer-a".to_owned(),
+                "answer-b".to_owned(),
+            ])),
+        });
+        let runtime = DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            store,
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        );
+        let request_a = AgentTurnRequest {
+            session_id: "buffered-turns".to_owned(),
+            cwd: "/workspace".to_owned(),
+            route: ModelRoute::new("test", "test-model"),
+            permission: PermissionPreset::WorkspaceWrite,
+            prompt: None,
+            messages: vec![AgentMessage::user("a").with_id("prompt-a")],
+            input_metadata: None,
+        };
+        let request_b = AgentTurnRequest {
+            messages: vec![AgentMessage::user("b").with_id("prompt-b")],
+            ..request_a.clone()
+        };
+
+        runtime.admit_turn(request_a.clone()).await.unwrap();
+        runtime.admit_turn(request_b.clone()).await.unwrap();
+        // Explicit start wakes the durable worker independently of polling;
+        // per-admission streams must still correlate their own inputs. Per-admission receivers retain the
+        // frames and correlate by claimed stable input ID.
+        tokio::task::yield_now().await;
+        let mut turn_a = runtime.start_turn(request_a).await.unwrap();
+        let mut turn_b = runtime.start_turn(request_b).await.unwrap();
+        while turn_a.next_event().await.is_some() {}
+        while turn_b.next_event().await.is_some() {}
+        assert_eq!(turn_a.result().await.final_text, "answer-a");
+        assert_eq!(turn_b.result().await.final_text, "answer-b");
+    }
+
+    #[tokio::test]
+    async fn durable_queue_replace_and_remove_update_the_inbox_before_web_projection() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let release = Arc::new(Notify::new());
+        let provider: Arc<dyn ModelProvider> = Arc::new(BlockingFirstProvider {
+            attempts: AtomicUsize::new(0),
+            release: Arc::clone(&release),
+        });
+        let runtime = DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        );
+        let first = AgentTurnRequest {
+            session_id: "queue-mutations".to_owned(),
+            cwd: "/workspace".to_owned(),
+            route: ModelRoute::new("test", "test-model"),
+            permission: PermissionPreset::WorkspaceWrite,
+            prompt: None,
+            messages: vec![AgentMessage::user("first").with_id("prompt-first")],
+            input_metadata: None,
+        };
+        let queued = AgentTurnRequest {
+            messages: vec![AgentMessage::user("old").with_id("prompt-queued")],
+            ..first.clone()
+        };
+        runtime.admit_turn(first.clone()).await.unwrap();
+        // Admission persists only; actual execution requires an explicit wake.
+        assert!(!store
+            .load("queue-mutations")
+            .await
+            .unwrap()
+            .unwrap()
+            .events()
+            .iter()
+            .any(|e| matches!(e.data(), xharness_session::EventData::UserMessage { .. })));
+        let mut running = runtime.start_turn(first.clone()).await.unwrap();
+        for _ in 0..100 {
+            let session = store.load("queue-mutations").await.unwrap().unwrap();
+            if session.events().iter().any(|event| {
+                matches!(
+                    event.data(),
+                    xharness_session::EventData::UserMessage { message, .. }
+                        if message.id.as_deref() == Some("prompt-first")
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(store
+            .load("queue-mutations")
+            .await
+            .unwrap()
+            .unwrap()
+            .events()
+            .iter()
+            .any(|event| matches!(
+                event.data(),
+                xharness_session::EventData::UserMessage { message, .. }
+                    if message.id.as_deref() == Some("prompt-first")
+            )));
+        runtime.admit_turn(queued).await.unwrap();
+
+        runtime
+            .replace_pending_input(
+                "queue-mutations",
+                AgentMessage::user("edited").with_id("prompt-queued"),
+                None,
+            )
+            .await
+            .unwrap();
+        let session = store.load("queue-mutations").await.unwrap().unwrap();
+        let inbox = xharness_agent::InboxProjection::from_session(&session).unwrap();
+        assert_eq!(inbox.next_turn().len(), 1);
+        assert_eq!(inbox.next_turn()[0].message.content, "edited");
+
+        runtime
+            .remove_pending_input("queue-mutations", "prompt-queued")
+            .await
+            .unwrap();
+        let session = store.load("queue-mutations").await.unwrap().unwrap();
+        assert!(!xharness_agent::InboxProjection::from_session(&session)
+            .unwrap()
+            .has_pending());
+
+        release.notify_one();
+        while running.next_event().await.is_some() {}
+        assert_eq!(running.result().await.final_text, "released");
+    }
+
+    #[tokio::test]
+    async fn durable_runtime_resumes_pending_input_without_appending_a_duplicate() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut header = SessionHeader::new("runtime-resume");
+        header.cwd = Some("/workspace".to_owned());
+        let inbox = xharness_agent::DurableInbox::open(Arc::clone(&store), header)
+            .await
+            .unwrap();
+        inbox
+            .append(
+                xharness_agent::InboxTarget::NextTurn,
+                InboxMessage::user("restored-input", "continue after restart"),
+            )
+            .await
+            .unwrap();
+
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptProvider {
+            answers: Mutex::new(VecDeque::from(["restored answer".to_owned()])),
+        });
+        let runtime = DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        );
+        let report = runtime
+            .resume_session(AgentSessionRequest {
+                session_id: "runtime-resume".to_owned(),
+                cwd: "/workspace".to_owned(),
+                route: ModelRoute::new("test", "test-model"),
+                permission: PermissionPreset::WorkspaceWrite,
+                prompt: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.pending_turns, 1);
+        assert_eq!(report.pending_next_step, 0);
+
+        let request = AgentTurnRequest {
+            session_id: "runtime-resume".to_owned(),
+            cwd: "/workspace".to_owned(),
+            route: ModelRoute::new("test", "test-model"),
+            permission: PermissionPreset::WorkspaceWrite,
+            prompt: None,
+            messages: vec![AgentMessage::user("continue after restart").with_id("restored-input")],
+            input_metadata: None,
+        };
+        let mut running = runtime.start_turn(request).await.unwrap();
+        while running.next_event().await.is_some() {}
+        assert_eq!(running.result().await.final_text, "restored answer");
+
+        let session = store.load("runtime-resume").await.unwrap().unwrap();
+        let inserted = session
+            .events()
+            .iter()
+            .filter_map(|event| match event.data() {
+                xharness_session::EventData::AgentInboxSpliced { inserted, .. } => Some(
+                    inserted
+                        .iter()
+                        .filter(|message| message.id == "restored-input")
+                        .count(),
+                ),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(inserted, 1, "resume must not append the prompt again");
+        assert_eq!(
+            session
+                .derive_messages()
+                .iter()
+                .filter(|message| message.id.as_deref() == Some("restored-input"))
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn inactive_execution_gate_rejects_admission_resume_compaction_and_auxiliary_model() {
+        struct Deny;
+        impl crate::ExecutionGate for Deny {
+            fn require_active(&self) -> Result<(), String> {
+                Err("inactive fixture".into())
+            }
+        }
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut models = ModelRegistry::new();
+        models
+            .register(RegisteredModel::new(
+                ModelDescriptor::new("fixture", "Fixture", "model", "Model"),
+                Arc::new(ScriptProvider {
+                    answers: Mutex::new(VecDeque::from(["unused".into()])),
+                }),
+            ))
+            .unwrap();
+        let route = ModelRoute::new("fixture", "model");
+        let runtime = DurableLoopAgentRuntime::from_registry(
+            route.clone(),
+            models,
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            store.clone(),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        )
+        .unwrap()
+        .with_execution_gate(Arc::new(Deny))
+        .unwrap();
+        let request = AgentTurnRequest {
+            session_id: "fenced".into(),
+            cwd: "/workspace".into(),
+            route: route.clone(),
+            permission: PermissionPreset::WorkspaceWrite,
+            prompt: None,
+            messages: vec![AgentMessage::user("must not execute")],
+            input_metadata: None,
+        };
+        assert!(runtime.admit_turn(request.clone()).await.is_err());
+        assert!(runtime.start_turn(request).await.is_err());
+        assert!(runtime
+            .resume_session(AgentSessionRequest {
+                session_id: "fenced".into(),
+                cwd: "/workspace".into(),
+                route: route.clone(),
+                permission: PermissionPreset::WorkspaceWrite,
+                prompt: None
+            })
+            .await
+            .is_err());
+        assert!(runtime
+            .start_manual_compaction("fenced", "compact")
+            .await
+            .is_err());
+        assert!(runtime.auxiliary_model(&route).is_none());
+        assert!(store.load("fenced").await.unwrap().is_none());
+        let report = runtime.shutdown(Duration::from_secs(1)).await;
+        assert!(report.is_graceful());
+    }
+}

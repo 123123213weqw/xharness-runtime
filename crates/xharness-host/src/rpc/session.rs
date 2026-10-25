@@ -1,0 +1,492 @@
+//! Session catalogue, search, history, and model-selection read adapter.
+//!
+//! State and runtime I/O stay here. Sorting, query policy, result bounding,
+//! and local history pagination are owned by `SessionProcessor`.
+
+use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
+use xharness_api::{RpcError, RpcErrorCode, RpcMethod};
+use xharness_projection::{
+    project_history_window, project_history_window_view, project_session_history,
+};
+
+use crate::{
+    driver::{agent_runtime_error, rpc_error},
+    event_gateway::EventGateway,
+    runtime::ModelRoute,
+    session_processor::{SearchQueryError, SessionProcessor, SessionSearchRecord},
+    BasicHost,
+};
+
+use super::{
+    model, optional_u64, require_object, required_string, session_not_found,
+    DEFAULT_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES,
+};
+
+pub(super) async fn call_read(
+    host: &BasicHost,
+    method: RpcMethod,
+    payload: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, RpcError> {
+    match method {
+        RpcMethod::SessionList => list(host, payload).await,
+        RpcMethod::SessionSearch => search(host, payload, cancellation).await,
+        RpcMethod::SessionHistory => history(host, payload).await,
+        RpcMethod::SessionModels => models(host, payload).await,
+        _ => unreachable!("session read adapter received non-read method {method}"),
+    }
+}
+
+async fn list(host: &BasicHost, payload: &Value) -> Result<Value, RpcError> {
+    require_object(payload)?;
+    let state = host.state.read().await;
+    Ok(SessionProcessor::list(
+        state
+            .sessions
+            .values()
+            .filter(|session| !state.archived_sessions.contains(&session.session_id))
+            .map(|session| session.summary())
+            .collect(),
+    ))
+}
+
+async fn search(
+    host: &BasicHost,
+    payload: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, RpcError> {
+    let query = SessionProcessor::normalize_query(&required_string(payload, "query")?).map_err(
+        |SearchQueryError::Invalid| {
+            super::bad_request("query must contain 1-500 visible characters")
+        },
+    )?;
+    check_search_cancelled(cancellation)?;
+
+    let state = host.state.read().await;
+    let session_ids = state
+        .sessions
+        .keys()
+        .filter(|session_id| !state.archived_sessions.contains(*session_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if host.agent_runtime.has_authoritative_sessions() {
+        drop(state);
+        let mut records = Vec::new();
+        for session_id in session_ids {
+            check_search_cancelled(cancellation)?;
+            let Some(session) = host
+                .agent_runtime
+                .authoritative_session(&session_id)
+                .await
+                .map_err(agent_runtime_error)?
+            else {
+                continue;
+            };
+            records.push(SessionSearchRecord {
+                id: session_id,
+                event_texts: session
+                    .events()
+                    .iter()
+                    .map(|event| serde_json::to_string(event).unwrap_or_default())
+                    .collect(),
+            });
+        }
+        return Ok(SessionProcessor::search(&query, records));
+    }
+
+    let records = state
+        .sessions
+        .values()
+        .filter(|session| !state.archived_sessions.contains(&session.session_id))
+        .map(|session| SessionSearchRecord {
+            id: session.session_id.clone(),
+            event_texts: session.events.iter().map(Value::to_string).collect(),
+        })
+        .collect::<Vec<_>>();
+    Ok(SessionProcessor::search(&query, records))
+}
+
+fn check_search_cancelled(cancellation: &CancellationToken) -> Result<(), RpcError> {
+    if cancellation.is_cancelled() {
+        return Err(rpc_error(
+            RpcErrorCode::Cancelled,
+            "session search was cancelled",
+            json!({}),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn history(host: &BasicHost, payload: &Value) -> Result<Value, RpcError> {
+    let session_id = required_string(payload, "sessionId")?;
+    let before_seq = optional_u64(payload, "beforeSeq")?;
+    let max_messages = optional_u64(payload, "maxMessages")?
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(DEFAULT_HISTORY_MESSAGES)
+        .clamp(1, MAX_HISTORY_MESSAGES);
+
+    host.state.write().await.touch_projection_cache(&session_id);
+    if let Some(page) = cold_history(host, &session_id, before_seq, max_messages).await? {
+        return Ok(page);
+    }
+    host.hydrate_session(&session_id)
+        .await
+        .map_err(|error| RpcError::internal(format!("session recovery failed: {error}")))?;
+    if let Some(page) = indexed_history(host, &session_id, before_seq, max_messages).await {
+        return Ok(page);
+    }
+    host.sync_authoritative_session(&session_id).await?;
+
+    if host.agent_runtime.has_authoritative_sessions() {
+        let durable = host
+            .agent_runtime
+            .authoritative_session(&session_id)
+            .await
+            .map_err(agent_runtime_error)?
+            .ok_or_else(|| session_not_found(&session_id))?;
+        let (route, projections) = {
+            let state = host.state.read().await;
+            let session = state
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| session_not_found(&session_id))?;
+            (
+                ModelRoute {
+                    provider: session.model.provider.clone(),
+                    model: session.model.model.clone(),
+                    reasoning_effort: session.model.reasoning_effort.clone(),
+                    context_window_tokens: session.model.context_window_tokens,
+                },
+                session.projection_values(),
+            )
+        };
+        let page = project_session_history(&durable, &route, before_seq, max_messages);
+        let events = page
+            .events
+            .into_iter()
+            .map(|event| {
+                let view = event
+                    .get("seq")
+                    .and_then(Value::as_u64)
+                    .and_then(|seq| {
+                        usize::try_from(seq)
+                            .ok()
+                            .and_then(|index| durable.events().get(index))
+                    })
+                    .and_then(|source| EventGateway::durable_view(&durable, source))
+                    .or_else(|| EventGateway::live_view(&event, &[]));
+                EventGateway::history_event(event, view)
+            })
+            .collect::<Vec<_>>();
+        let mut value = json!({"events": events, "hasMore": page.has_more});
+        if before_seq.is_none() {
+            value.as_object_mut().expect("history is object").insert(
+                "projections".to_owned(),
+                json!({
+                    "asOfSeq": page.as_of_seq.and_then(|seq| i64::try_from(seq).ok()).unwrap_or(-1),
+                    "values": projections,
+                }),
+            );
+        }
+        return Ok(value);
+    }
+
+    let state = host.state.read().await;
+    let session = state
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| session_not_found(&session_id))?;
+    let event_types = session
+        .events
+        .iter()
+        .map(|event| event.get("type").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let window = SessionProcessor::history_window(
+        &event_types,
+        session.event_base_seq,
+        session.next_event_seq(),
+        before_seq,
+        max_messages,
+    );
+    let events = session.events[window.start..window.end]
+        .iter()
+        .map(|event| {
+            EventGateway::history_event(
+                event.clone(),
+                EventGateway::live_view(event, &session.events),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut value = json!({
+        "events": events,
+        "hasMore": window.has_more,
+    });
+    if before_seq.is_none() {
+        value.as_object_mut().expect("history is object").insert(
+            "projections".to_owned(),
+            json!({
+                "asOfSeq": session.last_event_seq_i64(),
+                "values": session.projection_values(),
+            }),
+        );
+    }
+    Ok(value)
+}
+
+/// Presentation readiness is not execution readiness. Keep the cold record and
+/// its recovery gate intact; only a source-bound idle page may bypass hydration.
+async fn cold_history(
+    host: &BasicHost,
+    id: &str,
+    before: Option<u64>,
+    max: usize,
+) -> Result<Option<Value>, RpcError> {
+    if !host.agent_runtime.has_authoritative_sessions() {
+        return Ok(None);
+    }
+    let Some(store) = host.lazy_store.get().cloned() else {
+        return Ok(None);
+    };
+    {
+        let state = host.state.read().await;
+        let Some(record) = state.sessions.get(id) else {
+            return Ok(None);
+        };
+        if !record.restoring || record.running || state.deleted_sessions.contains(id) {
+            return Ok(None);
+        }
+    }
+    let gate = host.session_restore_gate(id).await;
+    let _recovery_guard = gate.lock().await;
+    let _projection_guard = host.lock_projection(id).await;
+    let (expected, route) = {
+        let state = host.state.read().await;
+        let Some(record) = state.sessions.get(id) else {
+            return Ok(None);
+        };
+        if !record.restoring || record.running || state.deleted_sessions.contains(id) {
+            return Ok(None);
+        }
+        (
+            match record.authoritative_seq {
+                Some(seq) => seq,
+                None => return Ok(None),
+            },
+            ModelRoute {
+                provider: record.model.provider.clone(),
+                model: record.model.model.clone(),
+                reasoning_effort: record.model.reasoning_effort.clone(),
+                context_window_tokens: record.model.context_window_tokens,
+            },
+        )
+    };
+    let Some(mut cut) = store
+        .cold_history_window(id, crate::state::HISTORY_PRESENTATION_SCHEMA, before, max)
+        .await
+        .map_err(|error| RpcError::internal(format!("cold history read failed: {error}")))?
+    else {
+        return Ok(None);
+    };
+    if cut.presentation.schema != crate::state::HISTORY_PRESENTATION_SCHEMA
+        || ![
+            "sessionListMetadata",
+            "permissions",
+            "plan",
+            "goal",
+            "taskPlan",
+            "tokenUsage",
+            "dailyTokenUsage",
+            "sessionStats",
+            "contextPressure",
+            "performanceTimeline",
+        ]
+        .iter()
+        .all(|key| cut.presentation.values.get(*key).is_some())
+        || cut.catalog.header.id != id
+        || cut.catalog.next_seq != expected
+        || cut.window.next_seq != expected
+        || cut.catalog.needs_recovery
+    {
+        return Ok(None);
+    }
+    {
+        let state = host.state.read().await;
+        let Some(record) = state.sessions.get(id) else {
+            return Ok(None);
+        };
+        if !record.restoring
+            || record.running
+            || state.deleted_sessions.contains(id)
+            || record.authoritative_seq != Some(expected)
+            || record.model.provider != route.provider
+            || record.model.model != route.model
+            || record.model.reasoning_effort != route.reasoning_effort
+            || record.model.context_window_tokens != route.context_window_tokens
+        {
+            return Ok(None);
+        }
+        // Display is ready; execution deliberately is not. Keep this metadata
+        // identical to the live/catalogue baseline at the same sequence.
+        cut.presentation.values["sessionListMetadata"] =
+            record.projection_values()["sessionListMetadata"].clone();
+    }
+    Ok(Some(indexed_page(
+        &cut.window,
+        &route,
+        before,
+        cut.presentation.values,
+    )))
+}
+
+/// Only an already hydrated, idle, exactly synchronized session can bypass
+/// full replay. Active turns and all unusable indices retain the old path.
+async fn indexed_history(
+    host: &BasicHost,
+    id: &str,
+    before: Option<u64>,
+    max: usize,
+) -> Option<Value> {
+    if !host.agent_runtime.has_authoritative_sessions() {
+        return None;
+    }
+    let store = host.lazy_store.get()?.clone();
+    let _gate = host.lock_projection(id).await;
+    let (expected, route, projections) = {
+        let state = host.state.read().await;
+        let record = state.sessions.get(id)?;
+        if record.restoring || record.running {
+            return None;
+        }
+        (
+            record.authoritative_seq?,
+            ModelRoute {
+                provider: record.model.provider.clone(),
+                model: record.model.model.clone(),
+                reasoning_effort: record.model.reasoning_effort.clone(),
+                context_window_tokens: record.model.context_window_tokens,
+            },
+            record.projection_values(),
+        )
+    };
+    let window = store
+        .history_window(id, expected, before, max)
+        .await
+        .ok()??;
+    {
+        let state = host.state.read().await;
+        let record = state.sessions.get(id)?;
+        if record.restoring
+            || record.running
+            || record.authoritative_seq != Some(expected)
+            || record.model.provider != route.provider
+            || record.model.model != route.model
+            || record.model.reasoning_effort != route.reasoning_effort
+            || record.model.context_window_tokens != route.context_window_tokens
+        {
+            return None;
+        }
+    }
+    Some(indexed_page(&window, &route, before, projections))
+}
+
+// Both display-only and recovered reads use the same event/view projection.
+fn indexed_page(
+    window: &xharness_session::SessionHistoryWindow,
+    route: &ModelRoute,
+    before: Option<u64>,
+    projections: Value,
+) -> Value {
+    let events = project_history_window(window, route)
+        .into_iter()
+        .map(|event| {
+            let view = event
+                .get("seq")
+                .and_then(Value::as_u64)
+                .and_then(|seq| window.events.binary_search_by_key(&seq, |e| e.seq).ok())
+                .and_then(|n| project_history_window_view(window, &window.events[n]))
+                .or_else(|| EventGateway::live_view(&event, &[]));
+            EventGateway::history_event(event, view)
+        })
+        .collect::<Vec<_>>();
+    let mut value = json!({"events": events, "hasMore": window.has_more});
+    if before.is_none() {
+        value["projections"] = json!({
+            "asOfSeq": window.next_seq.checked_sub(1).and_then(|s| i64::try_from(s).ok()).unwrap_or(-1),
+            "values": projections,
+        });
+    }
+    value
+}
+
+async fn models(host: &BasicHost, payload: &Value) -> Result<Value, RpcError> {
+    let session_id = required_string(payload, "sessionId")?;
+    if !host.state.read().await.sessions.contains_key(&session_id) {
+        return Err(session_not_found(&session_id));
+    }
+    if payload.get("refreshCapabilities").and_then(Value::as_bool) == Some(true) {
+        host.refresh_model_settings()
+            .await
+            .map_err(crate::model_settings::model_settings_error)?;
+    }
+    let mut cold = host
+        .state
+        .read()
+        .await
+        .sessions
+        .get(&session_id)
+        .is_some_and(|record| record.restoring);
+    if cold {
+        let store = host.lazy_store.get();
+        let entry = match store {
+            Some(store) => store.catalog_entry(&session_id).await.ok().flatten(),
+            None => None,
+        };
+        let verified = {
+            let state = host.state.read().await;
+            state
+                .sessions
+                .get(&session_id)
+                .zip(entry.as_ref())
+                .is_some_and(|(record, entry)| {
+                    record.restoring
+                        && !record.running
+                        && !entry.needs_recovery
+                        && record.authoritative_seq == Some(entry.next_seq)
+                })
+        };
+        if !verified {
+            host.hydrate_session(&session_id)
+                .await
+                .map_err(|error| RpcError::internal(format!("session recovery failed: {error}")))?;
+            cold = false;
+        }
+    }
+    if !cold {
+        let repaired = host.reconcile_model_routes().await;
+        if !repaired.is_empty() {
+            host.state.write().await.startup_issues.extend(repaired);
+        }
+    }
+    let (current, route) = {
+        let state = host.state.read().await;
+        let session = state
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| session_not_found(&session_id))?;
+        let route = ModelRoute {
+            provider: session.model.provider.clone(),
+            model: session.model.model.clone(),
+            reasoning_effort: session.model.reasoning_effort.clone(),
+            context_window_tokens: session.model.context_window_tokens,
+        };
+        (session.model.clone(), route)
+    };
+    let (groups, failures) = model::catalog_view(host).await;
+    Ok(json!({
+        "current": current,
+        "routable": host.agent_runtime.can_route(&route),
+        "groups": groups,
+        "failures": failures,
+    }))
+}

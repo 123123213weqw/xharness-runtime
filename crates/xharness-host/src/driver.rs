@@ -1,0 +1,2010 @@
+use std::sync::{atomic::Ordering, Arc};
+use xharness_projection::metrics::web_token_usage_from_core;
+#[cfg(test)]
+use xharness_projection::project_session_event_tail_from;
+use xharness_projection::{prepare_session_tail_update, project_session_event_range};
+
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot, OwnedMutexGuard};
+use xharness_agent::InboxProjection;
+use xharness_api::{RpcError, RpcErrorCode, RpcId};
+use xharness_core::{AgentMessage, LoopCommand, LoopEvent, LoopEventKind, LoopStatus, Role};
+use xharness_session::{EventData, Session, SessionCatalogEntry, SessionEvent};
+
+use crate::{
+    event_gateway::EventGateway,
+    restore::{
+        restored_agent_preset, restored_goal, restored_permission, restored_plan_mode,
+        restored_queue, restored_route, restored_session_mutation_receipts, restored_title,
+    },
+    runtime::{AgentRuntimeError, AgentTurnRequest, ModelRoute, RunningTurn},
+    state::{now_ms, DriverCommand, PendingResponse, QueuePlacement, QueuedPrompt},
+    BasicHost,
+};
+
+#[cfg(test)]
+#[path = "projection_publication_tests.rs"]
+mod projection_publication_tests;
+
+pub(crate) struct PromptAdmission {
+    pub rpc_id: RpcId,
+    pub session_id: String,
+    pub mode: String,
+    pub text: String,
+    pub content: Vec<Value>,
+    pub source: Value,
+    pub fingerprint: Option<String>,
+}
+
+/// Inputs that must still match before a prepared projection is published.
+/// The per-session gate orders synchronizers; model selection has a separate
+/// admission path, so the global write lock still needs this validation.
+struct ProjectionInputs {
+    cursor: Option<u64>,
+    cache_base_seq: u64,
+    created_at: u64,
+    schedules_hydrated: bool,
+    restoring: bool,
+    projected_model: Option<crate::state::ModelSelection>,
+    route: ModelRoute,
+}
+
+impl ProjectionInputs {
+    fn capture(record: &crate::state::SessionRecord) -> Self {
+        Self {
+            cursor: record.authoritative_seq,
+            cache_base_seq: record.event_base_seq,
+            created_at: record.created_at,
+            schedules_hydrated: record.schedules_hydrated,
+            restoring: record.restoring,
+            projected_model: record.projected_model.clone(),
+            route: ModelRoute {
+                provider: record.model.provider.clone(),
+                model: record.model.model.clone(),
+                reasoning_effort: record.model.reasoning_effort.clone(),
+                context_window_tokens: record.model.context_window_tokens,
+            },
+        }
+    }
+
+    fn matches(&self, record: &crate::state::SessionRecord) -> bool {
+        self.cursor == record.authoritative_seq
+            // Another session may evict this display prefix while preparation
+            // runs. The journal cursor still certifies the delta; applying it
+            // to a shorter suffix is safe, but never resurrect a stale cursor.
+            && self.cache_base_seq <= record.event_base_seq
+            && self.created_at == record.created_at
+            && self.schedules_hydrated == record.schedules_hydrated
+            && self.restoring == record.restoring
+            && self.projected_model == record.projected_model
+            && self.route.provider == record.model.provider
+            && self.route.model == record.model.model
+            && self.route.reasoning_effort == record.model.reasoning_effort
+            && self.route.context_window_tokens == record.model.context_window_tokens
+    }
+
+    fn already_projected(&self, next_seq: u64) -> bool {
+        self.cursor == Some(next_seq)
+            && self.schedules_hydrated
+            && !self.restoring
+            && self.reusable_route()
+    }
+
+    fn reusable_route(&self) -> bool {
+        self.projected_model.as_ref().is_some_and(|model| {
+            model.provider == self.route.provider
+                && model.model == self.route.model
+                && model.reasoning_effort == self.route.reasoning_effort
+                && model.context_window_tokens == self.route.context_window_tokens
+        })
+    }
+}
+
+// All history scans and event/view construction happen without a Host state
+// write guard. Applying the small mutable metrics cache stays in publication.
+fn prepare_projection_events(
+    session: &xharness_session::Session,
+    route: &ModelRoute,
+    previous: u64,
+) -> Result<Vec<(Value, Option<Value>)>, RpcError> {
+    let start = usize::try_from(previous)
+        .map_err(|_| RpcError::internal("authoritative session cursor overflow"))?;
+    if start > session.events().len() {
+        return Err(RpcError::internal(format!(
+            "authoritative session {:?} moved behind cursor {previous}",
+            session.header().id
+        )));
+    }
+    Ok(
+        project_session_event_range(session, route, start, session.events().len())
+            .into_iter()
+            .map(|event| {
+                // An output offset is not a journal index: folding may omit events.
+                let view = event
+                    .get("seq")
+                    .and_then(Value::as_u64)
+                    .and_then(|seq| usize::try_from(seq).ok())
+                    .and_then(|index| session.events().get(index))
+                    .and_then(|event| EventGateway::durable_view(session, event));
+                (event, view)
+            })
+            .collect(),
+    )
+}
+
+/// Owned only by Host clones, never by a listener. Last-owner drop wakes idle
+/// receivers even when an embedding application retains the Runtime/senders.
+#[derive(Default)]
+pub(crate) struct BackgroundListenerLifetime {
+    stop: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for BackgroundListenerLifetime {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+impl BasicHost {
+    /// Serialize the turn preparation snapshot with desired-permission writes.
+    /// The lock ends before any provider/tool work; existing executors are never changed.
+    pub(crate) async fn capture_turn_permission(
+        &self,
+        session_id: &str,
+    ) -> Result<(crate::PermissionPreset, xharness_prompt::PromptAssembly), RpcError> {
+        let _gate = self.lock_permission_selection(session_id).await;
+        let prompt = self
+            .prompt_assembly(session_id)
+            .await
+            .map_err(RpcError::internal)?;
+        let (permission, prompt, view) = {
+            let mut state = self.state.write().await;
+            let session = state
+                .sessions
+                .get_mut(session_id)
+                .ok_or_else(|| RpcError::internal("session disappeared at permission snapshot"))?;
+            let permission = session.permission_preset;
+            session.active_permission = Some(permission);
+            (permission, prompt, session.permission_projection())
+        };
+        self.push_projection(session_id, "permissions", view).await;
+        Ok((permission, prompt))
+    }
+
+    pub(crate) async fn push_permission_projection(&self, session_id: &str) {
+        let view = self
+            .state
+            .read()
+            .await
+            .sessions
+            .get(session_id)
+            .map(|s| s.permission_projection());
+        if let Some(view) = view {
+            self.push_projection(session_id, "permissions", view).await;
+        }
+    }
+
+    /// Share notification lifetime without exposing the lifetime owner's fields.
+    pub(crate) fn background_listener_cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.background_listener_lifetime.stop.clone()
+    }
+
+    /// Stop background notification listeners. Already-admitted turns remain
+    /// Runtime-owned and must be drained by AgentRuntime::shutdown separately.
+    /// Terminal and idempotent; this Host does not restart its listeners.
+    pub fn stop_background_listeners(&self) {
+        self.background_listener_lifetime.stop.cancel();
+    }
+    /// Bridge runtime-originated turns (currently durable Schedule delivery)
+    /// into the same live Web projection used by user-started turns.
+    pub(crate) fn start_background_turn_listener(self: &Arc<Self>) {
+        if self
+            .background_listener_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let Some(mut notices) = self.agent_runtime.subscribe_background_turns() else {
+            return;
+        };
+        let stop = self.background_listener_lifetime.stop.clone();
+        if let Some(mut changes) = self.agent_runtime.subscribe_goal_changes() {
+            let weak = Arc::downgrade(self);
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                loop {
+                    let received = tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => break,
+                        received = changes.recv() => received,
+                    };
+                    let ids = match received {
+                        Ok(id) => vec![id],
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let Some(host) = weak.upgrade() else { break };
+                            let ids = host.state.read().await.goals.keys().cloned().collect();
+                            ids
+                        }
+                        Err(_) => break,
+                    };
+                    let Some(host) = weak.upgrade() else { break };
+                    for id in ids {
+                        if let Err(e) = host.sync_authoritative_session(&id).await {
+                            host.push_host(json!({"type":"host/agent-error","sessionId":id,"message":e.message}));
+                        }
+                    }
+                }
+            });
+        }
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                // Never keep a strong Host reference while waiting for input.
+                let received = tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => return,
+                    received = notices.recv() => received,
+                };
+                match received {
+                    Ok(notice) => {
+                        let Some(host) = weak.upgrade() else { return };
+                        tokio::spawn(async move {
+                            if let Err(error) = host.start_background_turn(notice).await {
+                                host.push_host(json!({
+                                    "type": "host/agent-error",
+                                    "sessionId": error.0,
+                                    "message": error.1,
+                                }));
+                            }
+                        });
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        let Some(host) = weak.upgrade() else { return };
+                        host.push_host(json!({
+                            "type": "host/agent-error",
+                            "message": format!("background turn listener lagged by {skipped} notice(s)"),
+                        }));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+
+    async fn start_background_turn(
+        self: &Arc<Self>,
+        notice: xharness_schedule::ScheduleDeliveryNotice,
+    ) -> Result<(), (String, String)> {
+        let session_id = notice.session_id;
+        // Serialize background starts with prompt/model admission checks.
+        let _admission_guard = self.lock_admission(&session_id).await;
+        let run = self
+            .agent_runtime
+            .take_resumed_turn(&session_id, &notice.work_id)
+            .await
+            .map_err(|error| (session_id.clone(), error.to_string()))?
+            .ok_or_else(|| {
+                (
+                    session_id.clone(),
+                    format!("runtime lost background work {:?}", notice.work_id),
+                )
+            })?;
+        let mut exclusive_control = None;
+        let already_running = {
+            let mut state = self.state.write().await;
+            let record = state.sessions.get_mut(&session_id).ok_or_else(|| {
+                (
+                    session_id.clone(),
+                    "background turn belongs to an unknown session".to_owned(),
+                )
+            })?;
+            let already_running = record.running;
+            if !already_running {
+                let (control_tx, control_rx) = mpsc::channel::<DriverCommand>(64);
+                record.running = true;
+                record.control = Some(control_tx);
+                exclusive_control = Some(control_rx);
+            }
+            already_running
+        };
+        if let Some(control_rx) = exclusive_control {
+            self.push_host(json!({
+                "type": "host/session-status",
+                "sessionId": session_id,
+                "running": true,
+            }));
+            let host = self.as_ref().clone();
+            tokio::spawn(
+                async move { host.drive_recovered_turn(session_id, run, control_rx).await },
+            );
+        } else if already_running {
+            let host = self.as_ref().clone();
+            tokio::spawn(async move { host.drive_background_projection(session_id, run).await });
+        }
+        Ok(())
+    }
+
+    /// Commit log-only product facts through the runtime-owned Session when
+    /// available, otherwise retain the legacy in-memory projection. The
+    /// authoritative path flushes before it refreshes/broadcasts History.
+    pub(crate) async fn commit_session_events(
+        &self,
+        session_id: &str,
+        events: Vec<SessionEvent>,
+    ) -> Result<(), RpcError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let cwd = self
+            .state
+            .read()
+            .await
+            .sessions
+            .get(session_id)
+            .map(|session| session.cwd.clone())
+            .ok_or_else(|| {
+                rpc_error(
+                    RpcErrorCode::SessionNotFound,
+                    format!("session {session_id:?} was not found"),
+                    json!({"sessionId": session_id}),
+                )
+            })?;
+        let authoritative = self
+            .agent_runtime
+            .persist_session_events(session_id, &cwd, events.clone())
+            .await
+            .map_err(agent_runtime_error)?;
+        if authoritative {
+            self.sync_authoritative_session(session_id).await?;
+            return Ok(());
+        }
+        for event in events {
+            let mut tagged = serde_json::to_value(event).map_err(|error| {
+                RpcError::internal(format!("session event encoding failed: {error}"))
+            })?;
+            let object = tagged
+                .as_object_mut()
+                .ok_or_else(|| RpcError::internal("session event must encode as an object"))?;
+            let event_type = object
+                .remove("type")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or_else(|| RpcError::internal("session event encoding omitted its type"))?;
+            let data = object.remove("data").unwrap_or(Value::Null);
+            self.append_session_event(session_id, &event_type, data, None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Refresh the browser history cache from the runtime-owned append-only
+    /// Session. The returned boolean distinguishes a durable runtime from the
+    /// legacy ephemeral adapter, even before a Session file exists.
+    pub(crate) async fn sync_authoritative_session(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, RpcError> {
+        if !self.agent_runtime.has_authoritative_sessions() {
+            return Ok(false);
+        }
+        // Serialize read -> projection -> publication, not just the final write.
+        // Otherwise an older concurrent read can arrive after a newer cursor.
+        let _projection_guard = self.lock_projection(session_id).await;
+        // Do not spin indefinitely if another admission path keeps changing
+        // projection inputs. Each retry reloads the authoritative snapshot.
+        for _ in 0..3 {
+            let Some(session) = self
+                .agent_runtime
+                .authoritative_session(session_id)
+                .await
+                .map_err(agent_runtime_error)?
+            else {
+                return Ok(true);
+            };
+            let inputs = {
+                let state = self.state.read().await;
+                let record = state.sessions.get(session_id).ok_or_else(|| {
+                    rpc_error(
+                        RpcErrorCode::SessionNotFound,
+                        format!("session {session_id:?} was not found"),
+                        json!({"sessionId": session_id}),
+                    )
+                })?;
+                ProjectionInputs::capture(record)
+            };
+            // Several stream notices can refer to the same latest snapshot.
+            // Rebuilding it again clones and serializes the entire resident
+            // history without producing any new durable events. Cold records
+            // and changed routes must still pass through full hydration.
+            if inputs.already_projected(session.next_seq()) {
+                return Ok(true);
+            }
+            let route = &inputs.route;
+            let permission = restored_permission(&session);
+            let agent_preset = restored_agent_preset(&session);
+            let title = restored_title(&session);
+            let plan_active = restored_plan_mode(&session);
+            let goal = restored_goal(&session);
+            let mutation_receipts = restored_session_mutation_receipts(&session);
+            let inbox = InboxProjection::from_session(&session).map_err(|error| {
+                RpcError::internal(format!(
+                    "authoritative session {session_id:?} has an invalid inbox: {error}"
+                ))
+            })?;
+            let projected_queue = restored_queue(&inbox);
+            let catalog_boundary = inputs.cursor != Some(session.next_seq())
+                && (matches!(
+                    session.events().last().map(|event| event.data()),
+                    Some(EventData::TurnEnd { .. })
+                ) || !self
+                    .state
+                    .read()
+                    .await
+                    .sessions
+                    .get(session_id)
+                    .is_some_and(|record| record.running));
+            let tail = prepare_session_tail_update(
+                &session,
+                route,
+                inputs.cache_base_seq,
+                inputs.cursor,
+                inputs.reusable_route(),
+                self.config.session_event_cache_capacity,
+                self.config.session_event_cache_bytes,
+            );
+            let prepared_events =
+                prepare_projection_events(&session, route, inputs.cursor.unwrap_or_default())?;
+            // Plans are whole-value metadata: only rebuild on hydration or a
+            // plan event, never scan/clone a long plan for every text chunk.
+            let task_plan_update = (inputs.cursor.is_none()
+                || prepared_events.iter().any(|(event, _)| {
+                    event.get("type").and_then(Value::as_str) == Some("session/plan-updated")
+                }))
+            .then(|| xharness_session::session_plan(&session));
+            let schedule_projection = (!inputs.schedules_hydrated
+                || prepared_events.iter().any(|(event, _)| {
+                    event.get("type").and_then(Value::as_str) == Some("schedule/change")
+                }))
+            .then(|| xharness_schedule::active_schedules(&session))
+            .transpose()
+            .map_err(RpcError::internal)?;
+            let has_turn = session
+                .events()
+                .iter()
+                .any(|event| matches!(event.data(), xharness_session::EventData::TurnStart { .. }));
+            let (
+                new_events,
+                queue_changed,
+                permission_changed,
+                schedules_changed,
+                task_plan_changed,
+            ) = {
+                let mut state = self.state.write().await;
+                let (
+                    new_events,
+                    queue_changed,
+                    permission_changed,
+                    schedules_changed,
+                    task_plan_changed,
+                ) = {
+                    let record = state.sessions.get_mut(session_id).ok_or_else(|| {
+                        rpc_error(
+                            RpcErrorCode::SessionNotFound,
+                            format!("session {session_id:?} was removed during projection"),
+                            json!({"sessionId": session_id}),
+                        )
+                    })?;
+                    if !inputs.matches(record) {
+                        continue;
+                    }
+                    let mut new_events = prepared_events
+                        .into_iter()
+                        .map(|(event, view)| {
+                            let updates = record.metrics.apply_authoritative_web(&event);
+                            (event, updates, view)
+                        })
+                        .collect::<Vec<_>>();
+                    // Telemetry must retain original journal timestamps even
+                    // when the browser projection merges adjacent chunks.
+                    if let Some(update) = record.metrics.advance_performance_logged(
+                        &session.events()[inputs.cursor.unwrap_or_default() as usize..],
+                    ) {
+                        if let Some((_, updates, _)) = new_events.last_mut() {
+                            updates.push(update);
+                        }
+                    }
+                    record.apply_tail_update(
+                        tail,
+                        self.config.session_event_cache_capacity,
+                        self.config.session_event_cache_bytes,
+                    );
+                    record.projected_model = Some(record.model.clone());
+                    // Durable Runtime derives provider messages from the journal on demand.
+                    // Do not retain a second transcript for every idle conversation.
+                    record.messages.clear();
+                    let permission_changed = record.permission_preset != permission;
+                    record.permission_preset = permission;
+                    record.agent_preset = agent_preset;
+                    record.title = title;
+                    record.plan_active = plan_active;
+                    record.goal = goal.clone();
+                    let task_plan_changed = task_plan_update
+                        .as_ref()
+                        .is_some_and(|plan| record.task_plan != *plan);
+                    if let Some(plan) = task_plan_update.as_ref() {
+                        record.task_plan = plan.clone();
+                    }
+                    let schedules_changed = schedule_projection.as_ref().is_some_and(|catalog| {
+                        !record.schedules_hydrated || record.schedules != *catalog
+                    });
+                    if let Some(catalog) = schedule_projection.as_ref() {
+                        record.schedules = catalog.clone();
+                        record.schedules_hydrated = true;
+                    }
+                    record.mutation_receipts = mutation_receipts;
+                    let queue_changed = record.projected_queue != projected_queue;
+                    record.projected_queue = projected_queue;
+                    record.updated_at = session
+                        .events()
+                        .last()
+                        .map_or(record.created_at, |event| event.timestamp_ms);
+                    if has_turn {
+                        record.blank = false;
+                    }
+                    (
+                        new_events,
+                        queue_changed,
+                        permission_changed,
+                        schedules_changed,
+                        task_plan_changed,
+                    )
+                };
+                if let Some(goal) = goal.as_ref() {
+                    state.goals.insert(session_id.to_owned(), goal.clone());
+                } else {
+                    state.goals.remove(session_id);
+                }
+                state.enforce_projection_budget(
+                    session_id,
+                    self.config.session_event_cache_total_bytes,
+                );
+                (
+                    new_events,
+                    queue_changed,
+                    permission_changed,
+                    schedules_changed,
+                    task_plan_changed,
+                )
+            };
+            for (event, updates, view) in new_events {
+                let seq = event.get("seq").and_then(Value::as_u64).unwrap_or_default();
+                self.push_mux(EventGateway::session_event(session_id, event, view));
+                for update in updates {
+                    self.push_mux(EventGateway::projection(
+                        session_id,
+                        update.key,
+                        update.value,
+                        seq,
+                    ));
+                }
+            }
+            if queue_changed {
+                self.emit_queue(session_id).await;
+            }
+            if schedules_changed {
+                self.push_projection(
+                    session_id,
+                    "schedules",
+                    json!(schedule_projection.expect("changed schedule has a projection")),
+                )
+                .await;
+            }
+            self.push_projection(
+                session_id,
+                "goal",
+                goal.as_ref().map_or(Value::Null, |g| g.projection()),
+            )
+            .await;
+            if task_plan_changed {
+                self.push_projection(session_id, "taskPlan", json!(task_plan_update.flatten()))
+                    .await;
+            }
+            if permission_changed {
+                self.push_permission_projection(session_id).await;
+            }
+            if catalog_boundary {
+                self.publish_catalog_projection(&session).await;
+            }
+            return Ok(true);
+        }
+        Err(RpcError::internal(format!(
+            "authoritative session {session_id:?} changed repeatedly during projection; retry synchronization"
+        )))
+    }
+
+    /// Publish stable user-visible metadata from the already loaded durable
+    /// snapshot. The store compares its observed file stamp under the writer
+    /// lock, so a concurrent append cannot mark older work as safely idle.
+    async fn publish_catalog_projection(&self, session: &Session) {
+        let Some(store) = self.lazy_store.get() else {
+            return;
+        };
+        let route = restored_route(session, &self.config);
+        let (parent_session_id, origin, updated_at, blank, metric_snapshot) = {
+            let state = self.state.read().await;
+            let Some(record) = state.sessions.get(&session.header().id) else {
+                return;
+            };
+            (
+                record.parent_session_id.clone(),
+                record.origin.clone(),
+                record.updated_at,
+                record.blank,
+                (!record.restoring && record.next_event_seq() == session.next_seq())
+                    .then(|| record.metrics.catalog_snapshot()),
+            )
+        };
+        let needs_recovery = self
+            .agent_runtime
+            .needs_session_resume(session)
+            .unwrap_or(true)
+            || !session.pending_tool_approvals().is_empty()
+            || !session.recoverable_user_questions().is_empty()
+            || !xharness_session::incomplete_tool_calls(session.events()).is_empty()
+            || InboxProjection::from_session(session).map_or(true, |inbox| {
+                !inbox.next_turn().is_empty() || !inbox.next_step().is_empty()
+            });
+        let entry = SessionCatalogEntry {
+            header: session.header().clone(),
+            updated_at_ms: updated_at,
+            title: restored_title(session),
+            agent_preset: restored_agent_preset(session),
+            parent_session_id,
+            origin,
+            model_provider: route.provider,
+            model: route.model,
+            reasoning_effort: route.reasoning_effort,
+            context_window_tokens: route.context_window_tokens,
+            permission_preset: restored_permission(session).as_str().to_owned(),
+            plan_active: restored_plan_mode(session),
+            blank,
+            next_seq: session.next_seq(),
+            needs_recovery,
+            metric_snapshot,
+        };
+        let checkpoint = {
+            let state = self.state.read().await;
+            state
+                .sessions
+                .get(&session.header().id)
+                .and_then(|record| crate::restore_checkpoint::checkpoint(self, session, record))
+        };
+        if let Some(checkpoint) = checkpoint {
+            let _ = store.publish_recovery_checkpoint(checkpoint).await;
+        }
+        let presentation = {
+            let state = self.state.read().await;
+            state
+                .sessions
+                .get(&session.header().id)
+                .filter(|record| {
+                    !entry.needs_recovery
+                        && !record.restoring
+                        && record.next_event_seq() == session.next_seq()
+                })
+                .map(|record| xharness_session::HistoryPresentation {
+                    schema: crate::state::HISTORY_PRESENTATION_SCHEMA.to_owned(),
+                    values: record.history_presentation_values(),
+                })
+        };
+        let published = match presentation {
+            Some(presentation) => {
+                store
+                    .publish_catalog_presentation(entry, presentation)
+                    .await
+            }
+            None => store.publish_catalog_entry(entry).await,
+        };
+        if let Err(error) = published {
+            // The journal is authoritative. A failed or racing index write is
+            // repaired lazily on the next startup, never a model-loop failure.
+            eprintln!("xharness catalogue update skipped: {error}");
+        }
+    }
+
+    pub(crate) async fn append_session_event(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        data: Value,
+        surface_op: Option<&str>,
+    ) -> Result<Value, RpcError> {
+        let (event, metric_updates, view) = {
+            let mut state = self.state.write().await;
+            let session = state.sessions.get_mut(session_id).ok_or_else(|| {
+                rpc_error(
+                    RpcErrorCode::SessionNotFound,
+                    format!("session {session_id:?} was not found"),
+                    json!({"sessionId": session_id}),
+                )
+            })?;
+            let seq = session.next_event_seq();
+            let mut event = json!({
+                "type": event_type,
+                "seq": seq,
+                "time": now_ms(),
+                "data": data,
+            });
+            if let Some(surface_op) = surface_op {
+                event
+                    .as_object_mut()
+                    .expect("event is an object")
+                    .insert("surfaceOp".to_owned(), json!(surface_op));
+            }
+            if event_type == "turn/start" {
+                session.blank = false;
+            }
+            if event_type == "user/message" {
+                session.updated_at = now_ms();
+            }
+            session.event_cache_bytes = session
+                .event_cache_bytes
+                .saturating_add(serde_json::to_vec(&event).map_or(0, |encoded| encoded.len()));
+            session.events.push(event.clone());
+            let metric_updates = session.metrics.apply(&event);
+            let view = EventGateway::live_view(&event, &session.events);
+            (event, metric_updates, view)
+        };
+        let seq = event.get("seq").and_then(Value::as_u64).unwrap_or_default();
+        self.push_mux(EventGateway::session_event(session_id, event.clone(), view));
+        for update in metric_updates {
+            self.push_mux(EventGateway::projection(
+                session_id,
+                update.key,
+                update.value,
+                seq,
+            ));
+        }
+        Ok(event)
+    }
+
+    pub(crate) async fn push_projection(&self, session_id: &str, key: &str, value: Value) {
+        let seq = self
+            .state
+            .read()
+            .await
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.last_event_seq());
+        if let Some(seq) = seq {
+            self.push_mux(EventGateway::projection(session_id, key, value, seq));
+        }
+    }
+
+    pub(crate) async fn emit_queue(&self, session_id: &str) {
+        let items = self
+            .state
+            .read()
+            .await
+            .sessions
+            .get(session_id)
+            .map_or_else(Vec::new, |session| session.queue_view());
+        self.push_mux(EventGateway::queue(session_id, items));
+    }
+
+    pub(crate) async fn enqueue_prompt(&self, admission: PromptAdmission) -> Result<(), RpcError> {
+        let PromptAdmission {
+            rpc_id,
+            session_id,
+            mode,
+            text,
+            content,
+            source,
+            fingerprint,
+        } = admission;
+        let _ = prompt_message(rpc_id.as_str(), &text, &content)?;
+        let session_id = session_id.as_str();
+        // Only an explicit user prompt resumes a stopped admission gate.
+        if source.get("kind").and_then(Value::as_str) == Some("user") {
+            self.set_dispatch_paused(session_id, false).await?;
+        } else if matches!(
+            source.get("kind").and_then(Value::as_str),
+            Some("job-settlement" | "agent-settlement")
+        ) {
+            if let Some(cut) = self
+                .agent_runtime
+                .authoritative_session(session_id)
+                .await
+                .map_err(agent_runtime_error)?
+            {
+                let inbox = InboxProjection::from_session(&cut)
+                    .map_err(|e| RpcError::internal(e.to_string()))?;
+                if cut.dispatch_paused()
+                    && !inbox
+                        .next_turn()
+                        .iter()
+                        .any(xharness_session::InboxMessage::is_user_authored)
+                {
+                    self.set_dispatch_paused(session_id, true).await?;
+                }
+            }
+        }
+        let mode = mode.as_str();
+        let (steer_control, admission_request) = {
+            let state = self.state.read().await;
+            let session = state.sessions.get(session_id).ok_or_else(|| {
+                rpc_error(
+                    RpcErrorCode::SessionNotFound,
+                    format!("session {session_id:?} was not found"),
+                    json!({"sessionId": session_id}),
+                )
+            })?;
+            let route = ModelRoute {
+                provider: session.model.provider.clone(),
+                model: session.model.model.clone(),
+                reasoning_effort: session.model.reasoning_effort.clone(),
+                context_window_tokens: session.model.context_window_tokens,
+            };
+            if !self.agent_runtime.can_route(&route) {
+                return Err(rpc_error(
+                    RpcErrorCode::ModelUnavailable,
+                    format!(
+                        "model route {}/{} is unavailable",
+                        route.provider, route.model
+                    ),
+                    json!({"provider": route.provider, "model": route.model}),
+                ));
+            }
+            if mode == "steer"
+                && session.running
+                && !self.agent_runtime.has_authoritative_sessions()
+            {
+                (session.control.clone(), None)
+            } else {
+                let mut messages = session.messages.clone();
+                messages.push(prompt_message(rpc_id.as_str(), &text, &content)?);
+                (
+                    None,
+                    Some((
+                        AgentTurnRequest {
+                            session_id: session_id.to_owned(),
+                            cwd: session.cwd.clone(),
+                            route,
+                            permission: session.permission_preset,
+                            prompt: None,
+                            messages,
+                            input_metadata: Some(json!({
+                                "content": content.clone(),
+                                "source": source.clone(),
+                                "rpcFingerprint": fingerprint.clone(),
+                                "rpcSessionId": session_id,
+                            })),
+                        },
+                        state
+                            .prompt_sections(session_id)
+                            .map_err(RpcError::internal)?,
+                    )),
+                )
+            }
+        };
+
+        if let Some(control) = steer_control {
+            let message = prompt_message(rpc_id.as_str(), &text, &content)?;
+            let (acknowledgement, accepted) = oneshot::channel();
+            control
+                .send(DriverCommand {
+                    command: LoopCommand::Steer(message),
+                    input_metadata: Some(json!({
+                        "content": content.clone(),
+                        "source": source.clone(),
+                        "rpcFingerprint": fingerprint.clone(),
+                        "rpcSessionId": session_id,
+                    })),
+                    acknowledgement,
+                })
+                .await
+                .map_err(|_| {
+                    rpc_error(
+                        RpcErrorCode::SteerUnavailable,
+                        "the active turn stopped before steering was admitted",
+                        json!({"sessionId": session_id}),
+                    )
+                })?;
+            accepted
+                .await
+                .map_err(|_| {
+                    rpc_error(
+                        RpcErrorCode::SteerUnavailable,
+                        "the active turn closed before steering was applied",
+                        json!({"sessionId": session_id}),
+                    )
+                })?
+                .map_err(|error| {
+                    rpc_error(
+                        RpcErrorCode::SteerUnavailable,
+                        error.to_string(),
+                        json!({"sessionId": session_id}),
+                    )
+                })?;
+            {
+                let mut state = self.state.write().await;
+                if let Some(session) = state.sessions.get_mut(session_id) {
+                    session.admissions.insert(
+                        rpc_id.as_str().to_owned(),
+                        crate::admission_cache::AdmissionReceipt { fingerprint },
+                    );
+                }
+            }
+            if !self.sync_authoritative_session(session_id).await? {
+                self.append_session_event(
+                    session_id,
+                    "user/message",
+                    web_user_message(&self.mint_id("message"), content, source),
+                    Some("append"),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+
+        if let Some((mut admission_request, sections)) = admission_request {
+            // A live steer keeps the current turn's immutable prompt. If the
+            // actor has already finished, its new-turn factory captures fresh
+            // rules before any provider I/O. Do not reload workspace files just
+            // to decide which side of that actor boundary receives this input.
+            if mode != "steer" || !self.agent_runtime.has_authoritative_sessions() {
+                admission_request.prompt = Some(
+                    self.assemble_prompt(admission_request.cwd.clone(), sections)
+                        .await
+                        .map_err(RpcError::internal)?,
+                );
+            }
+            // A durable runtime flushes this input before returning. Only
+            // after that receipt may the Web API acknowledge session.prompt.
+            // Ephemeral runtimes implement this as a no-op and retain the
+            // legacy Host-owned queue behavior.
+            if mode == "steer" {
+                self.agent_runtime.admit_steering(admission_request).await
+            } else {
+                self.agent_runtime.admit_turn(admission_request).await
+            }
+            .map_err(agent_runtime_error)?;
+        }
+
+        let mut start_driver = None;
+        {
+            let mut state = self.state.write().await;
+            let session = state.sessions.get_mut(session_id).ok_or_else(|| {
+                rpc_error(
+                    RpcErrorCode::SessionNotFound,
+                    format!("session {session_id:?} was not found"),
+                    json!({"sessionId": session_id}),
+                )
+            })?;
+            session.queue.push_back(QueuedPrompt {
+                id: rpc_id.as_str().to_owned(),
+                text: text.clone(),
+                content: content.clone(),
+                source: source.clone(),
+                fingerprint: fingerprint.clone(),
+                placement: QueuePlacement::Queued,
+            });
+            session.admissions.insert(
+                rpc_id.as_str().to_owned(),
+                crate::admission_cache::AdmissionReceipt { fingerprint },
+            );
+            if !session.running && !session.dispatch_paused {
+                let (control_tx, control_rx) = mpsc::channel(64);
+                session.running = true;
+                session.control = Some(control_tx);
+                start_driver = Some(control_rx);
+            }
+        }
+        if !self.sync_authoritative_session(session_id).await? {
+            self.emit_queue(session_id).await;
+        }
+        if let Some(control_rx) = start_driver {
+            self.push_host(json!({
+                "type": "host/session-status",
+                "sessionId": session_id,
+                "running": true,
+            }));
+            let host = self.clone();
+            let session_id = session_id.to_owned();
+            tokio::spawn(async move { host.drive_session(session_id, control_rx).await });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn drive_session(
+        self,
+        session_id: String,
+        mut control_rx: mpsc::Receiver<DriverCommand>,
+    ) {
+        loop {
+            // Serialize the pause check, gate commit and runtime handoff with
+            // queue edits and prompt admission. Never keep this guard while
+            // consuming model/tool events. A steering RPC can itself hold the
+            // admission lock while waiting for our acknowledgement; reject it
+            // at this idle boundary instead of deadlocking lock acquisition.
+            let admission = self.lock_admission(&session_id);
+            tokio::pin!(admission);
+            let admission_guard = loop {
+                tokio::select! {
+                    guard = &mut admission => break guard,
+                    Some(command) = control_rx.recv() => {
+                        let _ = command.acknowledgement.send(Err(xharness_core::LoopControlError::Closed));
+                    }
+                }
+            };
+            let (mut paused, queued_user_prompt) = {
+                let state = self.state.read().await;
+                let Some(record) = state.sessions.get(&session_id) else {
+                    return;
+                };
+                (record.dispatch_paused, record.has_queued_user_prompt())
+            };
+            self.queue_title(&session_id);
+            let resuming = paused && queued_user_prompt;
+            if paused {
+                // An explicit stop ends the current turn; it never discards a
+                // queued user prompt (`docs/specs/host.md`). Reopen the gate so
+                // that prompt starts the next turn, exactly like a prompt
+                // admitted after the stop. Internal receipts project as context
+                // and keep the gate shut.
+                if queued_user_prompt {
+                    match self.set_dispatch_paused(&session_id, false).await {
+                        Ok(()) => paused = false,
+                        Err(error) => {
+                            self.push_host(json!({
+                                "type": "host/agent-error",
+                                "sessionId": session_id,
+                                "message": error.message,
+                            }));
+                        }
+                    }
+                }
+            }
+            if paused {
+                let mut state = self.state.write().await;
+                if let Some(record) = state.sessions.get_mut(&session_id) {
+                    record.running = false;
+                    record.control = None;
+                }
+                drop(state);
+                self.push_permission_projection(&session_id).await;
+                self.push_host(
+                    json!({"type":"host/session-status","sessionId":session_id,"running":false}),
+                );
+                return;
+            }
+            let next = {
+                let mut state = self.state.write().await;
+                state.sessions.get_mut(&session_id).and_then(|session| {
+                    if resuming {
+                        // Claim the user input that authorized resumption,
+                        // not an older internal receipt ahead of it.
+                        let index = session.queue.iter().position(|item| {
+                            item.user_mutable() && item.ui_placement() == QueuePlacement::Queued
+                        })?;
+                        session.queue.remove(index)
+                    } else {
+                        session.queue.pop_front()
+                    }
+                })
+            };
+            let Some(prompt) = next else {
+                let mut state = self.state.write().await;
+                if let Some(session) = state.sessions.get_mut(&session_id) {
+                    if !session.queue.is_empty() {
+                        continue;
+                    }
+                    session.running = false;
+                    session.control = None;
+                }
+                drop(state);
+                self.emit_queue(&session_id).await;
+                self.push_permission_projection(&session_id).await;
+                self.push_host(json!({
+                    "type": "host/session-status",
+                    "sessionId": session_id,
+                    "running": false,
+                }));
+                return;
+            };
+            self.emit_queue(&session_id).await;
+            let work_id = prompt.id.clone();
+            if let Err(error) = self
+                .run_turn(&session_id, prompt, &mut control_rx, admission_guard)
+                .await
+            {
+                if let Err(persist_error) = self
+                    .record_delegation_failure(&session_id, &work_id, &error.message)
+                    .await
+                {
+                    self.push_host(json!({"type":"host/agent-error","sessionId":session_id,"message":persist_error.message}));
+                }
+                self.push_host(json!({
+                    "type": "host/agent-error",
+                    "sessionId": session_id,
+                    "message": error.message,
+                }));
+            }
+        }
+    }
+
+    /// Project a turn that was already open at process death and reattached
+    /// by the durable runtime. It deliberately bypasses the prompt queue: the
+    /// original user input, assistant tool call and approval ask are already
+    /// authoritative Session facts. Once recovery settles, normal queued
+    /// turns continue through the same control channel.
+    pub(crate) async fn drive_recovered_turn(
+        self,
+        session_id: String,
+        mut run: Box<dyn RunningTurn>,
+        mut control_rx: mpsc::Receiver<DriverCommand>,
+    ) {
+        let outcome = async {
+            loop {
+                tokio::select! {
+                    event = run.next_event() => match event {
+                        Some(event) => {
+                            self.sync_authoritative_session(&session_id).await?;
+                            self.project_authoritative_control_event(&session_id, event).await?;
+                        }
+                        None => break,
+                    },
+                    command = control_rx.recv() => {
+                        if let Some(command) = command {
+                            let result = run
+                                .send_with_metadata(command.command, command.input_metadata)
+                                .await;
+                            let _ = command.acknowledgement.send(result);
+                        }
+                    }
+                }
+            }
+            let _ = run.result().await;
+            self.sync_authoritative_session(&session_id).await?;
+            self.state
+                .write()
+                .await
+                .pending
+                .retain(|_, pending| match pending {
+                    PendingResponse::Approval { session_id: id, .. } => id != &session_id,
+                });
+            Ok::<(), RpcError>(())
+        }
+        .await;
+        if let Err(error) = outcome {
+            self.push_host(json!({
+                "type": "host/agent-error",
+                "sessionId": session_id,
+                "message": error.message,
+            }));
+        }
+        self.drive_session(session_id, control_rx).await;
+    }
+
+    /// Project a runtime-originated turn while an existing Host driver owns
+    /// the session control channel. Targeted durable event receivers keep this
+    /// projection independent from the user turn that follows it.
+    async fn drive_background_projection(self, session_id: String, mut run: Box<dyn RunningTurn>) {
+        let outcome = async {
+            while let Some(event) = run.next_event().await {
+                self.sync_authoritative_session(&session_id).await?;
+                self.project_authoritative_control_event(&session_id, event)
+                    .await?;
+            }
+            let _ = run.result().await;
+            self.sync_authoritative_session(&session_id).await?;
+            Ok::<(), RpcError>(())
+        }
+        .await;
+        if let Err(error) = outcome {
+            self.push_host(json!({
+                "type": "host/agent-error",
+                "sessionId": session_id,
+                "message": error.message,
+            }));
+        }
+    }
+
+    async fn run_turn(
+        &self,
+        session_id: &str,
+        prompt: QueuedPrompt,
+        control_rx: &mut mpsc::Receiver<DriverCommand>,
+        admission_guard: OwnedMutexGuard<()>,
+    ) -> Result<(), RpcError> {
+        let authoritative = self.sync_authoritative_session(session_id).await?;
+        let (permission, assembled_prompt) = if authoritative {
+            // The durable driver may already own a started/queued turn. Only
+            // its factory may publish the active snapshot, never this observer.
+            let state = self.state.read().await;
+            let session = state
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| RpcError::internal("session disappeared"))?;
+            (session.permission_preset, None)
+        } else {
+            let (permission, prompt) = self.capture_turn_permission(session_id).await?;
+            (permission, Some(prompt))
+        };
+        let (turn, cwd, route, messages) = {
+            let mut state = self.state.write().await;
+            let session = state.sessions.get_mut(session_id).ok_or_else(|| {
+                rpc_error(
+                    RpcErrorCode::SessionNotFound,
+                    "session disappeared while starting its turn",
+                    json!({"sessionId": session_id}),
+                )
+            })?;
+            let turn = session.next_turn;
+            session.next_turn = session.next_turn.saturating_add(1);
+            session
+                .messages
+                .push(prompt_message(&prompt.id, &prompt.text, &prompt.content)?);
+            (
+                turn,
+                session.cwd.clone(),
+                ModelRoute {
+                    provider: session.model.provider.clone(),
+                    model: session.model.model.clone(),
+                    reasoning_effort: session.model.reasoning_effort.clone(),
+                    context_window_tokens: session.model.context_window_tokens,
+                },
+                session.messages.clone(),
+            )
+        };
+
+        if !authoritative {
+            self.append_session_event(
+                session_id,
+                "turn/start",
+                json!({
+                    "turn": turn,
+                    "trigger": {"kind": "message", "source": {"kind": "user"}},
+                }),
+                None,
+            )
+            .await?;
+            self.append_session_event(
+                session_id,
+                "user/message",
+                web_user_message(&prompt.id, prompt.content, prompt.source),
+                Some("append"),
+            )
+            .await?;
+        }
+
+        let mut run = self
+            .agent_runtime
+            .start_turn(AgentTurnRequest {
+                session_id: session_id.to_owned(),
+                cwd,
+                route,
+                permission,
+                prompt: assembled_prompt,
+                messages,
+                input_metadata: None,
+            })
+            .await
+            .map_err(agent_runtime_error)?;
+        // Runtime now owns the input. Queue mutation can no longer withdraw
+        // the user authorization underneath a paused-to-running transition.
+        drop(admission_guard);
+        let mut current_step = None;
+
+        loop {
+            tokio::select! {
+                event = run.next_event() => match event {
+                    Some(event) => {
+                        if authoritative {
+                            match event.kind {
+                                // These fragments are still inside the Core's
+                                // bounded journal batch. The following
+                                // StreamCheckpoint (or any terminal/control
+                                // boundary) refreshes them with authoritative
+                                // sequence coordinates in one store read.
+                                LoopEventKind::TextDelta(_)
+                                | LoopEventKind::ReasoningDelta(_)
+                                | LoopEventKind::ToolCallDelta { .. } => {}
+                                _ => {
+                                    self.sync_authoritative_session(session_id).await?;
+                                    self.project_authoritative_control_event(session_id, event).await?;
+                                }
+                            }
+                        } else {
+                            self.project_loop_event(session_id, turn, &mut current_step, event)
+                                .await?;
+                        }
+                    }
+                    None => break,
+                },
+                command = control_rx.recv() => {
+                    if let Some(command) = command {
+                        let result = run
+                            .send_with_metadata(command.command, command.input_metadata)
+                            .await;
+                        let _ = command.acknowledgement.send(result);
+                    }
+                }
+            }
+        }
+
+        let result = run.result().await;
+        if authoritative {
+            if result.status == LoopStatus::Failed {
+                self.record_delegation_failure(
+                    session_id,
+                    &prompt.id,
+                    result.error.as_deref().unwrap_or("child turn failed"),
+                )
+                .await?;
+            }
+            self.sync_authoritative_session(session_id).await?;
+            self.state
+                .write()
+                .await
+                .pending
+                .retain(|_, pending| match pending {
+                    PendingResponse::Approval { session_id: id, .. } => id != session_id,
+                });
+            return Ok(());
+        }
+        let final_reasoning = result
+            .messages
+            .last()
+            .filter(|m| {
+                m.role == Role::Assistant
+                    && (result.status == LoopStatus::Completed || m.interrupted)
+                    && (result.final_text == m.content || result.status == LoopStatus::Completed)
+            })
+            .map_or("", |m| m.reasoning.as_str());
+        if !result.final_text.is_empty() || !final_reasoning.is_empty() {
+            let model = self
+                .state
+                .read()
+                .await
+                .sessions
+                .get(session_id)
+                .map(|session| session.model.clone())
+                .expect("session exists while driver owns it");
+            let step = current_step.unwrap_or_else(|| {
+                result
+                    .step_usage
+                    .last()
+                    .map_or(0, |usage| usage.step.try_into().unwrap_or(u32::MAX))
+            });
+            let mut data = json!({
+                "turn": turn,
+                "step": step,
+                "message": web_assistant_message(
+                    &self.mint_id("message"),
+                    &result.final_text,
+                    final_reasoning,
+                    &model.provider,
+                    &model.model,
+                ),
+            });
+            if result.status != LoopStatus::Completed {
+                data["interrupted"] = json!(true);
+            }
+            if let Some(usage) = &result.usage {
+                data.as_object_mut()
+                    .expect("assistant data is object")
+                    .insert("usage".to_owned(), web_token_usage_from_core(usage));
+            }
+            self.append_session_event(session_id, "assistant/message", data, Some("append"))
+                .await?;
+        }
+        if let Some(step) = current_step {
+            self.append_session_event(
+                session_id,
+                "step/end",
+                json!({"turn": turn, "step": step}),
+                None,
+            )
+            .await?;
+        }
+        {
+            let mut state = self.state.write().await;
+            if let Some(session) = state.sessions.get_mut(session_id) {
+                // System Prompt is a per-request assembly captured by the
+                // Request Header, not transcript history or the next turn's
+                // mutable message cache.
+                session.messages = result
+                    .messages
+                    .iter()
+                    .filter(|message| message.role != Role::System)
+                    .cloned()
+                    .collect();
+            }
+            state.pending.retain(|_, pending| match pending {
+                PendingResponse::Approval { session_id: id, .. } => id != session_id,
+            });
+        }
+        let terminal = xharness_projection::wire::TurnEndData::from_loop(
+            turn,
+            result.status,
+            result.error.as_deref(),
+        );
+        self.append_session_event(
+            session_id,
+            "turn/end",
+            serde_json::to_value(terminal).expect("turn end DTO contains only serializable fields"),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn project_authoritative_control_event(
+        &self,
+        session_id: &str,
+        event: LoopEvent,
+    ) -> Result<(), RpcError> {
+        match event.kind {
+            LoopEventKind::InputCommitted => self.queue_title(session_id),
+            LoopEventKind::ToolApprovalRequested { approval_id, call } => {
+                self.register_tool_approval(session_id, approval_id, call)
+                    .await?;
+            }
+            LoopEventKind::ToolApprovalResolved {
+                approval_id,
+                call,
+                approved,
+                cancelled,
+                reason: _,
+            } => {
+                self.state.write().await.pending.retain(|_, p| match p {
+                    PendingResponse::Approval {
+                        session_id: id,
+                        approval_id: aid,
+                        ..
+                    } => !(id == session_id && aid == &approval_id),
+                });
+                self.push_mux(json!({
+                    "type": "approval/resolved",
+                    "sessionId": session_id,
+                    "approvalId": approval_id,
+                    "callId": call.id,
+                    "outcome": if cancelled { "cancelled" } else if approved { "allowed-once" } else { "rejected" },
+                }));
+            }
+            LoopEventKind::RunFailed { error } => {
+                self.push_host(json!({
+                    "type": "host/agent-error",
+                    "sessionId": session_id,
+                    "message": error,
+                }));
+            }
+            LoopEventKind::EventsLagged { missed, resume_seq } => {
+                self.push_host(json!({
+                    "type": "host/agent-error",
+                    "sessionId": session_id,
+                    "message": format!(
+                        "live loop projection lagged by {missed} events; durable history was resynchronized from cursor {resume_seq}"
+                    ),
+                }));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn ensure_step(
+        &self,
+        session_id: &str,
+        turn: u32,
+        current_step: &mut Option<u32>,
+        step: usize,
+    ) -> Result<(), RpcError> {
+        let step = u32::try_from(step).unwrap_or(u32::MAX);
+        if *current_step != Some(step) {
+            if let Some(previous) = *current_step {
+                self.append_session_event(
+                    session_id,
+                    "step/end",
+                    json!({"turn": turn, "step": previous}),
+                    None,
+                )
+                .await?;
+            }
+            self.append_session_event(
+                session_id,
+                "step/start",
+                json!({"turn": turn, "step": step}),
+                None,
+            )
+            .await?;
+            *current_step = Some(step);
+        }
+        Ok(())
+    }
+
+    async fn project_loop_event(
+        &self,
+        session_id: &str,
+        turn: u32,
+        current_step: &mut Option<u32>,
+        event: LoopEvent,
+    ) -> Result<(), RpcError> {
+        self.ensure_step(session_id, turn, current_step, event.step)
+            .await?;
+        let step = u32::try_from(event.step).unwrap_or(u32::MAX);
+        match event.kind {
+            LoopEventKind::ExecutionNotice(notice) => {
+                self.append_session_event(
+                    session_id,
+                    "run/checkpoint",
+                    xharness_projection::web_execution_notice(turn, Some(&notice)),
+                    None,
+                )
+                .await?;
+            }
+            LoopEventKind::TextDelta(text) => {
+                self.append_session_event(
+                    session_id,
+                    "assistant/chunk",
+                    json!({
+                        "turn": turn,
+                        "step": step,
+                        "chunk": xharness_projection::text_delta(&text),
+                    }),
+                    None,
+                )
+                .await?;
+            }
+            LoopEventKind::ReasoningDelta(text) => {
+                self.append_session_event(
+                    session_id,
+                    "assistant/chunk",
+                    json!({
+                        "turn": turn,
+                        "step": step,
+                        "chunk": xharness_projection::reasoning_delta(&text),
+                    }),
+                    None,
+                )
+                .await?;
+            }
+            LoopEventKind::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                self.append_session_event(
+                    session_id,
+                    "assistant/chunk",
+                    json!({
+                        "turn": turn,
+                        "step": step,
+                        "chunk": xharness_projection::tool_delta(index, &id, &name, &arguments_delta),
+                    }),
+                    None,
+                )
+                .await?;
+            }
+            LoopEventKind::ToolStarted(call) => {
+                self.append_session_event(
+                    session_id,
+                    "tool/call",
+                    json!({
+                        "turn": turn,
+                        "step": step,
+                        "callId": call.id,
+                        "name": call.name,
+                        "arguments": call.arguments_json,
+                    }),
+                    None,
+                )
+                .await?;
+            }
+            LoopEventKind::ToolCompleted { call, result } => {
+                self.append_session_event(
+                    session_id,
+                    "tool/result",
+                    json!({
+                        "turn": turn,
+                        "step": step,
+                        "message": {
+                            "id": self.mint_id("message"),
+                            "role": "user",
+                            "content": [{
+                                "type": "tool-result",
+                                "toolCallId": call.id,
+                                "content": xharness_projection::web_tool_content(if result.ok {&result.content} else {&result.error}, result.metadata.as_ref()),
+                                "isError": !result.ok,
+                            }],
+                            "source": {"kind": "tool", "callId": call.id},
+                        },
+                    }),
+                    Some("append"),
+                )
+                .await?;
+            }
+            LoopEventKind::ToolApprovalRequested { approval_id, call } => {
+                self.append_session_event(
+                    session_id,
+                    "approval/asked",
+                    json!({
+                        "id": approval_id,
+                        "toolName": call.name,
+                        "callId": call.id,
+                        "reason": "This tool requires explicit approval.",
+                    }),
+                    None,
+                )
+                .await?;
+                self.register_tool_approval(session_id, approval_id, call)
+                    .await?;
+            }
+            LoopEventKind::ToolApprovalResolved {
+                approval_id,
+                call,
+                approved,
+                cancelled,
+                reason: _,
+            } => {
+                self.state.write().await.pending.retain(|_, p| match p {
+                    PendingResponse::Approval {
+                        session_id: id,
+                        approval_id: aid,
+                        ..
+                    } => !(id == session_id && aid == &approval_id),
+                });
+                self.append_session_event(
+                    session_id,
+                    "approval/decided",
+                    json!({
+                        "id": approval_id,
+                        "outcome": if cancelled { "cancelled" } else if approved { "allowed-once" } else { "rejected" },
+                    }),
+                    None,
+                )
+                .await?;
+                self.push_mux(json!({
+                    "type": "approval/resolved",
+                    "sessionId": session_id,
+                    "approvalId": approval_id,
+                    "callId": call.id,
+                    "outcome": if cancelled { "cancelled" } else if approved { "allowed-once" } else { "rejected" },
+                }));
+            }
+            LoopEventKind::ModelRetry {
+                retry_id,
+                policy_key,
+                attempt,
+                max_retries,
+                error,
+                delay_ms,
+            } => {
+                self.append_session_event(
+                    session_id,
+                    "llm/retry",
+                    json!({
+                        "retryId": retry_id,
+                        "turn": turn,
+                        "step": step,
+                        "provider": self.config.provider_id,
+                        "mode": if max_retries.is_some() { "normal" } else { "always" },
+                        "policyKey": policy_key,
+                        "retry": attempt,
+                        "maxRetries": max_retries,
+                        "delayMs": delay_ms,
+                        "failure": {"code": "TRANSPORT", "message": error},
+                    }),
+                    None,
+                )
+                .await?;
+            }
+            LoopEventKind::ModelRetryStarted { retry_id, attempt } => {
+                self.append_session_event(
+                    session_id,
+                    "llm/retry-started",
+                    json!({
+                        "retryId": retry_id,
+                        "turn": turn,
+                        "step": step,
+                        "retry": attempt,
+                    }),
+                    None,
+                )
+                .await?;
+            }
+            LoopEventKind::RunFailed { error } => {
+                self.push_host(json!({
+                    "type": "host/agent-error",
+                    "sessionId": session_id,
+                    "message": error,
+                }));
+            }
+            LoopEventKind::EventsLagged { missed, resume_seq } => {
+                return Err(RpcError::internal(format!(
+                    "ephemeral loop projection lagged by {missed} events; resume cursor is {resume_seq}"
+                )));
+            }
+            LoopEventKind::InputCommitted
+            | LoopEventKind::OutputContinuationScheduled { .. }
+            | LoopEventKind::MessageInjected { .. }
+            | LoopEventKind::StreamCheckpoint
+            | LoopEventKind::RunPaused
+            | LoopEventKind::RunResumed
+            | LoopEventKind::ModelInterrupted
+            | LoopEventKind::RunCompleted { .. }
+            | LoopEventKind::RunMaxTokens { .. }
+            | LoopEventKind::RunCancelled
+            | LoopEventKind::LimitReached => {}
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn rpc_error(
+    code: RpcErrorCode,
+    message: impl Into<String>,
+    details: Value,
+) -> RpcError {
+    RpcError {
+        code,
+        message: message.into(),
+        details,
+    }
+}
+
+pub(crate) fn agent_runtime_error(error: AgentRuntimeError) -> RpcError {
+    match error {
+        AgentRuntimeError::ModelUnavailable { provider, model } => rpc_error(
+            RpcErrorCode::ModelUnavailable,
+            format!("model route {provider}/{model} is unavailable"),
+            json!({"provider": provider, "model": model}),
+        ),
+        AgentRuntimeError::Preparation { message } => {
+            RpcError::internal(format!("could not prepare agent turn: {message}"))
+        }
+    }
+}
+
+pub(crate) fn web_user_message(id: &str, content: Vec<Value>, source: Value) -> Value {
+    json!({
+        "id": id,
+        "role": "user",
+        "content": content,
+        "source": source,
+    })
+}
+
+fn web_assistant_message(
+    id: &str,
+    text: &str,
+    reasoning: &str,
+    provider: &str,
+    model: &str,
+) -> Value {
+    json!({
+        "id": id,
+        "role": "assistant",
+        "content": xharness_projection::assistant_content(text, reasoning),
+        "source": {"kind": "model", "provider": provider, "model": model},
+    })
+}
+
+fn prompt_message(id: &str, text: &str, content: &[Value]) -> Result<AgentMessage, RpcError> {
+    let mut message = AgentMessage::new(Role::User, text).with_id(id.to_owned());
+    if !content.iter().any(|p| {
+        p.get("type").and_then(Value::as_str) == Some("image")
+            || p.get("type").and_then(Value::as_str) == Some("file")
+    }) {
+        return Ok(message);
+    }
+    let mut blocks = Vec::new();
+    for part in content {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => blocks.push(xharness_session::ContentBlock::Text {
+                text: part["text"].as_str().unwrap_or_default().to_owned(),
+            }),
+            Some(kind @ ("image" | "file")) => {
+                let reference = serde_json::from_value(part["attachment"]["reference"].clone())
+                    .map_err(|_| {
+                        rpc_error(
+                            RpcErrorCode::AttachmentError,
+                            "legacy attachment bytes unavailable; reattach the image",
+                            json!({"reason":"REATTACH_REQUIRED"}),
+                        )
+                    })?;
+                blocks.push(if kind == "file" {
+                    xharness_session::ContentBlock::File {
+                        attachment: reference,
+                        name: part["attachment"]["name"].as_str().map(str::to_owned),
+                    }
+                } else {
+                    xharness_session::ContentBlock::Image {
+                        attachment: reference,
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+    message = message.with_content_blocks(blocks);
+    Ok(message)
+}
+
+#[cfg(test)]
+mod listener_lifetime_tests {
+    use super::*;
+    use crate::{runtime::AgentRuntime, HostConfig};
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
+    use xharness_schedule::ScheduleDeliveryNotice;
+
+    struct NoticesRuntime {
+        notices: broadcast::Sender<ScheduleDeliveryNotice>,
+        changes: broadcast::Sender<String>,
+        entered: CancellationToken,
+        release: CancellationToken,
+    }
+    impl NoticesRuntime {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                notices: broadcast::channel(2).0,
+                changes: broadcast::channel(2).0,
+                entered: CancellationToken::new(),
+                release: CancellationToken::new(),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentRuntime for NoticesRuntime {
+        fn has_available_route(&self) -> bool {
+            false
+        }
+        fn can_route(&self, _: &ModelRoute) -> bool {
+            false
+        }
+        fn subscribe_background_turns(
+            &self,
+        ) -> Option<broadcast::Receiver<ScheduleDeliveryNotice>> {
+            Some(self.notices.subscribe())
+        }
+        fn subscribe_goal_changes(&self) -> Option<broadcast::Receiver<String>> {
+            Some(self.changes.subscribe())
+        }
+        async fn take_resumed_turn(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<Box<dyn RunningTurn>>, AgentRuntimeError> {
+            self.entered.cancel();
+            self.release.cancelled().await;
+            Ok(None)
+        }
+        async fn start_turn(
+            &self,
+            _: AgentTurnRequest,
+        ) -> Result<Box<dyn RunningTurn>, AgentRuntimeError> {
+            unreachable!("listener must not start a new model turn")
+        }
+    }
+    fn host(runtime: Arc<NoticesRuntime>) -> Arc<BasicHost> {
+        let host = BasicHost::with_agent_runtime(HostConfig::new(std::env::temp_dir()), runtime);
+        host.start_background_turn_listener();
+        host
+    }
+    async fn eventually(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener did not release its owners/receiver");
+    }
+    fn notice() -> ScheduleDeliveryNotice {
+        ScheduleDeliveryNotice {
+            session_id: "test".into(),
+            work_id: "pending".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_drop_releases_host_and_both_receivers_with_runtime_alive() {
+        let runtime = NoticesRuntime::new();
+        for _ in 0..32 {
+            let host = host(runtime.clone());
+            host.start_background_turn_listener(); // idempotent registration
+            assert_eq!(runtime.notices.receiver_count(), 1);
+            assert_eq!(runtime.changes.receiver_count(), 1);
+            let weak = Arc::downgrade(&host);
+            let state = Arc::downgrade(&host.state);
+            tokio::task::yield_now().await;
+            drop(host);
+            eventually(|| {
+                weak.upgrade().is_none()
+                    && state.upgrade().is_none()
+                    && runtime.notices.receiver_count() == 0
+                    && runtime.changes.receiver_count() == 0
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_wakes_idle_receivers_without_dropping_host() {
+        let runtime = NoticesRuntime::new();
+        let host = host(runtime.clone());
+        host.stop_background_listeners();
+        host.stop_background_listeners();
+        eventually(|| {
+            runtime.notices.receiver_count() == 0 && runtime.changes.receiver_count() == 0
+        })
+        .await;
+        host.start_background_turn_listener();
+        assert_eq!(runtime.notices.receiver_count(), 0);
+        assert!(runtime.notices.send(notice()).is_err());
+    }
+
+    #[tokio::test]
+    async fn in_flight_notification_releases_host_after_settling() {
+        let runtime = NoticesRuntime::new();
+        let host = host(runtime.clone());
+        let weak = Arc::downgrade(&host);
+        runtime.notices.send(notice()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), runtime.entered.cancelled())
+            .await
+            .unwrap();
+        drop(host);
+        assert!(
+            weak.upgrade().is_some(),
+            "in-flight processing temporarily owns Host"
+        );
+        runtime.release.cancel();
+        eventually(|| {
+            weak.upgrade().is_none()
+                && runtime.notices.receiver_count() == 0
+                && runtime.changes.receiver_count() == 0
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lagged_and_queued_events_cannot_keep_a_dropped_host_alive() {
+        let runtime = NoticesRuntime::new();
+        let host = host(runtime.clone());
+        let weak = Arc::downgrade(&host);
+        // Current-thread runtime: fill channels before the listeners can poll.
+        for _ in 0..64 {
+            runtime.notices.send(notice()).unwrap();
+            runtime.changes.send("test".into()).unwrap();
+        }
+        drop(host);
+        eventually(|| {
+            weak.upgrade().is_none()
+                && runtime.notices.receiver_count() == 0
+                && runtime.changes.receiver_count() == 0
+        })
+        .await;
+        assert!(
+            !runtime.entered.is_cancelled(),
+            "stale notices must not admit work"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_one_value_clone_does_not_stop_another_owner() {
+        let runtime = NoticesRuntime::new();
+        let host = host(runtime.clone());
+        let clone = host.as_ref().clone();
+        drop(clone);
+        tokio::task::yield_now().await;
+        assert_eq!(runtime.notices.receiver_count(), 1);
+        host.stop_background_listeners();
+        eventually(|| {
+            runtime.notices.receiver_count() == 0 && runtime.changes.receiver_count() == 0
+        })
+        .await;
+    }
+}

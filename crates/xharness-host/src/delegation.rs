@@ -1,0 +1,1607 @@
+//! Thin model adapter and Host composition of durable child conversations.
+//! No provider loop or shell job is implemented here.
+pub(crate) mod model_selection;
+mod revert;
+mod settlement;
+#[cfg(test)]
+#[path = "swarm_tests.rs"]
+mod swarm_tests;
+mod tasks;
+
+use crate::{driver::PromptAdmission, rpc::permission_events, BasicHost};
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{atomic::Ordering, Arc, Weak},
+    time::Duration,
+};
+use tokio_util::sync::CancellationToken;
+use xharness_agent::{AgentOperation, DelegationRuntime};
+use xharness_api::{RpcError, RpcId};
+use xharness_core::LoopCommand;
+use xharness_session::{EventData, Session, SessionEvent};
+use xharness_tools::{ToolConcurrency, ToolDefinition, ToolHandlerError, ToolOutput, ToolSpec};
+
+/// Bind an authenticated caller outside model-controlled arguments.
+pub struct AgentTool;
+impl AgentTool {
+    pub fn spec(runtime: Arc<dyn DelegationRuntime>, caller: impl Into<String>) -> ToolSpec {
+        let caller = caller.into();
+        ToolSpec::new(ToolDefinition::new("agent",
+            "Delegate independent work to a child agent. If a child is requested, start it instead of doing its task yourself.\nActions: start(task; optional label/provider/model/reasoning_effort), send(agent_id,message), inspect(optional agent_id), stop(agent_id).\nInherit the parent's model/effort. Do not choose overrides from task complexity or cost. Override only at the human's explicit request; submit selectors with start for Host confirmation. To choose a model, inspect without agent_id and copy provider+model from models[].start_selectors; candidates are not availability guarantees. Model selectors are start-only; changed routes use target defaults unless effort is explicit.\nInclude necessary background; children have separate context and cannot delegate or ask the human. Resolve their questions via send.\nStart/send acknowledge admission, not success; completion/failure arrives automatically. Inspect last_settlement.outcome.provider_failure on failure; avoid polling or blind retries.\nStop interrupts the turn and parks pending work, preserving history; resumption requires the user.\nDo not parallelize dependent edits to the same files or replay side effects without checking prior results.\nParent-only revert(agent_id,checkpoint_seq,message): inspect a safe checkpoint for a stuck/misdirected child; source must be idle/unpaused with no pending work or unresolved operations. Branches a NEW child from the completed prefix, retains history, never undoes files or external effects; use its returned agent_id. No automatic revert or invented reasoning.",
+            json!({"type":"object","properties":{
+                "action":{"type":"string","enum":["start","send","inspect","stop","revert"]},
+                "task":{"type":"string"},"label":{"type":"string"},
+                "provider":{"type":"string","description":"Configured provider ID. Copy together with model from inspect models[].start_selectors when the user requests a model choice; omitted provider inherits the parent provider. Changes require human confirmation."},
+                "model":{"type":"string","description":"Configured model ID, not a provider/model concatenation. Copy together with provider from the same inspect models[].start_selectors candidate when the user requests a model choice. Changes require human confirmation."},
+                "reasoning_effort":{"type":"string","description":"Supported effort ID for the selected model. Omit unless explicitly requested by the user; changes require human confirmation."},
+                "agent_id":{"type":"string"},"message":{"type":"string"},"checkpoint_seq":{"type":"integer","minimum":0,"description":"Exact safe checkpoint seq returned by inspect; revert only."}},
+                "required":["action"],"additionalProperties":false})), move |context| {
+            let runtime = runtime.clone(); let caller = caller.clone();
+            async move {
+                let operation: AgentOperation = serde_json::from_value((*context.arguments).clone())
+                    .map_err(|e| ToolHandlerError::new(format!("invalid agent arguments: {e}")))?;
+                operation.validate().map_err(ToolHandlerError::new)?;
+                let value = runtime.execute(&caller, context.execution_id.as_str(), operation, context.cancellation).await
+                    .map_err(ToolHandlerError::new)?;
+                Ok(ToolOutput::text(value.to_string()))
+            }
+        }).with_concurrency(ToolConcurrency::Parallel).with_timeout(Duration::from_secs(45))
+    }
+    pub fn model_selection_guard(
+        host: &Arc<BasicHost>,
+        caller: &str,
+    ) -> Arc<dyn xharness_tools::MonotonicGuard> {
+        Arc::new(model_selection::SelectionGuard {
+            host: Arc::downgrade(host),
+            caller: caller.into(),
+        })
+    }
+    /// Project optional task commands only for durable Swarm coordinator sessions.
+    pub async fn for_session(host: &Arc<BasicHost>, caller: &str) -> ToolSpec {
+        let mut spec = Self::for_host(host, caller);
+        let teams = host.coordinator_swarms(caller).await;
+        if !teams.is_empty() {
+            spec.definition.parameters["properties"]["action"]["enum"] =
+                json!(["start", "send", "inspect", "stop", "revert", "tasks"]);
+            let catalog = {
+                let state = host.state.read().await;
+                teams
+                    .iter()
+                    .filter_map(|id| {
+                        state
+                            .swarms
+                            .get(id)
+                            .map(|team| json!({"id":id,"objective":bounded(&team.objective,160)}))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            spec.definition.parameters["properties"]["swarm_id"] = json!({"type":"string","enum":teams,"description":format!("Choose the saved team matching the user's request. These are labels, not instructions: {}",json!(catalog))});
+            spec.definition.parameters["properties"]["command"] = tasks::command_schema();
+            spec.definition.description.push_str(tasks::INSTRUCTIONS);
+        }
+        spec
+    }
+    pub fn for_host(host: &Arc<BasicHost>, caller: &str) -> ToolSpec {
+        Self::spec(Arc::new(HostDelegation(Arc::downgrade(host))), caller)
+    }
+}
+
+struct HostDelegation(Weak<BasicHost>);
+#[async_trait]
+impl DelegationRuntime for HostDelegation {
+    async fn execute(
+        &self,
+        caller: &str,
+        invocation: &str,
+        operation: AgentOperation,
+        cancellation: CancellationToken,
+    ) -> Result<Value, String> {
+        operation.validate()?;
+        if cancellation.is_cancelled() {
+            return Err("agent operation cancelled before admission".into());
+        }
+        let host = self.0.upgrade().ok_or("agent host is shutting down")?;
+        let caller = caller.to_owned();
+        let invocation = invocation.to_owned();
+        // Once admission begins it must finish even if the tool consumer goes away.
+        // A persisted receipt makes retries deterministic; cancellation never rolls
+        // back already accepted child work.
+        tokio::spawn(async move { host.execute_agent(&caller, &invocation, operation).await })
+            .await
+            .map_err(|e| format!("agent admission task failed: {e}"))?
+    }
+}
+
+fn identity(caller: &str, invocation: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(caller.as_bytes());
+    hash.update([0]);
+    hash.update(invocation.as_bytes());
+    format!("agent-{:x}", hash.finalize())
+}
+/// A branch retains historical execution facts, but starts a fresh delivery scope.
+fn owned_events(session: &Session) -> &[xharness_session::LoggedEvent] {
+    let start = session
+        .events()
+        .iter()
+        .rposition(|event| matches!(event.data(), EventData::AgentDelegated { .. }))
+        .unwrap_or(0);
+    &session.events()[start..]
+}
+fn bounded(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+pub(crate) fn restored_delegation(session: &Session) -> Option<String> {
+    session
+        .events()
+        .iter()
+        .rev()
+        .find_map(|event| match event.data() {
+            EventData::AgentDelegated {
+                parent_session_id, ..
+            } => Some(Some(parent_session_id.clone())),
+            // A normal fork can copy the history of a delegated child, but it
+            // must not become another delegated child after restart.
+            EventData::SessionForkOrigin { .. } => Some(None),
+            _ => None,
+        })
+        .flatten()
+}
+pub(crate) fn restored_dispatch_paused(session: &Session) -> bool {
+    session.dispatch_paused()
+}
+
+impl BasicHost {
+    pub(crate) async fn set_dispatch_paused(&self, id: &str, paused: bool) -> Result<(), RpcError> {
+        let current = self
+            .state
+            .read()
+            .await
+            .sessions
+            .get(id)
+            .map(|s| s.dispatch_paused)
+            .ok_or_else(|| RpcError::internal("agent session not found"))?;
+        if current != paused {
+            self.commit_session_events(id, vec![EventData::AgentDispatchPaused { paused }.into()])
+                .await?;
+            if let Some(record) = self.state.write().await.sessions.get_mut(id) {
+                record.dispatch_paused = paused;
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_agent(
+        &self,
+        caller: &str,
+        invocation: &str,
+        operation: AgentOperation,
+    ) -> Result<Value, String> {
+        operation.validate()?;
+        let key = identity(caller, invocation);
+        let _operation = self.lock_admission(&format!("agent-operation:{key}")).await;
+        match operation {
+            AgentOperation::Tasks { swarm_id, command } => {
+                self.execute_agent_tasks(caller, invocation, swarm_id, command)
+                    .await
+            }
+            AgentOperation::Start {
+                task,
+                label,
+                provider,
+                model,
+                reasoning_effort,
+            } => {
+                self.create_delegated(
+                    caller,
+                    invocation,
+                    &key,
+                    task,
+                    label,
+                    model_selection::ModelOverride {
+                        provider,
+                        model,
+                        reasoning_effort,
+                    },
+                )
+                .await
+            }
+            AgentOperation::Inspect { agent_id } => {
+                let state = self.state.read().await;
+                if !state.sessions.contains_key(caller) {
+                    return Err("calling agent does not exist".into());
+                }
+                if let Some(id) = &agent_id {
+                    if !state.sessions.get(id).is_some_and(|s| {
+                        s.delegated && s.parent_session_id.as_deref() == Some(caller)
+                    }) {
+                        return Err("agent is not a direct delegated child of this caller".into());
+                    }
+                }
+                let parent_model = state.sessions[caller].model.clone();
+                let entries: Vec<_> = state.sessions.values().filter(|s| s.delegated && s.parent_session_id.as_deref()==Some(caller)
+                    && agent_id.as_ref().is_none_or(|id| id == &s.session_id)).take(128).map(|s| json!({
+                    "agent_id":s.session_id,"label":s.title,"status":if s.dispatch_paused && s.running {"stopping"} else if s.dispatch_paused {"paused"} else if s.running {"running"} else {"idle"},
+                    "pending_messages":s.queue.len().max(s.projected_queue.len()),"model":s.model})).collect();
+                drop(state);
+                let mut result = json!({"ok":true,"agents":entries});
+                if let Some(id) = &agent_id {
+                    let session = self
+                        .agent_runtime
+                        .authoritative_session(id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    result["revert_checkpoints"] = session
+                        .as_ref()
+                        .map(revert::checkpoints)
+                        .unwrap_or_else(|| json!([]));
+                    result["last_settlement"] = session
+                        .as_ref()
+                        .and_then(|session| settlement::latest_notice(id, session))
+                        .unwrap_or(Value::Null);
+                }
+                if agent_id.is_none() {
+                    result["parent_model"] = json!(parent_model);
+                    result["models"] =
+                        model_selection::catalog_view(&self.agent_runtime.model_catalog());
+                }
+                Ok(result)
+            }
+            AgentOperation::Send { agent_id, message } => {
+                self.authorize_delegated(caller, &agent_id).await?;
+                self.deliver_agent_message(caller, &agent_id, &key, message, "agent-message", true)
+                    .await?;
+                Ok(json!({"ok":true,"agent_id":agent_id,"message_id":key,"status":"accepted"}))
+            }
+            AgentOperation::Revert {
+                agent_id,
+                checkpoint_seq,
+                message,
+            } => {
+                self.revert_delegated(caller, &key, &agent_id, checkpoint_seq, message)
+                    .await
+            }
+            AgentOperation::Stop { agent_id } => {
+                self.authorize_delegated(caller, &agent_id).await?;
+                crate::rpc::turn::send_control(self, &agent_id, LoopCommand::Cancel)
+                    .await
+                    .map_err(|e| e.message)?;
+                Ok(json!({"ok":true,"agent_id":agent_id,"accepted":true}))
+            }
+        }
+    }
+
+    async fn authorize_delegated(&self, caller: &str, child: &str) -> Result<(), String> {
+        let state = self.state.read().await;
+        if !state.sessions.contains_key(caller)
+            || !state
+                .sessions
+                .get(child)
+                .is_some_and(|s| s.delegated && s.parent_session_id.as_deref() == Some(caller))
+        {
+            return Err("agent is not a direct delegated child of this caller".into());
+        }
+        Ok(())
+    }
+
+    async fn create_delegated(
+        &self,
+        caller: &str,
+        invocation: &str,
+        id: &str,
+        task: String,
+        label: Option<String>,
+        overrides: model_selection::ModelOverride,
+    ) -> Result<Value, String> {
+        // This is a creation fence, not an execution queue. Actual work stays in Inbox.
+        let _creation = self.lock_admission("agent-creation").await;
+        // Admission only: never hold this lock while waiting for confirmation.
+        let _parent_settings = self.lock_admission(caller).await;
+        let (cwd, model, permission, preset, plan_active, existing) = {
+            let state = self.state.read().await;
+            let parent = state
+                .sessions
+                .get(caller)
+                .ok_or("calling agent does not exist")?;
+            if parent.delegated {
+                return Err("delegation depth limit reached: children cannot start agents".into());
+            }
+            if parent.dispatch_paused {
+                return Err("parent is paused; cannot start new agents".into());
+            }
+            let existing = state
+                .sessions
+                .get(id)
+                .is_some_and(|s| s.delegated && s.parent_session_id.as_deref() == Some(caller));
+            if !existing
+                && state
+                    .sessions
+                    .values()
+                    .filter(|s| s.delegated && s.parent_session_id.as_deref() == Some(caller))
+                    .count()
+                    >= 128
+            {
+                return Err("child catalog limit reached (128)".into());
+            }
+            if !existing
+                && state
+                    .sessions
+                    .values()
+                    .filter(|s| s.delegated && s.running)
+                    .count()
+                    >= 16
+            {
+                return Err(
+                    "delegation admission queue is full (16); wait for completion notices".into(),
+                );
+            }
+            (
+                parent.cwd.clone(),
+                parent.model.clone(),
+                parent.execution_permission(),
+                parent.agent_preset.clone(),
+                parent.plan_active,
+                existing,
+            )
+        };
+        if existing {
+            if let Some(session) = self
+                .agent_runtime
+                .authoritative_session(id)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                if revert::branch_source(&session).is_some() {
+                    return Err("invocation id already used for a context correction".into());
+                }
+                if session.events().iter().any(|e| matches!(e.data(), EventData::AgentDelegated { task: prior, .. } if prior != &task)) {
+                    return Err("invocation id already used for a different task".into());
+                }
+                // Compare explicit selectors with the original admission, not
+                // today's parent settings or later user changes to the child.
+                // Old journals without a model admission remain retryable for
+                // the legacy (inherit-only) operation. Explicit selectors must
+                // have a durable admission to compare against.
+                if !overrides.is_empty() {
+                    let admitted = model_selection::admitted_model(&session)
+                        .ok_or("original child model selection is unavailable")?;
+                    overrides.check_replay(&admitted)?;
+                }
+            } else {
+                let state = self.state.read().await;
+                overrides.check_replay(&state.sessions[id].model)?;
+            }
+        } else {
+            let parent_model = model;
+            let model = overrides.resolve(&parent_model, &self.agent_runtime.model_catalog())?;
+            // Exact durable human approval is required before a changed route
+            // can create a child. Guard/description alone are not authority.
+            if !overrides.is_empty() {
+                let parent_session = self
+                    .agent_runtime
+                    .authoritative_session(caller)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or("model override requires a durable user confirmation")?;
+                if !model_selection::same_selection(&model, &parent_model) {
+                    model_selection::require_approval(
+                        &parent_session,
+                        caller,
+                        invocation,
+                        &overrides.operation(&task, &label),
+                        &parent_model,
+                        &model,
+                    )?;
+                }
+            }
+            let route = crate::ModelRoute {
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                reasoning_effort: model.reasoning_effort.clone(),
+                context_window_tokens: model.context_window_tokens,
+            };
+            // Validate before creating any child or admitting its first task.
+            if !self.agent_runtime.can_route(&route) {
+                return Err(format!(
+                    "model route {}/{} is unavailable or does not support reasoning_effort {:?}",
+                    route.provider, route.model, route.reasoning_effort
+                ));
+            }
+            crate::rpc::session_lifecycle::create_with_visibility(
+                self,
+                &json!({"sessionId":id,"cwd":cwd}),
+                false,
+            )
+            .await
+            .map_err(|e| e.message)?;
+            let mut events = permission_events(permission);
+            events.push(
+                EventData::SessionModelSelected {
+                    provider: model.provider.clone(),
+                    model: model.model.clone(),
+                    reasoning_effort: model.reasoning_effort.clone(),
+                    context_window_tokens: model.context_window_tokens,
+                }
+                .into(),
+            );
+            if let Some(preset) = &preset {
+                events.push(
+                    EventData::AgentPresetSelected {
+                        agent_preset: preset.clone(),
+                    }
+                    .into(),
+                );
+            }
+            events.push(
+                EventData::PlanMode {
+                    active: plan_active,
+                }
+                .into(),
+            );
+            events.push(
+                EventData::SessionTitle {
+                    title: label.clone().unwrap_or_else(|| bounded(&task, 80).into()),
+                    message_seqs: vec![],
+                    source: xharness_session::SessionTitleSource::User,
+                }
+                .into(),
+            );
+            events.push(
+                EventData::AgentDelegated {
+                    parent_session_id: caller.into(),
+                    invocation_id: id.into(),
+                    task: task.clone(),
+                }
+                .into(),
+            );
+            self.commit_session_events(id, events)
+                .await
+                .map_err(|e| e.message)?;
+            let mut state = self.state.write().await;
+            let child = state
+                .sessions
+                .get_mut(id)
+                .ok_or("child disappeared during creation")?;
+            child.delegated = true;
+            child.origin = Some("subagent".into());
+            child.parent_session_id = Some(caller.into());
+            child.model = model;
+            child.permission_preset = permission;
+            child.agent_preset = preset.clone();
+            child.plan_active = plan_active;
+            child.title = label.or_else(|| Some(bounded(&task, 80).into()));
+            drop(state);
+            self.push_host(
+                json!({"type":"host/session-added","sessionId":id,"parentSessionId":caller,"origin":"subagent","blank":true,"cwd":cwd,"agentPreset":preset}),
+            );
+        }
+        self.deliver_agent_message(
+            caller,
+            id,
+            &format!("{id}:initial"),
+            task,
+            "agent-message",
+            false,
+        )
+        .await?;
+        let model = self.state.read().await.sessions[id].model.clone();
+        Ok(
+            json!({"ok":true,"agent_id":id,"message_id":format!("{id}:initial"),"status":"accepted","model":model}),
+        )
+    }
+
+    pub(crate) async fn deliver_agent_message(
+        &self,
+        sender: &str,
+        target: &str,
+        id: &str,
+        text: String,
+        kind: &str,
+        steer: bool,
+    ) -> Result<(), String> {
+        let _admission = self.lock_admission(target).await;
+        let fingerprint = json!({"sender":sender,"text":text,"kind":kind}).to_string();
+        if crate::rpc::turn::duplicate_admission(self, target, id, &fingerprint)
+            .await
+            .map_err(|e| e.message)?
+        {
+            return Ok(());
+        }
+        let (paused, running) = {
+            let state = self.state.read().await;
+            let record = state
+                .sessions
+                .get(target)
+                .ok_or("target agent does not exist")?;
+            if record.queue.len().max(record.projected_queue.len()) >= 32 {
+                return Err("target agent inbox is full (32)".into());
+            }
+            (record.dispatch_paused, record.running)
+        };
+        let prompt_text = format!("Agent {sender} ({kind}):\n{text}");
+        let content = vec![json!({"type":"text","text":prompt_text})];
+        self.enqueue_prompt(PromptAdmission {
+            rpc_id: RpcId::new(id),
+            session_id: target.into(),
+            mode: if steer && running && !paused {
+                "steer"
+            } else {
+                "queue"
+            }
+            .into(),
+            text: prompt_text,
+            content,
+            source: json!({"kind":kind,"senderSessionId":sender}),
+            fingerprint: Some(fingerprint),
+        })
+        .await
+        .map_err(|e| e.message)
+    }
+
+    /// TurnEnd is the durable outbox source. Delivery is retried until both the
+    /// parent's deduplicated Inbox receipt and child delivery marker exist.
+    pub fn start_delegation_listener(self: &Arc<Self>) {
+        if self
+            .delegation_listener_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.start_swarm_task_listener();
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut checked = BTreeMap::new();
+            loop {
+                tick.tick().await;
+                let Some(host) = weak.upgrade() else {
+                    break;
+                };
+                let children: Vec<_> = host
+                    .state
+                    .read()
+                    .await
+                    .sessions
+                    .values()
+                    .filter(|s| s.delegated && !s.running)
+                    .map(|s| (s.session_id.clone(), s.next_event_seq()))
+                    .collect();
+                for (child, seq) in children {
+                    if checked.get(&child) == Some(&seq) {
+                        continue;
+                    }
+                    match host.deliver_child_settlements(&child).await {
+                        Ok(()) => {
+                            checked.insert(child, seq);
+                        }
+                        Err(error) => host.push_host(
+                            json!({"type":"host/agent-error","sessionId":child,"message":error}),
+                        ),
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) async fn record_delegation_failure(
+        &self,
+        id: &str,
+        work: &str,
+        error: &str,
+    ) -> Result<(), RpcError> {
+        if !self
+            .state
+            .read()
+            .await
+            .sessions
+            .get(id)
+            .is_some_and(|s| s.delegated)
+        {
+            return Ok(());
+        }
+        let Some(session) = self
+            .agent_runtime
+            .authoritative_session(id)
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?
+        else {
+            return Ok(());
+        };
+        let start=session.events().iter().position(|e|matches!(e.data(),EventData::UserMessage { message,.. } if message.id.as_deref()==Some(work)));
+        if start.is_some_and(|index| {
+            session.events()[index..]
+                .iter()
+                .any(|e| matches!(e.data(), EventData::TurnEnd { .. }))
+        }) {
+            return Ok(());
+        }
+        if !session.events().iter().any(|e|matches!(e.data(),EventData::AgentDelegationFailure { message_id,.. } if message_id==work)) {
+            self.commit_session_events(id,vec![EventData::AgentDelegationFailure {message_id:work.into(),error:bounded(error,4096).into()}.into()]).await?;
+        }
+        self.set_dispatch_paused(id, true).await
+    }
+
+    async fn deliver_child_settlements(&self, child: &str) -> Result<(), String> {
+        let Some(session) = self
+            .agent_runtime
+            .authoritative_session(child)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(());
+        };
+        let Some(parent) = restored_delegation(&session) else {
+            return Ok(());
+        };
+        let events = owned_events(&session);
+        if let Some((invocation, task)) = events.iter().find_map(|e| match e.data() {
+            EventData::AgentDelegated {
+                invocation_id,
+                task,
+                ..
+            } => Some((invocation_id, task)),
+            _ => None,
+        }) {
+            self.deliver_agent_message(
+                &parent,
+                child,
+                &format!("{invocation}:initial"),
+                task.clone(),
+                "agent-message",
+                false,
+            )
+            .await?;
+        }
+        let delivered: BTreeSet<u32> = events
+            .iter()
+            .filter_map(|e| match e.data() {
+                EventData::AgentSettlementDelivered { turn } => Some(*turn),
+                _ => None,
+            })
+            .collect();
+        for event in events {
+            if let EventData::TurnEnd { turn, reason } = event.data() {
+                if delivered.contains(turn) {
+                    continue;
+                }
+                let notice = settlement::turn_notice(child, &session, *turn, reason);
+                self.deliver_agent_message(
+                    child,
+                    &parent,
+                    &format!("{child}:settlement:{turn}"),
+                    notice.to_string(),
+                    "agent-settlement",
+                    false,
+                )
+                .await?;
+                self.commit_session_events(
+                    child,
+                    vec![SessionEvent::from(EventData::AgentSettlementDelivered {
+                        turn: *turn,
+                    })],
+                )
+                .await
+                .map_err(|e| e.message)?;
+            }
+        }
+        let failed_delivered: BTreeSet<_> = events
+            .iter()
+            .filter_map(|e| match e.data() {
+                EventData::AgentFailureDelivered { message_id } => Some(message_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        for event in events {
+            if let EventData::AgentDelegationFailure { message_id, error } = event.data() {
+                if failed_delivered.contains(message_id.as_str()) {
+                    continue;
+                }
+                let notice = settlement::failure_notice(child, message_id, error);
+                self.deliver_agent_message(
+                    child,
+                    &parent,
+                    &format!("{child}:failure:{message_id}"),
+                    notice.to_string(),
+                    "agent-settlement",
+                    false,
+                )
+                .await?;
+                self.commit_session_events(
+                    child,
+                    vec![EventData::AgentFailureDelivered {
+                        message_id: message_id.clone(),
+                    }
+                    .into()],
+                )
+                .await
+                .map_err(|e| e.message)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    mod description_tests;
+    mod model_confirmation_tests;
+    mod model_selection_tests;
+    mod request_failure_tests;
+    mod revert_tests;
+    mod small_step_retry_experiment;
+
+    use super::*;
+    use crate::{AgentRuntime, DurableLoopAgentRuntime, HostConfig, NoTools};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use xharness_agent::MemoryLeaseManager;
+    use xharness_api::{ApiBackend, RpcMethod, RpcResult};
+    use xharness_core::{
+        FinishReason, IdentityContextPolicy, ModelProvider, ProviderError, ProviderEvent,
+        ProviderRequest, ProviderStream,
+    };
+    use xharness_session::{MemorySessionStore, Store};
+    use xharness_tools::{ToolExecutor, ToolRegistry, ToolRequest};
+
+    #[derive(Default)]
+    struct Probe {
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+        gate: Option<CancellationToken>,
+        requests: std::sync::Mutex<Vec<ProviderRequest>>,
+    }
+    struct Active(Arc<AtomicUsize>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    #[async_trait]
+    impl ModelProvider for Probe {
+        fn provider_name(&self) -> &str {
+            "probe"
+        }
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(current, Ordering::SeqCst);
+            let active = Active(self.active.clone());
+            let gate = self.gate.clone();
+            Ok(Box::pin(async_stream::stream! {
+                let _active = active;
+                if let Some(gate) = gate {
+                    gate.cancelled().await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+                yield Ok(ProviderEvent::TextDelta("checked; no edits".into()));
+                yield Ok(ProviderEvent::Completed { finish_reason:Some(FinishReason::Stop),usage:None,provider_items:vec![] });
+            }))
+        }
+    }
+    async fn setup(store: Arc<dyn Store>, probe: Arc<dyn ModelProvider>) -> Arc<BasicHost> {
+        let runtime: Arc<dyn AgentRuntime> = Arc::new(DurableLoopAgentRuntime::new(
+            "probe",
+            "test",
+            Some(probe),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            store,
+            Arc::new(MemoryLeaseManager::default()),
+            2048,
+        ));
+        let mut config = HostConfig::new(std::env::current_dir().unwrap());
+        config.provider_id = "probe".into();
+        config.model_id = "test".into();
+        BasicHost::with_agent_runtime(config, runtime)
+    }
+    async fn parent(host: &BasicHost, id: &str) {
+        crate::rpc::session_lifecycle::create(host, &json!({"sessionId":id}))
+            .await
+            .unwrap();
+    }
+    async fn wait_for_calls(probe: &Probe, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while probe.calls.load(Ordering::SeqCst) < expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("expected model turns did not start");
+    }
+    fn start(task: &str) -> AgentOperation {
+        AgentOperation::Start {
+            task: task.into(),
+            label: None,
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+        }
+    }
+    async fn settled(host: &BasicHost, id: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !host.state.read().await.sessions[id].running {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("driver did not settle");
+    }
+
+    #[tokio::test]
+    async fn failed_parent_restores_paused_and_child_receipts_do_not_restart_it() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let initial = store
+            .create(xharness_session::SessionHeader::new("failed-parent"))
+            .await
+            .unwrap();
+        let mut receipt = xharness_session::InboxMessage::user("old-receipt", "child finished");
+        receipt.source = Some(json!({"kind":"agent-settlement"}));
+        store
+            .append(
+                "failed-parent",
+                initial.revision(),
+                vec![
+                    EventData::TurnStart { turn: 1 }.into(),
+                    EventData::TurnEnd {
+                        turn: 1,
+                        reason: xharness_session::TurnEndReason::Failed {
+                            error: "overflow compaction failed".into(),
+                            provider_failure: None,
+                        },
+                    }
+                    .into(),
+                    EventData::AgentInboxSpliced {
+                        target: xharness_session::InboxTarget::NextTurn,
+                        start: 0,
+                        removed_count: 0,
+                        inserted: vec![receipt],
+                        outcome: None,
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let probe = Arc::new(Probe::default());
+        let host = setup(store.clone(), probe.clone()).await;
+        let restore = host.restore_from_store(store.clone()).await.unwrap();
+        assert_eq!(restore.resumed_pending_turns, 0);
+        for _ in 0..2 {
+            host.deliver_agent_message(
+                "child",
+                "failed-parent",
+                "new-receipt",
+                "completed".into(),
+                "agent-settlement",
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let state = host.state.read().await;
+            let parent = &state.sessions["failed-parent"];
+            assert!(parent.dispatch_paused);
+            assert!(!parent.running);
+            assert_eq!(
+                parent.projected_queue.len(),
+                2,
+                "receipt delivery is deduplicated"
+            );
+        }
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        let session = store.load("failed-parent").await.unwrap().unwrap();
+        assert_eq!(
+            session
+                .events()
+                .iter()
+                .filter(|e| matches!(e.data(), EventData::TurnStart { .. }))
+                .count(),
+            1
+        );
+        assert!(session.dispatch_paused());
+        host.enqueue_prompt(PromptAdmission {
+            rpc_id: RpcId::new("human-retry"),
+            session_id: "failed-parent".into(),
+            mode: "queue".into(),
+            text: "retry".into(),
+            content: vec![json!({"type":"text","text":"retry"})],
+            source: json!({"kind":"user"}),
+            fingerprint: None,
+        })
+        .await
+        .unwrap();
+        wait_for_calls(&probe, 3).await;
+        settled(&host, "failed-parent").await;
+        assert!(!store
+            .load("failed-parent")
+            .await
+            .unwrap()
+            .unwrap()
+            .dispatch_paused());
+        host.agent_runtime.shutdown(Duration::from_secs(1)).await;
+    }
+    #[tokio::test]
+    async fn archived_parent_deletion_cleans_real_cold_subagent_and_replays_receipt() {
+        for undiscovered in [false, true] {
+            let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+            let probe = Arc::new(Probe::default());
+            let host = setup(store.clone(), probe.clone()).await;
+            parent(&host, "archive-parent").await;
+            let started = host
+                .execute_agent("archive-parent", "archive-child", start("inspect only"))
+                .await
+                .unwrap();
+            let child = started["agent_id"].as_str().unwrap().to_owned();
+            wait_for_calls(&probe, 1).await;
+            settled(&host, &child).await;
+            settled(&host, "archive-parent").await;
+            // A new Host restores catalogue metadata, not an activated child.
+            let cold = setup(store.clone(), Arc::new(Probe::default())).await;
+            cold.prepare_startup_catalog(store.clone()).await.unwrap();
+            if undiscovered {
+                // Startup streaming has not published this child yet; the journal
+                // must still be included, despite no in-memory record or index.
+                cold.state.write().await.sessions.remove(&child);
+                cold.lazy_headers.write().await.remove(&child);
+                cold.state.write().await.sessions.remove("archive-parent");
+                cold.lazy_headers.write().await.remove("archive-parent");
+            }
+            cold.state
+                .write()
+                .await
+                .archived_sessions
+                .insert("archive-parent".into());
+            let payload = json!({"sessionId":"archive-parent"});
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                cold.call(
+                    RpcId::new("archive-real-delete"),
+                    RpcMethod::SessionDelete,
+                    payload.clone(),
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("deletion deadlocked");
+            let RpcResult::Success {
+                value: Some(receipt),
+            } = result
+            else {
+                panic!("delete failed: {result:?}")
+            };
+            assert_eq!(receipt["deletedSessionIds"].as_array().unwrap().len(), 2);
+            assert!(store.load("archive-parent").await.unwrap().is_none());
+            assert!(store.load(&child).await.unwrap().is_none());
+            let revision = cold.state.read().await.control_revision;
+            let replay = cold
+                .call(
+                    RpcId::new("archive-real-delete"),
+                    RpcMethod::SessionDelete,
+                    payload,
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(matches!(replay,RpcResult::Success {value} if value==Some(receipt)));
+            assert_eq!(cold.state.read().await.control_revision, revision);
+        }
+    }
+
+    #[tokio::test]
+    async fn archived_parent_deletion_rejects_pending_cold_child_without_activating_it() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        for id in ["cold-parent", "cold-child"] {
+            store
+                .create(xharness_session::SessionHeader::new(id))
+                .await
+                .unwrap();
+        }
+        store
+            .append(
+                "cold-child",
+                xharness_session::Revision::ZERO,
+                vec![
+                    EventData::AgentDelegated {
+                        parent_session_id: "cold-parent".into(),
+                        invocation_id: "old-call".into(),
+                        task: "inspect".into(),
+                    }
+                    .into(),
+                    EventData::AgentInboxSpliced {
+                        target: xharness_session::InboxTarget::NextTurn,
+                        start: 0,
+                        removed_count: 0,
+                        inserted: vec![xharness_session::InboxMessage::user(
+                            "queued",
+                            "pending work",
+                        )],
+                        outcome: None,
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let probe = Arc::new(Probe::default());
+        let host = setup(store.clone(), probe.clone()).await;
+        host.prepare_startup_catalog(store.clone()).await.unwrap();
+        host.state
+            .write()
+            .await
+            .archived_sessions
+            .insert("cold-parent".into());
+        let result = host
+            .call(
+                RpcId::new("reject-cold"),
+                RpcMethod::SessionDelete,
+                json!({"sessionId":"cold-parent"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, RpcResult::Failure { .. }));
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        let state = host.state.read().await;
+        assert!(state.deleted_sessions.is_empty());
+        assert!(!state.sessions["cold-child"].running);
+        assert!(store.load("cold-parent").await.unwrap().is_some());
+        assert!(store.load("cold-child").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn duplicate_start_authority_depth_and_followup() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let host = setup(store, Arc::new(Probe::default())).await;
+        parent(&host, "p").await;
+        parent(&host, "other").await;
+        let mut announcements = host.event_gateway.subscribe_host();
+        let (a, b) = tokio::join!(
+            host.execute_agent("p", "call", start("inspect files")),
+            host.execute_agent("p", "call", start("inspect files"))
+        );
+        let a = a.unwrap();
+        assert_eq!(a, b.unwrap());
+        let id = a["agent_id"].as_str().unwrap();
+        let mut announced_child = false;
+        while let Ok(frame) = announcements.try_recv() {
+            if frame.method == "host/session-added" && frame.payload["sessionId"] == id {
+                assert_eq!(frame.payload["origin"], "subagent");
+                assert_eq!(frame.payload["parentSessionId"], "p");
+                announced_child = true;
+            }
+        }
+        assert!(
+            announced_child,
+            "live session announcement must carry the child navigation identity"
+        );
+        {
+            let state = host.state.read().await;
+            let summary = state.sessions[id].summary();
+            assert_eq!(summary["origin"], "subagent");
+            assert_eq!(summary["parentSessionId"], "p");
+            assert!(state.sessions["p"].summary().get("origin").is_none());
+        }
+        assert_eq!(
+            host.state
+                .read()
+                .await
+                .sessions
+                .values()
+                .filter(|s| s.delegated)
+                .count(),
+            1
+        );
+        assert!(host
+            .execute_agent("p", "call", start("different"))
+            .await
+            .is_err());
+        assert!(host
+            .execute_agent(
+                "other",
+                "send",
+                AgentOperation::Send {
+                    agent_id: id.into(),
+                    message: "steal".into()
+                }
+            )
+            .await
+            .is_err());
+        assert!(host
+            .execute_agent(id, "nested", start("nested"))
+            .await
+            .is_err());
+        settled(&host, id).await;
+        let op = AgentOperation::Send {
+            agent_id: id.into(),
+            message: "continue".into(),
+        };
+        let first = host.execute_agent("p", "send", op.clone()).await.unwrap();
+        assert_eq!(first, host.execute_agent("p", "send", op).await.unwrap());
+        settled(&host, id).await;
+        host.agent_runtime.shutdown(Duration::from_secs(2)).await;
+    }
+    #[tokio::test]
+    async fn default_capacity_is_four_real_model_turns_and_results_deliver_once() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let gate = CancellationToken::new();
+        let probe = Arc::new(Probe {
+            gate: Some(gate.clone()),
+            ..Probe::default()
+        });
+        let host = setup(store.clone(), probe.clone()).await;
+        parent(&host, "p").await;
+        let mut children = vec![];
+        for n in 0..6 {
+            children.push(
+                host.execute_agent("p", &format!("call{n}"), start("inspect independently"))
+                    .await
+                    .unwrap()["agent_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        wait_for_calls(&probe, 4).await;
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 4);
+        gate.cancel();
+        for id in &children {
+            settled(&host, id).await;
+        }
+        assert_eq!(probe.maximum.load(Ordering::SeqCst), 4);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 6);
+        host.set_dispatch_paused("p", true).await.unwrap();
+        for id in &children {
+            host.deliver_child_settlements(id).await.unwrap();
+            host.deliver_child_settlements(id).await.unwrap();
+        }
+        assert_eq!(host.state.read().await.sessions["p"].queue.len(), 6);
+        let view = host.state.read().await.sessions["p"].queue_view();
+        assert_eq!(view.len(), 6);
+        assert!(view.iter().all(|item| item["placement"] == "context"));
+        assert!(view
+            .iter()
+            .all(|item| item["message"]["source"]["kind"] == "agent-settlement"));
+        let before = store.load("p").await.unwrap().unwrap();
+        // A stale client can still hold queued cards. The RPC must reject all
+        // mutations before removal, replacement, or steering admission.
+        for action in [
+            json!({"kind":"remove"}),
+            json!({"kind":"steer"}),
+            json!({"kind":"edit","content":[{"type":"text","text":"tampered"}]}),
+        ] {
+            let result = host
+                .call(
+                    RpcId::new("receipt-action"),
+                    RpcMethod::SessionUpdateQueue,
+                    json!({"sessionId":"p","itemId":view[0]["id"],"action":action}),
+                    CancellationToken::new(),
+                )
+                .await;
+            let xharness_api::RpcResult::Failure { error } = result else {
+                panic!("internal receipt was mutable");
+            };
+            assert_eq!(error.details["reason"], "QUEUE_ITEM_READ_ONLY");
+        }
+        assert_eq!(
+            store.load("p").await.unwrap().unwrap().events(),
+            before.events()
+        );
+        assert_eq!(host.state.read().await.sessions["p"].queue_view(), view);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            probe.calls.load(Ordering::SeqCst),
+            6,
+            "settlements must not wake paused parent"
+        );
+        assert!(!host.state.read().await.sessions["p"].running);
+        host.agent_runtime.shutdown(Duration::from_secs(2)).await;
+        let resumed = setup(store.clone(), Arc::new(Probe::default())).await;
+        resumed.restore_from_store(store).await.unwrap();
+        assert!(resumed.state.read().await.sessions["p"].dispatch_paused);
+        for id in &children {
+            assert_eq!(
+                resumed.state.read().await.sessions[id].summary()["origin"],
+                "subagent"
+            );
+            assert_eq!(
+                resumed.state.read().await.sessions[id]
+                    .parent_session_id
+                    .as_deref(),
+                Some("p")
+            );
+            resumed.deliver_child_settlements(id).await.unwrap();
+        }
+        assert_eq!(resumed.state.read().await.sessions["p"].queue.len(), 6);
+        assert_eq!(resumed.state.read().await.sessions["p"].queue_view(), view);
+        resumed.agent_runtime.shutdown(Duration::from_secs(2)).await;
+    }
+    #[tokio::test]
+    async fn configured_capacity_is_shared_and_primary_turns_bypass_child_slots() {
+        for capacity in [
+            crate::DelegationConcurrency::Two,
+            crate::DelegationConcurrency::Four,
+            crate::DelegationConcurrency::Eight,
+        ] {
+            let count = capacity.limit();
+            let gate = CancellationToken::new();
+            let probe = Arc::new(Probe {
+                gate: Some(gate.clone()),
+                ..Probe::default()
+            });
+            let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+            let mut models = crate::ModelRegistry::new();
+            models
+                .register(crate::RegisteredModel::new(
+                    crate::ModelDescriptor::new("probe", "probe", "test", "test"),
+                    probe.clone(),
+                ))
+                .unwrap();
+            let runtime = DurableLoopAgentRuntime::from_registry_with_delegation_concurrency(
+                crate::ModelRoute::new("probe", "test"),
+                models,
+                Arc::new(NoTools),
+                Arc::new(IdentityContextPolicy),
+                store.clone(),
+                Arc::new(MemoryLeaseManager::default()),
+                2048,
+                capacity,
+            )
+            .unwrap();
+            let mut config = HostConfig::new(std::env::current_dir().unwrap());
+            config.provider_id = "probe".into();
+            config.model_id = "test".into();
+            let host = BasicHost::with_agent_runtime(config, Arc::new(runtime));
+            parent(&host, "p").await;
+            parent(&host, "other").await;
+            let mut ids = vec![];
+            for n in 0..count {
+                ids.push(
+                    host.execute_agent("p", &format!("start{n}"), start("work"))
+                        .await
+                        .unwrap()["agent_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+            wait_for_calls(&probe, count).await;
+            let queued = host
+                .execute_agent("other", "extra", start("queued work"))
+                .await
+                .unwrap()["agent_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            // A primary user turn can start even though all child permits are held.
+            host.enqueue_prompt(PromptAdmission {
+                rpc_id: RpcId::new("primary"),
+                session_id: "other".into(),
+                mode: "queue".into(),
+                text: "primary work".into(),
+                content: vec![json!({"type":"text","text":"primary work"})],
+                source: json!({"kind":"user"}),
+                fingerprint: None,
+            })
+            .await
+            .unwrap();
+            wait_for_calls(&probe, count + 1).await;
+            let queued_session = store.load(&queued).await.unwrap().unwrap();
+            assert!(!queued_session
+                .events()
+                .iter()
+                .any(|e| matches!(e.data(), EventData::TurnStart { .. })));
+            assert!(
+                xharness_agent::InboxProjection::from_session(&queued_session)
+                    .unwrap()
+                    .has_pending()
+            );
+            // Cancellation returns an actual child permit to the queued child.
+            host.execute_agent(
+                "p",
+                "stop",
+                AgentOperation::Stop {
+                    agent_id: ids[0].clone(),
+                },
+            )
+            .await
+            .unwrap();
+            wait_for_calls(&probe, count + 2).await;
+            gate.cancel();
+            ids.extend([queued, "other".into()]);
+            for id in &ids {
+                settled(&host, id).await;
+            }
+            assert_eq!(probe.maximum.load(Ordering::SeqCst), count + 1);
+            assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+            let cancelled = store.load(&ids[0]).await.unwrap().unwrap();
+            assert!(cancelled.events().iter().any(|e| matches!(
+                e.data(),
+                EventData::TurnEnd {
+                    reason: xharness_session::TurnEndReason::Cancelled,
+                    ..
+                }
+            )));
+            host.agent_runtime.shutdown(Duration::from_secs(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_parks_pending_work_until_explicit_user_prompt() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let probe = Arc::new(Probe::default());
+        let host = setup(store.clone(), probe.clone()).await;
+        parent(&host, "p").await;
+        let value = host
+            .execute_agent("p", "start", start("long work"))
+            .await
+            .unwrap();
+        let id = value["agent_id"].as_str().unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        host.execute_agent(
+            "p",
+            "stop",
+            AgentOperation::Stop {
+                agent_id: id.into(),
+            },
+        )
+        .await
+        .unwrap();
+        settled(&host, id).await;
+        let ended = store.load(id).await.unwrap().unwrap();
+        assert!(
+            ended.events().iter().any(|e| matches!(
+                e.data(),
+                EventData::TurnEnd {
+                    reason: xharness_session::TurnEndReason::Cancelled,
+                    ..
+                }
+            )),
+            "stop must durably record cancellation, not silently fail journal conflict"
+        );
+        let calls = probe.calls.load(Ordering::SeqCst);
+        host.execute_agent(
+            "p",
+            "follow",
+            AgentOperation::Send {
+                agent_id: id.into(),
+                message: "park this".into(),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert_eq!(probe.calls.load(Ordering::SeqCst), calls);
+        assert!(!host.state.read().await.sessions[id].queue.is_empty());
+        host.enqueue_prompt(PromptAdmission {
+            rpc_id: RpcId::new("human-resume"),
+            session_id: id.into(),
+            mode: "queue".into(),
+            text: "continue".into(),
+            content: vec![json!({"type":"text","text":"continue"})],
+            source: json!({"kind":"user"}),
+            fingerprint: None,
+        })
+        .await
+        .unwrap();
+        settled(&host, id).await;
+        assert!(probe.calls.load(Ordering::SeqCst) > calls);
+        host.agent_runtime.shutdown(Duration::from_secs(2)).await;
+    }
+    #[tokio::test]
+    async fn registry_has_one_tool_and_invalid_action_never_reaches_runtime() {
+        struct Never;
+        #[async_trait]
+        impl DelegationRuntime for Never {
+            async fn execute(
+                &self,
+                _: &str,
+                _: &str,
+                _: AgentOperation,
+                _: CancellationToken,
+            ) -> Result<Value, String> {
+                panic!("invalid arguments reached runtime")
+            }
+        }
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(AgentTool::spec(Arc::new(Never), "p"))
+            .await
+            .unwrap();
+        assert_eq!(registry.definitions().await.len(), 1);
+        let executor = ToolExecutor::new(registry);
+        for args in [
+            json!({"action":"stop"}),
+            json!({"action":"start","task":"x","message":"bad"}),
+            json!({"action":"send","agent_id":"a","message":" "}),
+        ] {
+            let result = executor
+                .execute(ToolRequest::new("agent", args.to_string()))
+                .await;
+            assert!(!result.is_ok());
+        }
+    }
+    #[tokio::test]
+    async fn stop_while_waiting_for_capacity_never_claims_input_or_hangs() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let gate = CancellationToken::new();
+        let probe = Arc::new(Probe {
+            gate: Some(gate.clone()),
+            ..Probe::default()
+        });
+        let host = setup(store.clone(), probe.clone()).await;
+        parent(&host, "p").await;
+        let mut ids = vec![];
+        for n in 0..4 {
+            ids.push(
+                host.execute_agent("p", &format!("start{n}"), start("work"))
+                    .await
+                    .unwrap()["agent_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        wait_for_calls(&probe, 4).await;
+        ids.push(
+            host.execute_agent("p", "fifth", start("queued work"))
+                .await
+                .unwrap()["agent_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            host.execute_agent(
+                "p",
+                "stop",
+                AgentOperation::Stop {
+                    agent_id: ids[4].clone(),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        settled(&host, &ids[4]).await;
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 4);
+        gate.cancel();
+        for id in &ids {
+            settled(&host, id).await;
+        }
+        let session = store.load(&ids[4]).await.unwrap().unwrap();
+        assert!(!session
+            .events()
+            .iter()
+            .any(|e| matches!(e.data(), EventData::TurnStart { .. })));
+        assert!(xharness_agent::InboxProjection::from_session(&session)
+            .unwrap()
+            .has_pending());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 4);
+        host.agent_runtime.shutdown(Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_before_admission_does_not_create_child() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let host = setup(store, Arc::new(Probe::default())).await;
+        parent(&host, "p").await;
+        let runtime = HostDelegation(Arc::downgrade(&host));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(runtime
+            .execute("p", "c", start("work"), cancel)
+            .await
+            .is_err());
+        assert_eq!(host.state.read().await.sessions.len(), 1);
+        host.agent_runtime.shutdown(Duration::from_secs(2)).await;
+    }
+    #[tokio::test]
+    async fn preparation_failure_is_durable_notified_once_and_not_auto_replayed() {
+        struct BrokenTools;
+        #[async_trait]
+        impl crate::SessionToolFactory for BrokenTools {
+            async fn executor(
+                &self,
+                _: &str,
+                _: &str,
+                _: crate::PermissionPreset,
+            ) -> Result<ToolExecutor, String> {
+                Err("fixture: tool preparation unavailable".into())
+            }
+        }
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut config = HostConfig::new(std::env::current_dir().unwrap());
+        config.provider_id = "probe".into();
+        config.model_id = "test".into();
+        let runtime: Arc<dyn AgentRuntime> = Arc::new(DurableLoopAgentRuntime::new(
+            "probe",
+            "test",
+            Some(Arc::new(Probe::default())),
+            Arc::new(BrokenTools),
+            Arc::new(IdentityContextPolicy),
+            store.clone(),
+            Arc::new(MemoryLeaseManager::default()),
+            2048,
+        ));
+        let host = BasicHost::with_agent_runtime(config, runtime);
+        parent(&host, "p").await;
+        let value = host
+            .execute_agent("p", "start", start("work"))
+            .await
+            .unwrap();
+        let id = value["agent_id"].as_str().unwrap();
+        settled(&host, id).await;
+        let session = store.load(id).await.unwrap().unwrap();
+        assert!(session
+            .events()
+            .iter()
+            .any(|e| matches!(e.data(), EventData::AgentDelegationFailure { .. })));
+        assert!(host.state.read().await.sessions[id].dispatch_paused);
+        host.set_dispatch_paused("p", true).await.unwrap();
+        host.deliver_child_settlements(id).await.unwrap();
+        host.deliver_child_settlements(id).await.unwrap();
+        assert_eq!(host.state.read().await.sessions["p"].queue.len(), 1);
+        host.agent_runtime.shutdown(Duration::from_secs(2)).await;
+        let restored = setup(store.clone(), Arc::new(Probe::default())).await;
+        restored.restore_from_store(store).await.unwrap();
+        assert!(restored.state.read().await.sessions[id].dispatch_paused);
+        assert!(!restored.state.read().await.sessions[id].running);
+        restored
+            .agent_runtime
+            .shutdown(Duration::from_secs(2))
+            .await;
+    }
+    #[tokio::test]
+    async fn concurrent_history_refresh_and_child_control_never_regress_cursor() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let host = setup(store.clone(), Arc::new(Probe::default())).await;
+        parent(&host, "p").await;
+        let mut tasks = vec![];
+        for _ in 0..8 {
+            let host = host.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut previous = 0;
+                for _ in 0..32 {
+                    host.sync_authoritative_session("p").await.unwrap();
+                    let seq = host.state.read().await.sessions["p"].next_event_seq();
+                    assert!(seq >= previous);
+                    previous = seq;
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for n in 0..32 {
+            host.commit_session_events(
+                "p",
+                vec![EventData::AgentDispatchPaused { paused: n % 2 == 0 }.into()],
+            )
+            .await
+            .unwrap();
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let session = store.load("p").await.unwrap().unwrap();
+        assert_eq!(
+            host.state.read().await.sessions["p"].next_event_seq() as usize,
+            session.events().len()
+        );
+        host.agent_runtime.shutdown(Duration::from_secs(2)).await;
+    }
+}

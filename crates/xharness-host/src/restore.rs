@@ -1,0 +1,7113 @@
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    path::Path,
+    sync::Arc,
+};
+use xharness_projection::metrics::MetricsProjectionState;
+
+use serde::Serialize;
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+use xharness_agent::InboxProjection;
+use xharness_session::{
+    EventData, Session, SessionCatalogEntry, StartupCandidate, Store, StoreError,
+};
+
+#[cfg(test)]
+#[path = "dynamic_projection_tests.rs"]
+mod dynamic_projection_tests;
+
+#[cfg(test)]
+use xharness_projection::*;
+use xharness_projection::{project_inbox_message, ProjectedEventTail};
+
+use crate::{
+    runtime::{AgentSessionRequest, ModelRoute},
+    state::{
+        DriverCommand, GoalState, ModelSelection, QueuePlacement, QueuedPrompt, SessionRecord,
+        WorkspaceRecord,
+    },
+    BasicHost, PermissionPreset,
+};
+
+/// Non-fatal startup condition. The durable Session remains visible even when
+/// its pending Agent cannot currently be resumed (for example because its
+/// historical model route is no longer configured).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostRestoreIssue {
+    pub session_id: String,
+    pub message: String,
+}
+
+/// Deterministic summary of one Host startup replay.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostRestoreReport {
+    pub discovered_sessions: usize,
+    pub model_settings_error: Option<String>,
+    pub restored_sessions: usize,
+    pub checkpoint_restored_sessions: usize,
+    pub checkpoint_tail_events: usize,
+    pub resumed_pending_turns: usize,
+    pub resumed_pending_approvals: usize,
+    pub resumed_user_questions: usize,
+    pub waiting_next_step_inputs: usize,
+    pub paused_incomplete_tool_sessions: usize,
+    pub issues: Vec<HostRestoreIssue>,
+}
+
+/// Startup behavior for work that was interrupted after a model emitted a
+/// tool call but before an authoritative tool result was recorded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecoveryPolicy {
+    /// Compatibility mode for embedded callers that explicitly own recovery.
+    #[default]
+    ResumeIncompleteTools,
+    /// Native product mode: reconstruct the session but require a new explicit
+    /// user prompt before any interrupted work can proceed.
+    PauseIncompleteTools,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HostRestoreError {
+    #[error(transparent)]
+    Control(#[from] xharness_control::ControlError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("startup catalogue worker failed: {0}")]
+    CatalogueWorker(String),
+    #[error("session {session_id:?} disappeared during Host restoration")]
+    SessionDisappeared { session_id: String },
+    #[error("session {session_id:?} could not finish recovery; retry after repairing the runtime")]
+    RecoveryIncomplete { session_id: String },
+    #[error("session {session_id:?} has an invalid durable inbox: {message}")]
+    InvalidInbox { session_id: String, message: String },
+    #[error("session {session_id:?} has an invalid durable schedule: {message}")]
+    InvalidSchedule { session_id: String, message: String },
+    #[error("session {session_id:?} prompt could not be restored: {message}")]
+    Prompt { session_id: String, message: String },
+    #[error(
+        "session {session_id:?} resume attached {runtime_count} turns but projection contains {projected_count}"
+    )]
+    ResumeMismatch {
+        session_id: String,
+        runtime_count: usize,
+        projected_count: usize,
+    },
+}
+
+impl BasicHost {
+    /// Rebuild the Web-facing Host projection from the append-only Session
+    /// store and reattach every pending next-turn input before starting any
+    /// Agent worker. This method is idempotent for a freshly constructed Host;
+    /// callers must invoke it before exposing the HTTP listener.
+    pub async fn restore_from_store(
+        self: &Arc<Self>,
+        store: Arc<dyn Store>,
+    ) -> Result<HostRestoreReport, HostRestoreError> {
+        self.restore_from_store_with_policy(store, RecoveryPolicy::default())
+            .await
+    }
+
+    pub async fn restore_from_store_with_policy(
+        self: &Arc<Self>,
+        store: Arc<dyn Store>,
+        recovery_policy: RecoveryPolicy,
+    ) -> Result<HostRestoreReport, HostRestoreError> {
+        self.restore_from_store_with_policy_and_progress(store, recovery_policy, || {})
+            .await
+    }
+
+    /// Variant used by native composition to publish a closed startup stage
+    /// exactly when history replay transitions into model reconciliation.
+    pub async fn restore_from_store_with_policy_and_progress<F>(
+        self: &Arc<Self>,
+        store: Arc<dyn Store>,
+        recovery_policy: RecoveryPolicy,
+        model_reconciliation_started: F,
+    ) -> Result<HostRestoreReport, HostRestoreError>
+    where
+        F: FnOnce(),
+    {
+        self.restore_filtered(
+            store,
+            recovery_policy,
+            None,
+            true,
+            model_reconciliation_started,
+        )
+        .await
+    }
+
+    async fn restore_filtered<F>(
+        self: &Arc<Self>,
+        store: Arc<dyn Store>,
+        recovery_policy: RecoveryPolicy,
+        selected: Option<&BTreeSet<String>>,
+        initialize: bool,
+        model_reconciliation_started: F,
+    ) -> Result<HostRestoreReport, HostRestoreError>
+    where
+        F: FnOnce(),
+    {
+        let model_settings_error = if initialize {
+            self.start_background_turn_listener();
+            self.restore_control_state().await?;
+            self.finish_deleted_session_cleanup(&store).await?;
+            // Persisted model overrides and credentials must be activated before
+            // any recovered input is admitted. Bootstrap registries may be empty.
+            let model_settings_error = self.refresh_model_settings().await.err();
+            if model_settings_error.is_some() {
+                // Keep settings repair available, but never execute queued work
+                // against a stale bootstrap route when activation failed.
+                if let Some(backend) = self.model_settings.get() {
+                    backend.activate(crate::ModelRegistry::new());
+                }
+            }
+            model_settings_error
+        } else {
+            self.state.read().await.model_settings_error.clone()
+        };
+        // Tolerant scan: one unreadable entry must not make every healthy
+        // session undiscoverable, and it must not be dropped silently either.
+        // Whatever cannot be published is reported below as a startup issue.
+        let (headers, unreadable) = if let Some(ids) = selected {
+            let known = self.lazy_headers.read().await;
+            (
+                ids.iter().filter_map(|id| known.get(id).cloned()).collect(),
+                Vec::new(),
+            )
+        } else {
+            store.scan_startup_candidates().await?
+        };
+        let mut report = HostRestoreReport {
+            discovered_sessions: headers.len() + unreadable.len(),
+            model_settings_error,
+            issues: unreadable
+                .into_iter()
+                .filter(|entry| selected.is_none_or(|ids| ids.contains(&entry.session_id)))
+                .map(|entry| HostRestoreIssue {
+                    session_id: entry.session_id,
+                    message: entry.reason,
+                })
+                .collect(),
+            ..HostRestoreReport::default()
+        };
+        let mut resumable = Vec::new();
+        let mut loaded_ids = BTreeSet::new();
+        let mut failed_resumes = BTreeSet::new();
+
+        for header in headers {
+            if self
+                .state
+                .read()
+                .await
+                .deleted_sessions
+                .contains(&header.id)
+            {
+                continue;
+            }
+            if selected.is_some_and(|ids| !ids.contains(&header.id)) {
+                continue;
+            }
+            let session_id = header.id.clone();
+            // Read-only idle acceleration; unsupported work and stale sources
+            // must enter the exact existing lifecycle recovery below.
+            if self.agent_runtime.supports_idle_restore_checkpoint() {
+                if let Ok(Some(tail)) = store
+                    .recovery_tail(&session_id, crate::restore_checkpoint::SCHEMA)
+                    .await
+                {
+                    if tail.checkpoint.header == header {
+                        if let Some(record) = crate::restore_checkpoint::restore(self, &tail) {
+                            // Upgrade a verified legacy idle checkpoint without
+                            // loading its full transcript. The store can only
+                            // attach values to an identical, source-bound idle
+                            // catalogue; it cannot change recovery metadata.
+                            if let Ok(Some(entry)) = store.catalog_entry(&session_id).await {
+                                if !entry.needs_recovery
+                                    && entry.next_seq == tail.next_seq
+                                    && entry.header == header
+                                {
+                                    let _ = store
+                                        .publish_catalog_presentation(
+                                            entry,
+                                            xharness_session::HistoryPresentation {
+                                                schema: crate::state::HISTORY_PRESENTATION_SCHEMA
+                                                    .to_owned(),
+                                                values: record.history_presentation_values(),
+                                            },
+                                        )
+                                        .await;
+                                }
+                            }
+                            let mut state = self.state.write().await;
+                            attach_workspace(
+                                &mut state,
+                                &session_id,
+                                &record.cwd,
+                                record.created_at,
+                            );
+                            if let Some(goal) = record.goal.clone() {
+                                state.goals.insert(session_id.clone(), goal);
+                            } else {
+                                state.goals.remove(&session_id);
+                            }
+                            state.sessions.insert(session_id.clone(), record);
+                            state.enforce_projection_budget(
+                                &session_id,
+                                self.config.session_event_cache_total_bytes,
+                            );
+                            report.restored_sessions += 1;
+                            report.checkpoint_restored_sessions += 1;
+                            report.checkpoint_tail_events += tail.events.len();
+                            continue;
+                        }
+                    }
+                }
+            }
+            // A candidate header is not proof that its event tail is valid.
+            // Validate the complete journal exactly once here, and keep one
+            // damaged session from hiding every healthy conversation.
+            let mut session = match store.load(&session_id).await {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    report.issues.push(HostRestoreIssue {
+                        session_id,
+                        message: "session disappeared during startup recovery".to_owned(),
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    report.issues.push(HostRestoreIssue {
+                        session_id,
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let mut cancellations =
+                xharness_session::stale_approval_cancellations(session.events());
+            cancellations.extend(crate::questions::delegated_question_cancellations(&session));
+            // Append-only, flushed and idempotent repair before worker resume.
+            // Parent history is read at the child's creation cut, not at now.
+            let parent = if let Some(parent_id) = crate::delegation::restored_delegation(&session)
+                .filter(|_| crate::context_selection::needs_legacy_check(&session))
+            {
+                match store.load(&parent_id).await {
+                    Ok(parent) => parent,
+                    Err(error) => {
+                        report.issues.push(HostRestoreIssue {
+                            session_id: session_id.clone(),
+                            message: format!(
+                                "could not verify inherited legacy context budget: {error}"
+                            ),
+                        });
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(repair) = crate::context_selection::legacy_repair(&session, parent.as_ref())
+            {
+                cancellations.push(repair);
+            }
+            if !cancellations.is_empty() {
+                store
+                    .append(&session_id, session.revision(), cancellations)
+                    .await?;
+                store.flush(&session_id).await?;
+                session = store.load(&session_id).await?.ok_or_else(|| {
+                    HostRestoreError::SessionDisappeared {
+                        session_id: session_id.clone(),
+                    }
+                })?;
+            }
+            self.questions.restore_snapshot(&session).await;
+            let inbox = InboxProjection::from_session(&session).map_err(|error| {
+                HostRestoreError::InvalidInbox {
+                    session_id: session_id.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            let cwd = header
+                .cwd
+                .clone()
+                .unwrap_or_else(|| self.config.cwd.to_string_lossy().into_owned());
+            let route = restored_route(&session, &self.config);
+            let queue = inbox
+                .recovery_inputs(&session)
+                .map(restored_prompt)
+                .collect::<VecDeque<_>>();
+            let projected_queue = restored_queue(&inbox);
+            let admissions = restored_admissions(&session);
+            let projected_queue_len = queue.len();
+            // A stop outlives the process, but a prompt the user queued before
+            // it does not belong to the aborted turn: resume it instead of
+            // stranding it behind the admission gate. Internal receipts project
+            // as context and keep the gate shut.
+            let queued_user_prompt = queue.iter().any(|prompt| prompt.user_mutable());
+            let pending_approvals = session.pending_tool_approvals();
+            let recoverable_questions = session.recoverable_user_questions();
+            let pending_approval_count = pending_approvals.len();
+            let recoverable_question_count = recoverable_questions.len();
+            // Undecided approvals have not crossed the execution boundary;
+            // durable questions use stable interaction identities. Their Web
+            // response channels must remain available after restart. Only
+            // calls without a safe interaction are outcome-unknown.
+            let pause_incomplete_tools =
+                matches!(recovery_policy, RecoveryPolicy::PauseIncompleteTools)
+                    && xharness_session::incomplete_tool_calls(session.events())
+                        .iter()
+                        .any(|pending| {
+                            !pending_approvals
+                                .iter()
+                                .any(|approval| approval.call_id == pending.call.id)
+                                && !recoverable_questions
+                                    .iter()
+                                    .any(|question| question.call.id == pending.call.id)
+                        });
+            let (runtime_background_work, runtime_resume_unknown) =
+                match self.agent_runtime.needs_session_resume(&session) {
+                    Ok(required) => (required, false),
+                    Err(error) => {
+                        report.issues.push(HostRestoreIssue {
+                            session_id: session_id.clone(),
+                            message: error.to_string(),
+                        });
+                        (false, true)
+                    }
+                };
+            let authoritative = self.agent_runtime.has_authoritative_sessions();
+            // Rebuild counters from typed durable events without constructing
+            // the complete Web projection during startup.
+            let metrics = MetricsProjectionState::rebuild_logged(session.events());
+            let tail = if authoritative {
+                ProjectedEventTail::empty_at(session.next_seq())
+            } else {
+                xharness_projection::project_session_event_tail(
+                    &session,
+                    &route,
+                    self.config.session_event_cache_capacity,
+                    self.config.session_event_cache_bytes,
+                )
+            };
+            let messages = if authoritative {
+                Vec::new()
+            } else {
+                session.derive_messages()
+            };
+            let updated_at = session
+                .events()
+                .last()
+                .map_or(header.created_at_ms, |event| event.timestamp_ms);
+            let next_turn = session
+                .events()
+                .iter()
+                .filter_map(|event| match event.data() {
+                    EventData::TurnStart { turn } => Some(*turn),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or_default();
+            let blank = !session.events().iter().any(|e| {
+                matches!(
+                    e.data(),
+                    EventData::UserMessage { .. } | EventData::AssistantMessage { .. }
+                )
+            }) && !inbox.has_pending();
+            let permission = restored_permission(&session);
+            let plan_active = restored_plan_mode(&session);
+            let goal = restored_goal(&session);
+            let schedules = xharness_schedule::active_schedules(&session).map_err(|message| {
+                HostRestoreError::InvalidSchedule {
+                    session_id: session_id.clone(),
+                    message,
+                }
+            })?;
+            let delegation_parent = crate::delegation::restored_delegation(&session);
+            let fork_parent = session
+                .events()
+                .iter()
+                .rev()
+                .find_map(|event| match event.data() {
+                    EventData::SessionForkOrigin {
+                        parent_session_id, ..
+                    } => Some(parent_session_id.clone()),
+                    _ => None,
+                });
+            let record = SessionRecord {
+                dispatch_paused: crate::delegation::restored_dispatch_paused(&session)
+                    || pause_incomplete_tools,
+                delegated: delegation_parent.is_some(),
+                restoring: selected.is_some(),
+                session_id: session_id.clone(),
+                created_at: header.created_at_ms,
+                updated_at,
+                running: false,
+                blank,
+                parent_session_id: delegation_parent.clone().or(fork_parent),
+                origin: delegation_parent
+                    .map(|_| "subagent".to_owned())
+                    .or_else(|| {
+                        session
+                            .events()
+                            .iter()
+                            .any(|event| {
+                                matches!(event.data(), EventData::SessionForkOrigin { .. })
+                            })
+                            .then(|| "fork".to_owned())
+                    })
+                    .or_else(|| {
+                        crate::automation::restored_origin(&session)
+                            .then(|| "automation".to_owned())
+                    }),
+                cwd: cwd.clone(),
+                agent_preset: restored_agent_preset(&session),
+                title: restored_title(&session),
+                model: ModelSelection {
+                    provider: route.provider.clone(),
+                    model: route.model.clone(),
+                    reasoning_effort: route.reasoning_effort.clone(),
+                    context_window_tokens: route.context_window_tokens,
+                },
+                permission_preset: permission,
+                active_permission: None,
+                plan_active,
+                goal: goal.clone(),
+                task_plan: xharness_session::session_plan(&session),
+                schedules,
+                schedules_hydrated: true,
+                events: tail.events,
+                event_base_seq: tail.base_seq,
+                event_cache_bytes: tail.bytes,
+                event_cache_weights: tail.event_bytes,
+                event_cache_resident_bytes: tail.resident_bytes,
+                event_cache_resident_weights: tail.event_resident_bytes,
+                event_cache_touched: 0,
+                projected_model: None,
+                metrics,
+                catalog_metrics: None,
+                messages,
+                queue,
+                projected_queue,
+                admissions,
+                mutation_receipts: restored_session_mutation_receipts(&session),
+                authoritative_seq: Some(tail.next_seq),
+                control: None,
+                next_turn,
+            };
+
+            let needs_recovery = projected_queue_len > 0
+                || pending_approval_count > 0
+                || recoverable_question_count > 0
+                || runtime_background_work
+                || runtime_resume_unknown
+                || !xharness_session::incomplete_tool_calls(session.events()).is_empty()
+                || !inbox.next_step().is_empty();
+            if let Some(checkpoint) = crate::restore_checkpoint::checkpoint(self, &session, &record)
+            {
+                let _ = store.publish_recovery_checkpoint(checkpoint).await;
+            }
+            // The journal is authoritative; a failed rebuild only means next
+            // startup must treat this session as unknown and replay it.
+            let catalog_entry = SessionCatalogEntry {
+                header: header.clone(),
+                updated_at_ms: updated_at,
+                title: record.title.clone(),
+                agent_preset: record.agent_preset.clone(),
+                parent_session_id: record.parent_session_id.clone(),
+                origin: record.origin.clone(),
+                model_provider: route.provider.clone(),
+                model: route.model.clone(),
+                reasoning_effort: route.reasoning_effort.clone(),
+                context_window_tokens: route.context_window_tokens,
+                permission_preset: permission.as_str().to_owned(),
+                plan_active,
+                blank,
+                next_seq: session.next_seq(),
+                needs_recovery,
+                metric_snapshot: Some(record.metrics.catalog_snapshot()),
+            };
+            let published = if needs_recovery {
+                store.publish_catalog_entry(catalog_entry).await
+            } else {
+                store
+                    .publish_catalog_presentation(
+                        catalog_entry,
+                        xharness_session::HistoryPresentation {
+                            schema: crate::state::HISTORY_PRESENTATION_SCHEMA.to_owned(),
+                            values: record.history_presentation_values(),
+                        },
+                    )
+                    .await
+            };
+            if let Err(error) = published {
+                report.issues.push(HostRestoreIssue {
+                    session_id: session_id.clone(),
+                    message: format!("catalog publication failed: {error}"),
+                });
+            }
+            {
+                let mut state = self.state.write().await;
+                attach_workspace(&mut state, &session_id, &cwd, header.created_at_ms);
+                state.sessions.insert(session_id.clone(), record);
+                state.enforce_projection_budget(
+                    &session_id,
+                    self.config.session_event_cache_total_bytes,
+                );
+                if let Some(goal) = goal {
+                    state.goals.insert(session_id.clone(), goal);
+                }
+            }
+            loaded_ids.insert(session_id.clone());
+            report.restored_sessions += 1;
+            report.waiting_next_step_inputs += inbox.next_step().len();
+            if pause_incomplete_tools {
+                report.paused_incomplete_tool_sessions += 1;
+                report.issues.push(HostRestoreIssue {
+                    session_id: session_id.clone(),
+                    message: "interrupted tool work was restored paused; send a new user prompt to continue"
+                        .to_owned(),
+                });
+            }
+            if !pause_incomplete_tools
+                && (!crate::delegation::restored_dispatch_paused(&session) || queued_user_prompt)
+                && (projected_queue_len > 0
+                    || pending_approval_count > 0
+                    || recoverable_question_count > 0
+                    || runtime_background_work)
+            {
+                let prompt = match self.prompt_assembly(&session_id).await {
+                    Ok(prompt) => prompt,
+                    Err(message) => {
+                        // One invalid project file must not block startup or
+                        // healthy workspaces. Keep its inbox intact and expose
+                        // the failure through the existing recovery issue path.
+                        failed_resumes.insert(session_id.clone());
+                        report.issues.push(HostRestoreIssue {
+                            session_id: session_id.clone(),
+                            message,
+                        });
+                        continue;
+                    }
+                };
+                resumable.push((
+                    session_id,
+                    cwd,
+                    route,
+                    permission,
+                    prompt,
+                    projected_queue_len,
+                    pending_approval_count,
+                    recoverable_question_count,
+                ));
+            }
+        }
+
+        // The runtime subscribes and prepares every recovered input before it
+        // wakes the durable Agent. Only after that succeeds do we publish the
+        // Host-owned driver/control projection.
+        for (
+            session_id,
+            cwd,
+            route,
+            permission,
+            prompt,
+            projected_count,
+            projected_approvals,
+            projected_questions,
+        ) in resumable
+        {
+            match self
+                .agent_runtime
+                .resume_session(AgentSessionRequest {
+                    session_id: session_id.clone(),
+                    cwd,
+                    route,
+                    permission,
+                    prompt: Some(prompt),
+                })
+                .await
+            {
+                Ok(runtime_report) => {
+                    if runtime_report.pending_turns != projected_count {
+                        return Err(HostRestoreError::ResumeMismatch {
+                            session_id,
+                            runtime_count: runtime_report.pending_turns,
+                            projected_count,
+                        });
+                    }
+                    report.resumed_pending_turns += runtime_report.pending_turns;
+                    if runtime_report.recovered_approval_work_id.is_some() {
+                        report.resumed_pending_approvals += projected_approvals;
+                    } else if projected_approvals > 0 {
+                        failed_resumes.insert(session_id.clone());
+                        report.issues.push(HostRestoreIssue {
+                            session_id: session_id.clone(),
+                            message: "runtime did not attach the durable pending approval"
+                                .to_owned(),
+                        });
+                        continue;
+                    }
+                    if runtime_report.recovered_question_work_id.is_some() {
+                        report.resumed_user_questions += projected_questions;
+                    } else if projected_questions > 0 {
+                        failed_resumes.insert(session_id.clone());
+                        report.issues.push(HostRestoreIssue {
+                            session_id: session_id.clone(),
+                            message: "runtime did not attach the durable user question".to_owned(),
+                        });
+                        continue;
+                    }
+                    if runtime_report.pending_turns == 0
+                        && runtime_report.recovered_approval_work_id.is_none()
+                        && runtime_report.recovered_question_work_id.is_none()
+                        && runtime_report.recovered_compaction_work_id.is_none()
+                    {
+                        // Startup may have removed already-consumed steering.
+                        // Publish that cleanup even when no observer must run.
+                        self.sync_authoritative_session(&session_id)
+                            .await
+                            .map_err(|error| HostRestoreError::InvalidInbox {
+                                session_id: session_id.clone(),
+                                message: error.message,
+                            })?;
+                        // Timer-only activation is driven by the runtime's
+                        // background-turn notice. Starting an empty Host queue
+                        // driver here would race and clear its running state.
+                        continue;
+                    }
+                    let (control_tx, control_rx) = mpsc::channel::<DriverCommand>(64);
+                    {
+                        let mut state = self.state.write().await;
+                        let record = state
+                            .sessions
+                            .get_mut(&session_id)
+                            .expect("restored session remains registered");
+                        record.running = true;
+                        record.control = Some(control_tx);
+                    }
+                    let host = self.as_ref().clone();
+                    if let Some(work_id) = runtime_report
+                        .recovered_approval_work_id
+                        .or(runtime_report.recovered_question_work_id)
+                        .or(runtime_report.recovered_compaction_work_id)
+                    {
+                        let recovered = self
+                            .agent_runtime
+                            .take_resumed_turn(&session_id, &work_id)
+                            .await
+                            .map_err(|error| HostRestoreError::InvalidInbox {
+                                session_id: session_id.clone(),
+                                message: error.to_string(),
+                            })?
+                            .ok_or_else(|| HostRestoreError::InvalidInbox {
+                                session_id: session_id.clone(),
+                                message: format!(
+                                    "runtime lost recovered interaction work {work_id:?}"
+                                ),
+                            })?;
+                        tokio::spawn(async move {
+                            host.drive_recovered_turn(session_id, recovered, control_rx)
+                                .await
+                        });
+                    } else {
+                        tokio::spawn(
+                            async move { host.drive_session(session_id, control_rx).await },
+                        );
+                    }
+                }
+                Err(error) => {
+                    failed_resumes.insert(session_id.clone());
+                    report.issues.push(HostRestoreIssue {
+                        session_id,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+
+        // Session discovery may attach newly restored ids to a Workspace.
+        // Reapply durable custom ordering/tombstones after those ids exist.
+        if initialize {
+            self.reload_control_projection().await?;
+        }
+
+        if let Err(error) = self.questions.deliver_restored_answers().await {
+            report.issues.push(HostRestoreIssue {
+                session_id: "question-outbox".into(),
+                message: error.to_string(),
+            });
+        }
+        // A stored model selection can outlive the deployment that advertised
+        // it, and the registry that was just refreshed is the authority on what
+        // is still offered. Repair before publishing so a healthy provider is
+        // not reported as an unavailable model.
+        model_reconciliation_started();
+        if initialize {
+            report.issues.extend(self.reconcile_model_routes().await);
+        }
+        // A metadata-only session must not admit new user work until durable
+        // runtime reattachment and restored interactions have both settled.
+        let mut state = self.state.write().await;
+        if let Some(ids) = selected {
+            for id in ids {
+                if loaded_ids.contains(id) && !failed_resumes.contains(id) {
+                    if let Some(record) = state.sessions.get_mut(id) {
+                        record.restoring = false;
+                    }
+                }
+            }
+        }
+        // Publishing issues on Host state keeps them visible in host.describe.
+        if initialize {
+            state.startup_issues = report.issues.clone();
+        } else {
+            state.startup_issues.extend(report.issues.iter().cloned());
+        }
+        state.model_settings_error = report.model_settings_error.clone();
+        Ok(report)
+    }
+
+    /// Restore the small control/model state and install the lazy Store before
+    /// the HTTP readiness gate opens. No session directory scan belongs here.
+    pub async fn prepare_startup_basics(
+        self: &Arc<Self>,
+        store: Arc<dyn Store>,
+    ) -> Result<(), HostRestoreError> {
+        self.start_background_turn_listener();
+        self.restore_control_state().await?;
+        self.finish_deleted_session_cleanup(&store).await?;
+        let model_settings_error = self.refresh_model_settings().await.err();
+        if model_settings_error.is_some() {
+            if let Some(backend) = self.model_settings.get() {
+                backend.activate(crate::ModelRegistry::new());
+            }
+        }
+        self.reload_control_projection().await?;
+        self.state.write().await.model_settings_error = model_settings_error;
+        let _ = self.lazy_store.set(store);
+        Ok(())
+    }
+
+    async fn finish_deleted_session_cleanup(
+        &self,
+        store: &Arc<dyn Store>,
+    ) -> Result<(), HostRestoreError> {
+        let deleted = self
+            .state
+            .read()
+            .await
+            .deleted_sessions
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in deleted {
+            store.delete_session_data(&id).await?;
+            self.config
+                .attachment_store
+                .delete_session_data(&id)
+                .await
+                .map_err(|error| HostRestoreError::CatalogueWorker(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Stream old headers into a paused, metadata-only projection. The caller
+    /// may run this after Ready: slow media, legacy logs, and bad entries then
+    /// affect individual histories instead of holding the whole product.
+    pub async fn populate_startup_catalog(
+        self: &Arc<Self>,
+        store: Arc<dyn Store>,
+    ) -> Result<(Vec<String>, Vec<String>), HostRestoreError> {
+        let (sender, mut receiver) = mpsc::channel(32);
+        let mut scan = tokio::task::JoinSet::new();
+        scan.spawn(async move { store.stream_startup_candidates(sender).await });
+        let mut necessary = Vec::new();
+        let mut deferred = Vec::new();
+        let mut published = 0usize;
+        let mut last_notified = 0usize;
+        loop {
+            let candidate =
+                match tokio::time::timeout(std::time::Duration::from_millis(250), receiver.recv())
+                    .await
+                {
+                    Ok(Some(candidate)) => candidate,
+                    Ok(None) => break,
+                    Err(_) => {
+                        // A held lock must not hide the final partial batch from
+                        // the UI while another scanner worker remains blocked.
+                        if published > last_notified {
+                            self.push_host(serde_json::json!({
+                                "type": "host/remote-event",
+                                "event": "xharness/catalog-updated",
+                                "args": [],
+                            }));
+                            last_notified = published;
+                        }
+                        continue;
+                    }
+                };
+            let header = match candidate {
+                StartupCandidate::Header(header) => header,
+                StartupCandidate::Unreadable(entry) => {
+                    self.state
+                        .write()
+                        .await
+                        .startup_issues
+                        .push(HostRestoreIssue {
+                            session_id: entry.session_id,
+                            message: entry.reason,
+                        });
+                    continue;
+                }
+            };
+            let session_id = header.id.clone();
+            if self
+                .state
+                .read()
+                .await
+                .deleted_sessions
+                .contains(&session_id)
+            {
+                continue;
+            }
+            // A user can create a session while discovery is still running.
+            // The durable in-memory record already owns that identity.
+            if self.state.read().await.sessions.contains_key(&session_id) {
+                continue;
+            }
+            self.lazy_headers
+                .write()
+                .await
+                .insert(header.id.clone(), header.clone());
+            let index = match self.lazy_store.get() {
+                Some(store) => match store.catalog_entry(&header.id).await {
+                    Ok(index) => index,
+                    Err(error) => {
+                        self.state
+                            .write()
+                            .await
+                            .startup_issues
+                            .push(HostRestoreIssue {
+                                session_id: session_id.clone(),
+                                message: error.to_string(),
+                            });
+                        None
+                    }
+                },
+                None => None,
+            };
+            let indexed = index.as_ref();
+            let cwd = header
+                .cwd
+                .clone()
+                .unwrap_or_else(|| self.config.cwd.to_string_lossy().into_owned());
+            let model = ModelSelection {
+                provider: indexed.map_or_else(
+                    || self.config.provider_id.clone(),
+                    |e| e.model_provider.clone(),
+                ),
+                model: indexed.map_or_else(|| self.config.model_id.clone(), |e| e.model.clone()),
+                reasoning_effort: indexed.and_then(|e| e.reasoning_effort.clone()),
+                context_window_tokens: indexed.and_then(|e| e.context_window_tokens),
+            };
+            let record = SessionRecord {
+                dispatch_paused: true,
+                delegated: false,
+                restoring: true,
+                session_id: header.id.clone(),
+                created_at: header.created_at_ms,
+                updated_at: indexed.map_or(header.created_at_ms, |e| e.updated_at_ms),
+                running: false,
+                // Unknown legacy history is not proof of an empty draft.
+                // New Session may reuse this flag before replay finishes.
+                blank: indexed.is_some_and(|e| e.blank),
+                parent_session_id: indexed.and_then(|e| e.parent_session_id.clone()),
+                origin: indexed.and_then(|e| e.origin.clone()),
+                cwd: cwd.clone(),
+                agent_preset: indexed.and_then(|e| e.agent_preset.clone()),
+                title: indexed.and_then(|e| e.title.clone()),
+                model,
+                permission_preset: indexed
+                    .and_then(|e| PermissionPreset::parse(&e.permission_preset))
+                    .unwrap_or_default(),
+                active_permission: None,
+                plan_active: indexed.is_some_and(|e| e.plan_active),
+                goal: None,
+                task_plan: None,
+                schedules: Vec::new(),
+                schedules_hydrated: false,
+                events: Vec::new(),
+                event_base_seq: 0,
+                event_cache_bytes: 0,
+                event_cache_weights: Vec::new(),
+                event_cache_resident_bytes: 0,
+                event_cache_resident_weights: Vec::new(),
+                event_cache_touched: 0,
+                projected_model: None,
+                metrics: MetricsProjectionState::default(),
+                catalog_metrics: indexed.and_then(|e| {
+                    xharness_projection::metrics::catalog_metric_values(
+                        e.metric_snapshot.as_ref(),
+                    )?;
+                    e.metric_snapshot.clone()
+                }),
+                messages: Vec::new(),
+                queue: VecDeque::new(),
+                projected_queue: Vec::new(),
+                admissions: crate::admission_cache::AdmissionCache::new(true),
+                mutation_receipts: BTreeMap::new(),
+                authoritative_seq: indexed.map(|e| e.next_seq),
+                control: None,
+                next_turn: 0,
+            };
+            let mut state = self.state.write().await;
+            if state.sessions.contains_key(&session_id) {
+                continue;
+            }
+            attach_workspace(&mut state, &session_id, &cwd, header.created_at_ms);
+            state.sessions.insert(session_id.clone(), record);
+            state.enforce_projection_budget(
+                &session_id,
+                self.config.session_event_cache_total_bytes,
+            );
+            drop(state);
+            if indexed.is_some_and(|e| e.needs_recovery) {
+                necessary.push(header.id);
+            } else if indexed.is_none() {
+                deferred.push(header.id);
+            }
+            published += 1;
+            if published - last_notified >= 16 {
+                self.push_host(serde_json::json!({
+                    "type": "host/remote-event",
+                    "event": "xharness/catalog-updated",
+                    "args": [],
+                }));
+                last_notified = published;
+            }
+        }
+        scan.join_next()
+            .await
+            .ok_or_else(|| {
+                HostRestoreError::CatalogueWorker("scanner exited without a result".into())
+            })?
+            .map_err(|error| HostRestoreError::CatalogueWorker(error.to_string()))??;
+        if published > last_notified {
+            self.push_host(serde_json::json!({
+                "type": "host/remote-event",
+                "event": "xharness/catalog-updated",
+                "args": [],
+            }));
+        }
+        let route_issues = self.reconcile_model_routes().await;
+        self.state.write().await.startup_issues.extend(route_issues);
+        Ok((necessary, deferred))
+    }
+
+    /// Compatibility composition for callers that explicitly require a fully
+    /// discovered catalogue before returning.
+    pub async fn prepare_startup_catalog(
+        self: &Arc<Self>,
+        store: Arc<dyn Store>,
+    ) -> Result<(Vec<String>, Vec<String>), HostRestoreError> {
+        self.prepare_startup_basics(store.clone()).await?;
+        self.populate_startup_catalog(store).await
+    }
+
+    /// Background catalogue failures do not retract Ready, but remain
+    /// inspectable through host.describe instead of producing a blank list
+    /// with only a line in stderr.
+    pub async fn report_startup_catalog_failure(&self, error: &HostRestoreError) {
+        self.state
+            .write()
+            .await
+            .startup_issues
+            .push(HostRestoreIssue {
+                session_id: "<catalogue>".to_owned(),
+                message: error.to_string(),
+            });
+    }
+
+    /// The background catalogue is the readiness boundary for cold sessions.
+    /// History may remain deliberately unhydrated until the user opens it.
+    pub async fn startup_catalogue_counts(&self) -> (usize, usize) {
+        let state = self.state.read().await;
+        (state.sessions.len(), state.startup_issues.len())
+    }
+
+    /// One-time repair of pre-metrics sidecars, after Ready and work recovery.
+    /// Only counters are retained: this does not open histories, derive model
+    /// messages, attach agents, or execute tools. One journal is read at a time.
+    pub async fn backfill_startup_metrics(&self) {
+        let ids: Vec<_> = self
+            .state
+            .read()
+            .await
+            .sessions
+            .values()
+            .filter(|record| record.restoring && record.catalog_metrics.is_none())
+            .map(|record| record.session_id.clone())
+            .collect();
+        for id in ids {
+            if let Err(error) = self.backfill_session_metrics(&id).await {
+                self.state
+                    .write()
+                    .await
+                    .startup_issues
+                    .push(HostRestoreIssue {
+                        session_id: id,
+                        message: format!("usage catalogue repair failed: {error}"),
+                    });
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn backfill_session_metrics(&self, session_id: &str) -> Result<(), HostRestoreError> {
+        let gate = self.session_restore_gate(session_id).await;
+        let _guard = gate.lock().await;
+        if !self
+            .state
+            .read()
+            .await
+            .sessions
+            .get(session_id)
+            .is_some_and(|record| record.restoring && record.catalog_metrics.is_none())
+        {
+            return Ok(());
+        }
+        let Some(store) = self.lazy_store.get() else {
+            return Ok(());
+        };
+        // Missing/stale catalogues use the existing full legacy recovery path;
+        // metric repair must not manufacture needs_recovery=false for them.
+        let Some(mut entry) = store.catalog_entry(session_id).await? else {
+            return Ok(());
+        };
+        struct MetricsFold(MetricsProjectionState);
+        impl xharness_session::CatalogMetricsFold for MetricsFold {
+            fn apply(&mut self, events: &[xharness_session::LoggedEvent]) {
+                for event in events {
+                    self.0.apply_logged(event);
+                }
+            }
+            fn snapshot(&self) -> Value {
+                self.0.catalog_snapshot()
+            }
+        }
+        let expected_next = entry.next_seq;
+        let snapshot = match store
+            .repair_catalog_metrics(
+                entry.clone(),
+                Box::new(MetricsFold(MetricsProjectionState::default())),
+            )
+            .await?
+        {
+            Some(snapshot) => snapshot,
+            None => {
+                // Optional Store seam: unsupported or changed sources retain
+                // the full-load path, including normal semantic validation.
+                let Some(session) = store.load(session_id).await? else {
+                    return Ok(());
+                };
+                if entry.next_seq != session.next_seq() {
+                    return Ok(());
+                }
+                let snapshot =
+                    MetricsProjectionState::rebuild_logged(session.events()).catalog_snapshot();
+                entry.metric_snapshot = Some(snapshot.clone());
+                store.publish_catalog_entry(entry).await?;
+                snapshot
+            }
+        };
+        let mut state = self.state.write().await;
+        if let Some(record) = state.sessions.get_mut(session_id) {
+            if record.restoring && record.next_event_seq() == expected_next {
+                record.catalog_metrics = Some(snapshot);
+            }
+        }
+        drop(state);
+        self.push_host(serde_json::json!({
+            "type": "host/remote-event", "event": "xharness/catalog-updated", "args": [],
+        }));
+        Ok(())
+    }
+
+    pub(crate) async fn session_restore_gate(
+        &self,
+        session_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.lazy_restore_gates.lock().await;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        gates
+            .entry(session_id.to_owned())
+            .or_insert_with(std::sync::Weak::new)
+            .upgrade()
+            .unwrap_or_else(|| {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(session_id.to_owned(), Arc::downgrade(&gate));
+                gate
+            })
+    }
+
+    /// Deduplicated journal replay, used for selected startup work and when a
+    /// user opens a metadata-only conversation.
+    pub async fn hydrate_session(&self, session_id: &str) -> Result<(), HostRestoreError> {
+        let gate = self.session_restore_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let needs_replay = {
+            let state = self.state.read().await;
+            !state.deleted_sessions.contains(session_id)
+                && match state.sessions.get(session_id) {
+                    Some(record) => record.restoring,
+                    // A validated discovery header can precede the streaming
+                    // startup catalogue record (e.g. subtree deletion).
+                    None => self.lazy_headers.read().await.contains_key(session_id),
+                }
+        };
+        if !needs_replay {
+            return Ok(());
+        }
+        let Some(store) = self.lazy_store.get().cloned() else {
+            return Ok(());
+        };
+        let mut selected = BTreeSet::new();
+        selected.insert(session_id.to_owned());
+        let host = Arc::new(self.clone());
+        let report = host
+            .restore_filtered(
+                store,
+                RecoveryPolicy::PauseIncompleteTools,
+                Some(&selected),
+                false,
+                || {},
+            )
+            .await?;
+        if report.restored_sessions == 0 {
+            return Err(HostRestoreError::SessionDisappeared {
+                session_id: session_id.to_owned(),
+            });
+        }
+        if self
+            .state
+            .read()
+            .await
+            .sessions
+            .get(session_id)
+            .is_some_and(|record| record.restoring)
+        {
+            return Err(HostRestoreError::RecoveryIncomplete {
+                session_id: session_id.to_owned(),
+            });
+        }
+        let projections = self
+            .state
+            .read()
+            .await
+            .sessions
+            .get(session_id)
+            .map(|record| record.projection_values());
+        if let Some(serde_json::Value::Object(projections)) = projections {
+            for (key, value) in projections {
+                self.push_projection(session_id, &key, value).await;
+            }
+        }
+        self.queue_title(session_id);
+        // Replay resolves conservative catalogue facts, including an unknown
+        // legacy draft becoming confirmed empty. Refresh list consumers too.
+        self.push_host(serde_json::json!({
+            "type": "host/remote-event", "event": "xharness/catalog-updated", "args": [],
+        }));
+        Ok(())
+    }
+}
+
+pub(crate) fn restored_route(session: &Session, config: &crate::HostConfig) -> ModelRoute {
+    // `session/model-selected` is the durable user preference.  Request
+    // headers are execution observations and older providers may omit the
+    // optional reasoning effort from them.  Looking for both event kinds in a
+    // single reverse scan lets a later request header erase an explicit
+    // effort after restart (for example `low` becomes the model default).
+    // Prefer the newest explicit selection for the lifetime of the session;
+    // only legacy sessions without one fall back to their last request route.
+    if let Some(route) = session
+        .events()
+        .iter()
+        .rev()
+        .find_map(|event| match event.data() {
+            EventData::SessionModelSelected {
+                provider,
+                model,
+                reasoning_effort,
+                context_window_tokens,
+            } => Some(ModelRoute {
+                provider: provider.clone(),
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+                context_window_tokens: *context_window_tokens,
+            }),
+            _ => None,
+        })
+    {
+        return route;
+    }
+
+    session
+        .events()
+        .iter()
+        .rev()
+        .find_map(|event| match event.data() {
+            EventData::RequestHeader { header } => Some(ModelRoute {
+                provider: header.provider.clone(),
+                model: header.model.clone(),
+                reasoning_effort: header.reasoning_effort.clone(),
+                context_window_tokens: None,
+            }),
+            _ => None,
+        })
+        .unwrap_or_else(|| ModelRoute {
+            provider: config.provider_id.clone(),
+            model: config.model_id.clone(),
+            reasoning_effort: None,
+            context_window_tokens: config
+                .token_guard
+                .as_ref()
+                .map(|guard| guard.budget().context_window_tokens),
+        })
+}
+
+pub(crate) fn restored_permission(session: &Session) -> PermissionPreset {
+    for event in session.events().iter().rev() {
+        match event.data() {
+            EventData::PermissionPreset { preset } => {
+                if let Some(preset) = PermissionPreset::parse(preset) {
+                    return preset;
+                }
+            }
+            EventData::SandboxMode {
+                mode: xharness_session::SessionSandboxMode::DangerFullAccess,
+                ..
+            } => return PermissionPreset::DangerFullAccess,
+            EventData::SandboxMode { .. } => return PermissionPreset::WorkspaceWrite,
+            _ => {}
+        }
+    }
+    PermissionPreset::default()
+}
+
+pub(crate) fn restored_agent_preset(session: &Session) -> Option<String> {
+    session
+        .events()
+        .iter()
+        .rev()
+        .find_map(|event| {
+            let EventData::AgentPresetSelected { agent_preset } = event.data() else {
+                return None;
+            };
+            Some(agent_preset.clone())
+        })
+        .or_else(|| Some("coding".to_owned()))
+}
+
+pub(crate) fn restored_title(session: &Session) -> Option<String> {
+    session.events().iter().rev().find_map(|event| {
+        let EventData::SessionTitle { title, .. } = event.data() else {
+            return None;
+        };
+        Some(title.clone())
+    })
+}
+
+pub(crate) fn restored_plan_mode(session: &Session) -> bool {
+    session
+        .events()
+        .iter()
+        .rev()
+        .find_map(|event| match event.data() {
+            EventData::PlanMode { active } => Some(*active),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn restored_goal(session: &Session) -> Option<GoalState> {
+    let mut current = None;
+    for event in session.events() {
+        let EventData::GoalChange { change } = event.data() else {
+            continue;
+        };
+        current = match change {
+            xharness_session::GoalChange::Snapshot(change) => Some(GoalState {
+                execution: None,
+                id: change.goal.id.clone(),
+                revision: change.goal.revision,
+                objective: change.goal.objective.clone(),
+                phase: change.goal.phase,
+                blocked_reason: change.goal.blocked_reason.clone(),
+                max_goal_rounds: change.goal.max_goal_rounds,
+                rounds_started: change.rounds_started,
+                created_at: change.created_at,
+                updated_at: change.updated_at,
+            }),
+            xharness_session::GoalChange::Clear(_) => None,
+        };
+    }
+    if let Some(goal) = current.as_mut() {
+        goal.execution = Some(crate::goals::execution_projection(session));
+    }
+    current
+}
+
+pub(crate) fn restored_prompt(input: &xharness_session::InboxMessage) -> QueuedPrompt {
+    let projected = project_inbox_message(input);
+    QueuedPrompt {
+        id: input.id.clone(),
+        text: input.message.content.clone(),
+        content: projected.content,
+        source: projected.source,
+        fingerprint: projected.rpc_fingerprint,
+        placement: QueuePlacement::Queued,
+    }
+}
+
+pub(crate) fn restored_queue(inbox: &InboxProjection) -> Vec<QueuedPrompt> {
+    let mut items = inbox
+        .next_turn()
+        .iter()
+        .filter(|m| !xharness_agent::is_goal_message(m))
+        .map(restored_prompt)
+        .collect::<Vec<_>>();
+    items.extend(inbox.next_step().iter().map(|input| {
+        let mut prompt = restored_prompt(input);
+        prompt.placement = if prompt.source.get("kind").and_then(Value::as_str) == Some("user") {
+            QueuePlacement::Steering
+        } else {
+            QueuePlacement::Context
+        };
+        prompt
+    }));
+    items
+}
+
+pub(crate) fn restored_admission(
+    session: &Session,
+    rpc_id: &str,
+) -> Option<crate::admission_cache::AdmissionReceipt> {
+    session.events().iter().rev().find_map(|event| {
+        let EventData::AgentInboxSpliced { inserted, .. } = event.data() else {
+            return None;
+        };
+        inserted
+            .iter()
+            .rev()
+            .filter(|input| input.id == rpc_id)
+            .find_map(|input| admission_receipt(session, input).map(|(_, receipt)| receipt))
+    })
+}
+
+fn admission_receipt<'a>(
+    session: &Session,
+    input: &'a xharness_session::InboxMessage,
+) -> Option<(&'a str, crate::admission_cache::AdmissionReceipt)> {
+    let metadata = input.source.as_ref()?;
+    if metadata.get("rpcSessionId")?.as_str()? != session.header().id {
+        return None;
+    }
+    let fingerprint = metadata.get("rpcFingerprint")?.as_str()?.to_owned();
+    Some((
+        &input.id,
+        crate::admission_cache::AdmissionReceipt {
+            fingerprint: Some(fingerprint),
+        },
+    ))
+}
+
+pub(crate) fn restored_admissions(session: &Session) -> crate::admission_cache::AdmissionCache {
+    let mut admissions = crate::admission_cache::AdmissionCache::new(true);
+    for event in session.events() {
+        if let EventData::AgentInboxSpliced { inserted, .. } = event.data() {
+            for input in inserted {
+                if let Some((id, receipt)) = admission_receipt(session, input) {
+                    admissions.insert(id.to_owned(), receipt);
+                }
+            }
+        }
+    }
+    admissions
+}
+
+pub(crate) fn restored_session_mutation_receipts(
+    session: &Session,
+) -> BTreeMap<String, crate::state::ProjectedSessionMutationReceipt> {
+    session
+        .events()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            let EventData::SessionMutationCommitted { receipt } = event.data() else {
+                return None;
+            };
+            let state_event_seq = session.events().get(index.checked_sub(1)?)?.seq;
+            Some((
+                receipt.rpc_id.clone(),
+                crate::state::ProjectedSessionMutationReceipt {
+                    receipt: receipt.clone(),
+                    state_event_seq,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Identity for a Workspace discovered from a restored Session's `cwd` rather
+/// than an explicit `workspace.create`.
+///
+/// The id must be a pure function of the canonical path. Deriving it from
+/// `state.workspaces.len()` made identity depend on how many other Workspaces
+/// happened to be restored first, so creating or deleting an unrelated
+/// Workspace rebound an existing id to a different directory. The durable
+/// `workspace_order_set` written earlier then replayed that id against the
+/// wrong workspace, permanently reordering the user's sidebar.
+fn discovered_workspace_id(cwd: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(cwd.as_bytes()));
+    format!("workspace-path-{}", &digest[..16])
+}
+
+fn attach_workspace(
+    state: &mut crate::state::HostState,
+    session_id: &str,
+    cwd: &str,
+    created_at_ms: u64,
+) {
+    let workspace_id = state
+        .workspaces
+        .iter()
+        .find_map(|(id, workspace)| (workspace.path == cwd).then(|| id.clone()))
+        .unwrap_or_else(|| {
+            let mut id = discovered_workspace_id(cwd);
+            while state.workspaces.contains_key(&id) {
+                id.push('x');
+            }
+            let title = Path::new(cwd)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(cwd)
+                .to_owned();
+            let timestamp = created_at_ms.to_string();
+            state.workspaces.insert(
+                id.clone(),
+                WorkspaceRecord {
+                    workspace_id: id.clone(),
+                    path: cwd.to_owned(),
+                    title,
+                    session_ids: Vec::new(),
+                    created_at: timestamp.clone(),
+                    updated_at: timestamp,
+                },
+            );
+            state.workspace_order.push(id.clone());
+            id
+        });
+    let workspace = state
+        .workspaces
+        .get_mut(&workspace_id)
+        .expect("selected workspace exists");
+    if !workspace
+        .session_ids
+        .iter()
+        .any(|existing| existing == session_id)
+    {
+        workspace.session_ids.push(session_id.to_owned());
+    }
+    workspace.updated_at = created_at_ms.to_string();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+
+    use async_trait::async_trait;
+    use futures::{stream, StreamExt};
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
+    use xharness_agent::{DurableInbox, InboxMessage, InboxTarget, MemoryLeaseManager};
+    use xharness_api::{
+        ApiBackend, ClientResponse, ClientResponseKind, RpcId, RpcMethod, RpcResult,
+    };
+    use xharness_control::{ControlRevision, ControlStore, JsonlControlStore, MemoryControlStore};
+    use xharness_core::{
+        FinishReason, IdentityContextPolicy, ModelProvider, ProviderError, ProviderEvent,
+        ProviderRequest, ProviderStream, TokenUsage,
+    };
+    use xharness_interaction::{
+        AnswerDestination, AskUserQuestionRequest, AskUserQuestionTool, QuestionInvocation,
+        QuestionOption, QuestionSpec, ASK_USER_QUESTION_TOOL,
+    };
+    use xharness_session::{
+        ApprovalOutcome, AssistantChunk, EventData, LlmFailure, LlmRetryMode, MemorySessionStore,
+        Message, RequestHeader, Revision, SequenceRange, Session, SessionEvent, SessionHeader,
+        Store, SurfaceReplace, ToolCall, ToolOutcome, ToolResultData, TurnEndReason,
+    };
+    use xharness_tools::{ToolDefinition, ToolExecutor, ToolOutput, ToolRegistry, ToolSpec};
+
+    use super::*;
+    use crate::{
+        state::now_ms, AgentRuntime, AgentRuntimeError, AgentTurnRequest, DurableLoopAgentRuntime,
+        HostConfig, ModelDescriptor, ModelReasoning, ModelReasoningEffort, ModelRegistry, NoTools,
+        PermissionPreset, RegisteredModel, RunningTurn, SessionToolFactory,
+    };
+
+    struct OfflineSnapshotRuntime {
+        store: Arc<dyn Store>,
+    }
+
+    struct CountedSnapshotRuntime {
+        store: Arc<dyn Store>,
+        loads: AtomicUsize,
+        idle_checkpoints: bool,
+    }
+
+    #[async_trait]
+    impl AgentRuntime for CountedSnapshotRuntime {
+        fn has_available_route(&self) -> bool {
+            true
+        }
+        fn can_route(&self, _route: &ModelRoute) -> bool {
+            true
+        }
+        fn has_authoritative_sessions(&self) -> bool {
+            true
+        }
+        fn supports_idle_restore_checkpoint(&self) -> bool {
+            self.idle_checkpoints
+        }
+        async fn authoritative_session(
+            &self,
+            id: &str,
+        ) -> Result<Option<Session>, AgentRuntimeError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.store
+                .load(id)
+                .await
+                .map_err(|e| AgentRuntimeError::Preparation {
+                    message: e.to_string(),
+                })
+        }
+        async fn start_turn(
+            &self,
+            _request: AgentTurnRequest,
+        ) -> Result<Box<dyn RunningTurn>, AgentRuntimeError> {
+            panic!("read-only history must never execute model work")
+        }
+    }
+
+    #[async_trait]
+    impl AgentRuntime for OfflineSnapshotRuntime {
+        fn has_available_route(&self) -> bool {
+            true
+        }
+
+        fn can_route(&self, _route: &ModelRoute) -> bool {
+            true
+        }
+
+        fn has_authoritative_sessions(&self) -> bool {
+            true
+        }
+
+        async fn authoritative_session(
+            &self,
+            session_id: &str,
+        ) -> Result<Option<Session>, AgentRuntimeError> {
+            self.store
+                .load(session_id)
+                .await
+                .map_err(|error| AgentRuntimeError::Preparation {
+                    message: error.to_string(),
+                })
+        }
+
+        async fn start_turn(
+            &self,
+            _request: AgentTurnRequest,
+        ) -> Result<Box<dyn RunningTurn>, AgentRuntimeError> {
+            panic!("offline restore validation must not start model work")
+        }
+    }
+
+    struct GatedProvider {
+        calls: AtomicUsize,
+        release: Arc<Notify>,
+        answers: Mutex<VecDeque<String>>,
+    }
+
+    struct LiveDeltaProvider {
+        fragments: usize,
+        delta_announced: Arc<Notify>,
+        finish_release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for LiveDeltaProvider {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> Option<&str> {
+            Some("test-model")
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let delta_announced = Arc::clone(&self.delta_announced);
+            let finish_release = Arc::clone(&self.finish_release);
+            Ok(Box::pin(
+                stream::once(async move {
+                    delta_announced.notify_one();
+                    Ok(ProviderEvent::TextDelta("live-0".to_owned()))
+                })
+                .chain(stream::iter((1..self.fragments).map(|index| {
+                    Ok(ProviderEvent::TextDelta(format!("live-{index}")))
+                })))
+                .chain(stream::once(async move {
+                    finish_release.notified().await;
+                    Ok(ProviderEvent::Completed {
+                        finish_reason: Some(FinishReason::Stop),
+                        usage: None,
+                        provider_items: Vec::new(),
+                    })
+                })),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for GatedProvider {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> Option<&str> {
+            Some("test-model")
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            let answer = self.answers.lock().unwrap().pop_front().unwrap();
+            Ok(Box::pin(stream::iter([
+                Ok(ProviderEvent::TextDelta(answer)),
+                Ok(ProviderEvent::Completed {
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: Some(TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_read_tokens: 90,
+                        cache_write_tokens: 2,
+                        reasoning_tokens: 3,
+                    }),
+                    provider_items: Vec::new(),
+                }),
+            ])))
+        }
+    }
+
+    struct ApprovalRecoveryProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ApprovalRecoveryProvider {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> Option<&str> {
+            Some("test-model")
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(Box::pin(stream::iter([
+                Ok(ProviderEvent::TextDelta("recovered".to_owned())),
+                Ok(ProviderEvent::Completed {
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: None,
+                    provider_items: Vec::new(),
+                }),
+            ])))
+        }
+    }
+
+    struct ApprovalRecoveryTools {
+        executions: Arc<AtomicUsize>,
+    }
+
+    struct QuestionRecoveryTools {
+        hub: Arc<crate::DurableQuestionHub>,
+    }
+
+    #[async_trait]
+    impl SessionToolFactory for QuestionRecoveryTools {
+        async fn executor(
+            &self,
+            session_id: &str,
+            _cwd: &str,
+            _permission: PermissionPreset,
+        ) -> Result<ToolExecutor, String> {
+            let registry = Arc::new(ToolRegistry::new());
+            AskUserQuestionTool::new(Arc::new(crate::DurableQuestionProvider::new(
+                Arc::clone(&self.hub),
+                session_id,
+            )))
+            .register(&registry)
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok(ToolExecutor::new(registry))
+        }
+    }
+
+    #[async_trait]
+    impl SessionToolFactory for ApprovalRecoveryTools {
+        async fn executor(
+            &self,
+            _session_id: &str,
+            _cwd: &str,
+            _permission: PermissionPreset,
+        ) -> Result<ToolExecutor, String> {
+            let executions = Arc::clone(&self.executions);
+            let registry = Arc::new(ToolRegistry::new());
+            registry
+                .register(
+                    ToolSpec::new(
+                        ToolDefinition::new(
+                            "guarded",
+                            "approval recovery fixture",
+                            serde_json::json!({"type":"object"}),
+                        ),
+                        move |_context| {
+                            let executions = Arc::clone(&executions);
+                            async move {
+                                executions.fetch_add(1, Ordering::SeqCst);
+                                Ok(ToolOutput::text("recovered tool result"))
+                            }
+                        },
+                    )
+                    .requiring_approval(true),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(ToolExecutor::new(registry))
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_catalog_lists_without_replaying_legacy_and_hydrates_on_open() {
+        use xharness_session_jsonl::JsonlSessionStore;
+        let dir = std::env::temp_dir().join(format!(
+            "xharness-catalog-startup-{}-{}",
+            std::process::id(),
+            crate::state::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn Store> = Arc::new(JsonlSessionStore::new(&dir).unwrap());
+        let indexed = SessionHeader::new("indexed-idle");
+        store.create(indexed.clone()).await.unwrap();
+        store
+            .publish_catalog_entry(SessionCatalogEntry {
+                header: indexed.clone(),
+                updated_at_ms: indexed.created_at_ms,
+                title: Some("Indexed title".into()),
+                agent_preset: None,
+                parent_session_id: None,
+                origin: None,
+                model_provider: "test".into(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+                context_window_tokens: None,
+                permission_preset: "workspace-write".into(),
+                plan_active: false,
+                blank: true,
+                next_seq: 0,
+                needs_recovery: false,
+                metric_snapshot: None,
+            })
+            .await
+            .unwrap();
+        let pending = SessionHeader::new("indexed-pending");
+        store.create(pending.clone()).await.unwrap();
+        store
+            .publish_catalog_entry(SessionCatalogEntry {
+                header: pending.clone(),
+                updated_at_ms: pending.created_at_ms,
+                title: Some("Pending".into()),
+                agent_preset: None,
+                parent_session_id: None,
+                origin: None,
+                model_provider: "test".into(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+                context_window_tokens: None,
+                permission_preset: "workspace-write".into(),
+                plan_active: false,
+                blank: true,
+                next_seq: 0,
+                needs_recovery: true,
+                metric_snapshot: None,
+            })
+            .await
+            .unwrap();
+        store.create(SessionHeader::new("legacy")).await.unwrap();
+        store
+            .create(SessionHeader::new("legacy-used"))
+            .await
+            .unwrap();
+        store
+            .append(
+                "legacy-used",
+                xharness_session::Revision::ZERO,
+                closed_text_turn(1, "Old question", "Old answer"),
+            )
+            .await
+            .unwrap();
+        store.create(SessionHeader::new("damaged")).await.unwrap();
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("damaged.jsonl"))
+                .unwrap(),
+            b"invalid tail\n",
+        )
+        .unwrap();
+        let host = BasicHost::without_provider(config(&dir));
+        let (necessary, deferred) = host.prepare_startup_catalog(store).await.unwrap();
+        assert_eq!(necessary, vec!["indexed-pending"]);
+        assert_eq!(deferred.len(), 3);
+        let state = host.state.read().await;
+        assert_eq!(state.sessions.len(), 5);
+        assert_eq!(
+            state.sessions["indexed-idle"].title.as_deref(),
+            Some("Indexed title")
+        );
+        assert!(state.sessions.values().all(|session| session.restoring));
+        assert!(state.sessions["indexed-idle"].blank);
+        assert!(!state.sessions["legacy"].blank);
+        assert!(!state.sessions["legacy-used"].blank);
+        assert!(!state.sessions["damaged"].blank);
+        drop(state);
+        host.hydrate_session("indexed-pending").await.unwrap();
+        assert!(!host.state.read().await.sessions["indexed-pending"].restoring);
+        let mut updates = host.event_gateway.subscribe_host();
+        host.hydrate_session("legacy").await.unwrap();
+        assert!(!host.state.read().await.sessions["legacy"].restoring);
+        assert!(host.state.read().await.sessions["legacy"].blank);
+        assert_eq!(
+            updates.try_recv().unwrap().payload["event"],
+            "xharness/catalog-updated"
+        );
+        host.hydrate_session("legacy").await.unwrap();
+        assert!(updates.try_recv().is_err());
+        host.hydrate_session("legacy-used").await.unwrap();
+        assert!(!host.state.read().await.sessions["legacy-used"].blank);
+        assert!(host.hydrate_session("damaged").await.is_err());
+        assert!(host.state.read().await.sessions["damaged"].restoring);
+        host.hydrate_session("indexed-idle").await.unwrap();
+        assert!(!host.state.read().await.sessions["indexed-idle"].restoring);
+    }
+
+    /// One unreadable entry must not stop startup, and it must be reported on
+    /// the Host state so the surface can show it.
+    #[tokio::test]
+    async fn an_unreadable_session_is_reported_without_blocking_restore() {
+        use xharness_session_jsonl::JsonlSessionStore;
+
+        let dir = std::env::temp_dir().join(format!(
+            "xharness-restore-unreadable-{}-{}",
+            std::process::id(),
+            crate::state::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn Store> = Arc::new(JsonlSessionStore::new(&dir).unwrap());
+        store.create(SessionHeader::new("healthy")).await.unwrap();
+        std::fs::write(dir.join("broken.jsonl"), b"not-json\n").unwrap();
+
+        let host = BasicHost::without_provider(config(&dir));
+        let report = host.restore_from_store(Arc::clone(&store)).await.unwrap();
+
+        assert_eq!(report.discovered_sessions, 2);
+        assert_eq!(report.restored_sessions, 1, "the healthy session must load");
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].session_id, "broken");
+        assert!(
+            report.issues[0].message.contains("invalid header JSON"),
+            "got {:?}",
+            report.issues[0].message
+        );
+        assert_eq!(
+            host.state.read().await.startup_issues,
+            report.issues,
+            "the report must be reachable from the product surface"
+        );
+    }
+
+    /// Header-only startup discovery must never publish a conversation whose
+    /// later batch is corrupt. Validation is deferred, not weakened.
+    #[tokio::test]
+    async fn corrupt_tail_is_reported_when_startup_load_validates_candidate() {
+        use xharness_session_jsonl::JsonlSessionStore;
+
+        let dir = std::env::temp_dir().join(format!(
+            "xharness-restore-tail-{}-{}",
+            std::process::id(),
+            crate::state::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn Store> = Arc::new(JsonlSessionStore::new(&dir).unwrap());
+        store.create(SessionHeader::new("healthy")).await.unwrap();
+        store
+            .create(SessionHeader::new("corrupt-tail"))
+            .await
+            .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("corrupt-tail.jsonl"))
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"not-json\n").unwrap();
+
+        let host = BasicHost::without_provider(config(&dir));
+        let report = host.restore_from_store(store).await.unwrap();
+        assert_eq!(report.discovered_sessions, 2);
+        assert_eq!(report.restored_sessions, 1);
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].session_id, "corrupt-tail");
+        assert!(report.issues[0].message.contains("invalid batch JSON"));
+        assert!(host.state.read().await.sessions.contains_key("healthy"));
+        assert!(!host
+            .state
+            .read()
+            .await
+            .sessions
+            .contains_key("corrupt-tail"));
+    }
+
+    fn config(cwd: &Path) -> HostConfig {
+        let mut config = HostConfig::new(cwd);
+        config.provider_id = "test".to_owned();
+        config.provider_display_name = "Test".to_owned();
+        config.model_id = "test-model".to_owned();
+        config
+    }
+
+    #[tokio::test]
+    async fn profile_metrics_survive_cold_restart_and_legacy_catalogue_migration() {
+        use xharness_session_jsonl::JsonlSessionStore;
+        let dir = std::env::temp_dir().join(format!(
+            "xharness-profile-restart-{}-{}",
+            std::process::id(),
+            crate::state::now_ms()
+        ));
+        let disk = Arc::new(JsonlSessionStore::new(&dir).unwrap().for_runtime());
+        disk.create(SessionHeader::new("usage-history"))
+            .await
+            .unwrap();
+        let mut events = closed_text_turn(1, "private prompt", "private answer");
+        for event in &mut events {
+            if let EventData::AssistantMessage { usage, .. } = event.data_mut() {
+                *usage = Some(json!({"inputTokens":10,"cacheReadTokens":90,"outputTokens":5}));
+            }
+        }
+        disk.append("usage-history", xharness_session::Revision::ZERO, events)
+            .await
+            .unwrap();
+        let live = BasicHost::without_provider(config(&dir));
+        live.restore_from_store(disk.clone()).await.unwrap();
+        let expected = live.state.read().await.sessions["usage-history"].projection_values();
+        assert_eq!(expected["dailyTokenUsage"][0]["uncachedInputTokens"], 10);
+        let catalogue = disk.catalog_entry("usage-history").await.unwrap().unwrap();
+        let snapshot = catalogue.metric_snapshot.as_ref().unwrap();
+        assert!(!snapshot.to_string().contains("private prompt"));
+        assert!(!snapshot.to_string().contains("private answer"));
+
+        // A fresh Store has no loaded journals. Reading the catalogue must
+        // publish usage for unopened conversations without filling that cache.
+        let cold_disk = Arc::new(JsonlSessionStore::new(&dir).unwrap().for_runtime());
+        let cold = BasicHost::without_provider(config(&dir));
+        let (necessary, deferred) = cold
+            .prepare_startup_catalog(cold_disk.clone())
+            .await
+            .unwrap();
+        assert!(necessary.is_empty() && deferred.is_empty());
+        assert_eq!(cold_disk.cache_stats().entries, 0);
+        {
+            let state = cold.state.read().await;
+            let record = &state.sessions["usage-history"];
+            assert!(record.restoring && record.events.is_empty() && record.messages.is_empty());
+            let views = record.projection_values();
+            assert_eq!(views["dailyTokenUsage"], expected["dailyTokenUsage"]);
+            assert_eq!(views["tokenUsage"], expected["tokenUsage"]);
+            assert_eq!(views["sessionStats"], expected["sessionStats"]);
+            assert_eq!(views["sessionListMetadata"]["metricsPending"], false);
+        }
+        cold.hydrate_session("usage-history").await.unwrap();
+        assert_eq!(
+            cold.state.read().await.sessions["usage-history"].projection_values()
+                ["dailyTokenUsage"],
+            expected["dailyTokenUsage"]
+        );
+
+        // Older application versions wrote valid metadata but no metrics.
+        // Repair those without opening the chat or attaching an Agent.
+        let path = dir.join("usage-history.catalog");
+        let mut legacy: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["entry"]
+            .as_object_mut()
+            .unwrap()
+            .remove("metricSnapshot");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let legacy_disk = Arc::new(JsonlSessionStore::new(&dir).unwrap().for_runtime());
+        let upgrading = BasicHost::without_provider(config(&dir));
+        upgrading
+            .prepare_startup_catalog(legacy_disk.clone())
+            .await
+            .unwrap();
+        {
+            let state = upgrading.state.read().await;
+            let views = state.sessions["usage-history"].projection_values();
+            assert_eq!(views["sessionListMetadata"]["metricsPending"], true);
+            assert!(
+                views.get("dailyTokenUsage").is_none(),
+                "unknown usage must not become an empty array"
+            );
+        }
+        upgrading.backfill_startup_metrics().await;
+        {
+            let state = upgrading.state.read().await;
+            let record = &state.sessions["usage-history"];
+            assert!(record.restoring && record.events.is_empty() && record.messages.is_empty());
+            assert!(record.control.is_none());
+            assert!(state.startup_issues.is_empty());
+            assert_eq!(
+                record.projection_values()["dailyTokenUsage"],
+                expected["dailyTokenUsage"]
+            );
+            assert_eq!(
+                record.projection_values()["sessionListMetadata"]["metricsPending"],
+                false
+            );
+        }
+        assert_eq!(
+            legacy_disk.cache_stats().entries,
+            0,
+            "metric repair must stream without a Session"
+        );
+        assert!(legacy_disk
+            .catalog_entry("usage-history")
+            .await
+            .unwrap()
+            .unwrap()
+            .metric_snapshot
+            .is_some());
+        let again_disk = Arc::new(JsonlSessionStore::new(&dir).unwrap().for_runtime());
+        let again = BasicHost::without_provider(config(&dir));
+        again
+            .prepare_startup_catalog(again_disk.clone())
+            .await
+            .unwrap();
+        assert_eq!(again_disk.cache_stats().entries, 0);
+        assert_eq!(
+            again.state.read().await.sessions["usage-history"].projection_values()
+                ["dailyTokenUsage"],
+            expected["dailyTokenUsage"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn closed_text_turn(turn: u32, user: &str, assistant: &str) -> Vec<SessionEvent> {
+        vec![
+            EventData::TurnStart { turn }.into(),
+            EventData::UserMessage {
+                message: Message::user(user).with_id(format!("user-{turn}")),
+                surface_replace: None,
+            }
+            .into(),
+            EventData::StepStart { turn, step: 1 }.into(),
+            EventData::RequestHeader {
+                header: RequestHeader::new("test", "test-model"),
+            }
+            .into(),
+            EventData::AssistantMessage {
+                turn,
+                step: 1,
+                message: Message::assistant(assistant).with_id(format!("assistant-{turn}")),
+                usage: None,
+            }
+            .into(),
+            EventData::StepEnd { turn, step: 1 }.into(),
+            EventData::TurnEnd {
+                turn,
+                reason: TurnEndReason::Completed,
+            }
+            .into(),
+        ]
+    }
+
+    fn closed_tool_session(
+        tool_name: &str,
+        arguments_json: String,
+        result: ToolResultData,
+    ) -> Session {
+        let mut session = Session::new(SessionHeader::new("tool-view-session")).unwrap();
+        let call = ToolCall {
+            id: result.call_id.clone(),
+            provider_call_id: Some(format!("provider-{}", result.call_id)),
+            index: 0,
+            name: tool_name.to_owned(),
+            arguments_json,
+        };
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls.push(call.clone());
+        session
+            .append_batch_at(
+                Revision::ZERO,
+                vec![
+                    EventData::TurnStart { turn: 1 }.into(),
+                    EventData::UserMessage {
+                        message: Message::user("run the tool"),
+                        surface_replace: None,
+                    }
+                    .into(),
+                    EventData::StepStart { turn: 1, step: 1 }.into(),
+                    EventData::RequestHeader {
+                        header: RequestHeader::new("test", "test-model"),
+                    }
+                    .into(),
+                    EventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message: assistant,
+                        usage: None,
+                    }
+                    .into(),
+                    EventData::ToolCall {
+                        turn: 1,
+                        step: 1,
+                        call,
+                    }
+                    .into(),
+                    EventData::ToolResult {
+                        turn: 1,
+                        step: 1,
+                        result,
+                    }
+                    .into(),
+                    EventData::StepEnd { turn: 1, step: 1 }.into(),
+                    EventData::TurnEnd {
+                        turn: 1,
+                        reason: TurnEndReason::Completed,
+                    }
+                    .into(),
+                ],
+                1,
+            )
+            .unwrap();
+        session
+    }
+
+    #[test]
+    fn reasoning_text_and_tools_have_disjoint_live_and_restored_blocks() {
+        use xharness_projection as projection;
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/assistant-projection.json"
+        ))
+        .unwrap();
+        for interrupted in [false, true] {
+            let mut session = Session::new(SessionHeader::new("reasoning-replay")).unwrap();
+            let mut message = Message::assistant("正文🙂done");
+            message.reasoning = "思考α再想".into();
+            message.interrupted = interrupted;
+            let chunks = [
+                AssistantChunk::TextDelta("正文🙂".into()),
+                AssistantChunk::ReasoningDelta("思考α".into()),
+                AssistantChunk::ToolCallDelta {
+                    index: 0,
+                    id: "call-a".into(),
+                    name: "read".into(),
+                    arguments_delta: "{}".into(),
+                },
+                AssistantChunk::ReasoningDelta("再想".into()),
+                AssistantChunk::TextDelta("done".into()),
+                AssistantChunk::ToolCallDelta {
+                    index: 1,
+                    id: "call-b".into(),
+                    name: "read".into(),
+                    arguments_delta: "{}".into(),
+                },
+            ];
+            let mut events = vec![
+                EventData::TurnStart { turn: 1 }.into(),
+                EventData::StepStart { turn: 1, step: 1 }.into(),
+            ];
+            for (chunk, expected) in chunks.iter().zip(fixture["chunks"].as_array().unwrap()) {
+                assert_eq!(&web_assistant_chunk(chunk), expected);
+                events.push(
+                    EventData::AssistantChunk {
+                        turn: 1,
+                        step: 1,
+                        chunk: chunk.clone(),
+                    }
+                    .into(),
+                );
+            }
+            session.append_batch_at(Revision::ZERO, events, 1).unwrap();
+            let route = ModelRoute::new("test", "test");
+            let live = project_session_event_range(&session, &route, 2, session.events().len());
+            assert_eq!(
+                live.iter()
+                    .map(|e| e["data"]["chunk"].clone())
+                    .collect::<Vec<_>>(),
+                fixture["chunks"].as_array().unwrap().clone()
+            );
+            let revision = session.revision();
+            session
+                .append_batch_at(
+                    revision,
+                    vec![EventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message,
+                        usage: None,
+                    }
+                    .into()],
+                    2,
+                )
+                .unwrap();
+            let all = project_session_event_range(&session, &route, 0, session.events().len());
+            let tail = project_session_event_tail(&session, &route, usize::MAX, usize::MAX);
+            let history = project_session_history(&session, &route, None, 100);
+            for events in [&all, &tail.events, &history.events] {
+                let settled = events
+                    .iter()
+                    .find(|e| e["type"] == "assistant/message")
+                    .unwrap();
+                assert_eq!(settled["data"]["message"]["content"], fixture["content"]);
+                assert_eq!(
+                    settled["data"]["interrupted"].as_bool().unwrap_or(false),
+                    interrupted
+                );
+            }
+            assert_eq!(
+                projection::assistant_content("正文🙂done", "思考α再想"),
+                fixture["content"].as_array().unwrap().clone()
+            );
+        }
+        assert_eq!(
+            projection::assistant_content("", "only thought"),
+            vec![json!({"type":"reasoning","text":"only thought"})]
+        );
+        assert_eq!(
+            projection::assistant_content("text", ""),
+            vec![json!({"type":"text","text":"text"})]
+        );
+        assert!(projection::assistant_content("", "").is_empty());
+    }
+
+    #[test]
+    fn execution_checkpoint_projection_is_shared_and_internal_snapshots_are_hidden() {
+        let mut session = Session::new(SessionHeader::new("checkpoint-projection")).unwrap();
+        let state = xharness_session::ExecutionCheckpointState {
+            phase: 1,
+            phase_end_step: 1024,
+            stage_pending: false,
+            repetition: Default::default(),
+            pending_notice: None,
+            pending_repetitions: Vec::new(),
+        };
+        let notice = xharness_session::ExecutionNotice {
+            kind: "issued".into(),
+            message: "检查点".into(),
+            phase: 1,
+            steps_completed: 0,
+            phase_end_step: 1024,
+            hard_max_steps: None,
+        };
+        session
+            .append_batch_at(
+                Revision::ZERO,
+                vec![
+                    EventData::TurnStart { turn: 1 }.into(),
+                    EventData::ExecutionCheckpoint {
+                        turn: 1,
+                        step: 0,
+                        state: state.clone(),
+                        notice: None,
+                    }
+                    .into(),
+                    EventData::ExecutionCheckpoint {
+                        turn: 1,
+                        step: 0,
+                        state,
+                        notice: Some(notice.clone()),
+                    }
+                    .into(),
+                ],
+                1,
+            )
+            .unwrap();
+        let tail =
+            project_session_event_tail(&session, &ModelRoute::new("test", "test"), 100, usize::MAX);
+        assert_eq!(tail.events[1]["hidden"], true);
+        assert_eq!(tail.events[1]["type"], "xharness/internal");
+        assert_eq!(tail.events[2]["type"], "run/checkpoint");
+        assert_eq!(
+            tail.events[2]["data"],
+            super::web_execution_notice(0, Some(&notice))
+        );
+        assert!(session.derive_messages().is_empty());
+    }
+
+    #[test]
+    fn explicit_model_selection_survives_a_later_request_header() {
+        let mut session = Session::new(SessionHeader::new("selected-route")).unwrap();
+        let mut events = vec![EventData::SessionModelSelected {
+            provider: "test".to_owned(),
+            model: "selected-model".to_owned(),
+            reasoning_effort: Some("low".to_owned()),
+            context_window_tokens: Some(32_768),
+        }
+        .into()];
+        // `closed_text_turn` appends a lifecycle-valid later request header
+        // without a reasoning effort, matching the provider log that exposed
+        // this restoration bug.
+        events.extend(closed_text_turn(1, "hello", "world"));
+        session.append_batch_at(Revision::ZERO, events, 1).unwrap();
+
+        let route = restored_route(&session, &config(Path::new("/tmp")));
+        assert_eq!(route.provider, "test");
+        assert_eq!(route.model, "selected-model");
+        assert_eq!(route.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(route.context_window_tokens, Some(32_768));
+    }
+
+    #[test]
+    fn authoritative_history_pages_are_independent_of_the_bounded_live_tail() {
+        let mut session = Session::new(SessionHeader::new("paged")).unwrap();
+        let events = (1..=6)
+            .flat_map(|turn| {
+                closed_text_turn(turn, &format!("question-{turn}"), &format!("answer-{turn}"))
+            })
+            .collect::<Vec<_>>();
+        session.append_batch_at(Revision::ZERO, events, 1).unwrap();
+        let route = ModelRoute::new("test", "test-model");
+
+        let tail = project_session_event_tail(&session, &route, 5, usize::MAX);
+        assert_eq!(tail.events.len(), 5);
+        assert_eq!(tail.base_seq, session.next_seq() - 5);
+        assert_eq!(tail.next_seq, session.next_seq());
+        assert_eq!(tail.events[0]["seq"], tail.base_seq);
+        let byte_evicted = project_session_event_tail(&session, &route, usize::MAX, 1);
+        assert!(byte_evicted.events.is_empty());
+        assert_eq!(byte_evicted.base_seq, session.next_seq());
+        assert_eq!(byte_evicted.bytes, 0);
+
+        let newest = project_session_history(&session, &route, None, 2);
+        assert!(newest.has_more);
+        assert_eq!(newest.as_of_seq, session.next_seq().checked_sub(1));
+        assert!(newest
+            .events
+            .iter()
+            .any(|event| event["data"].to_string().contains("question-6")));
+        assert!(newest
+            .events
+            .iter()
+            .any(|event| event["data"].to_string().contains("answer-6")));
+        let cursor = newest.events[0]["seq"].as_u64().unwrap();
+        let previous = project_session_history(&session, &route, Some(cursor), 2);
+        assert!(previous
+            .events
+            .iter()
+            .all(|event| event["seq"].as_u64().unwrap() < cursor));
+        assert!(previous
+            .events
+            .iter()
+            .any(|event| event["data"].to_string().contains("question-5")));
+    }
+
+    /// A bounded, synthetic experiment for the Windows 0xc0000005 dump in
+    /// restored_web_event -> serde_json::to_value -> BTreeMap::insert_entry.
+    /// Passing is not evidence that the original sporadic crash is fixed.
+    #[test]
+    #[ignore = "offline crash-reproduction stress; run explicitly in CI"]
+    fn offline_reasoning_projection_stress() {
+        let mut session = Session::new(SessionHeader::new("offline-reasoning-stress")).unwrap();
+        let mut events = Vec::new();
+        for turn in 1..=128 {
+            events.extend(closed_text_turn(
+                turn,
+                "synthetic question",
+                "synthetic answer",
+            ));
+        }
+        events.push(EventData::TurnStart { turn: 129 }.into());
+        events.push(EventData::StepStart { turn: 129, step: 1 }.into());
+        for index in 0..64 {
+            events.push(
+                EventData::AssistantChunk {
+                    turn: 129,
+                    step: 1,
+                    chunk: AssistantChunk::ReasoningDelta(format!(
+                        "synthetic-{index}: {}",
+                        "模拟 reasoning 🧪 ".repeat(16)
+                    )),
+                }
+                .into(),
+            );
+        }
+        session.append_batch_at(Revision::ZERO, events, 1).unwrap();
+        let workers = (0..4)
+            .map(|_| {
+                let session = session.clone();
+                std::thread::spawn(move || {
+                    let route = ModelRoute::new("offline", "offline");
+                    for _ in 0..2_000 {
+                        let tail = project_session_event_tail(&session, &route, 64, usize::MAX);
+                        assert_eq!(tail.events.len(), 64);
+                        for event in tail.events {
+                            assert_eq!(event["type"], "assistant/chunk");
+                            assert_eq!(event["data"]["chunk"]["type"], "reasoning-delta");
+                            let serialized = serde_json::to_vec(&event).unwrap();
+                            let copied: Value = serde_json::from_slice(&serialized).unwrap();
+                            assert_eq!(copied, event);
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        eprintln!("offline reasoning projection: 4 workers, 512000 projected events; no live models or tools");
+    }
+
+    /// Local incident replay without constructing a Host, provider or tool executor.
+    /// CI exercises the same loader with synthetic data. Private input is copied
+    /// before the store opens it (the store creates a sidecar lock), and is never
+    /// printed. A passing run does not establish that a sporadic AV is fixed.
+    #[tokio::test]
+    #[ignore = "explicit offline projection experiment; private journals stay local"]
+    async fn offline_journal_projection_stress() {
+        use std::io::{BufRead, Read};
+        use xharness_session_jsonl::JsonlSessionStore;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "xharness-offline-journal-{}-{nonce}",
+            std::process::id()
+        ));
+        // Leave the isolated copy for incident analysis, including on failure.
+        std::fs::create_dir(&root).unwrap();
+        let store = JsonlSessionStore::new(&root).unwrap().for_runtime();
+        let session_id = if let Some(input) = std::env::var_os("XHARNESS_OFFLINE_JOURNAL") {
+            let input = std::path::PathBuf::from(input);
+            assert!(
+                input.is_absolute() && input.is_file(),
+                "expected a local journal file"
+            );
+            let mut header_line = Vec::new();
+            std::io::BufReader::new(std::fs::File::open(&input).unwrap())
+                .take(1024 * 1024)
+                .read_until(b'\n', &mut header_line)
+                .unwrap();
+            let header: Value = serde_json::from_slice(&header_line)
+                .unwrap_or_else(|_| panic!("invalid offline journal header"));
+            let id = header["header"]["id"]
+                .as_str()
+                .expect("missing offline session ID")
+                .to_owned();
+            assert!(
+                !id.is_empty()
+                    && id.len() <= 200
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "offline session ID must be a simple file name"
+            );
+            std::fs::copy(&input, root.join(format!("{id}.jsonl"))).unwrap();
+            id
+        } else {
+            let id = "offline-journal-fixture";
+            store.create(SessionHeader::new(id)).await.unwrap();
+            let mut events = closed_text_turn(1, "synthetic question", "synthetic answer");
+            events.push(EventData::TurnStart { turn: 2 }.into());
+            events.push(EventData::StepStart { turn: 2, step: 1 }.into());
+            for _ in 0..64 {
+                events.push(
+                    EventData::AssistantChunk {
+                        turn: 2,
+                        step: 1,
+                        chunk: AssistantChunk::ReasoningDelta("offline reasoning 🧪".repeat(16)),
+                    }
+                    .into(),
+                );
+            }
+            store.append(id, Revision::ZERO, events).await.unwrap();
+            id.to_owned()
+        };
+        eprintln!("offline journal: loading isolated copy; no Host, models or tools");
+        let session = store
+            .load(&session_id)
+            .await
+            .unwrap_or_else(|_| panic!("offline journal failed store/lifecycle validation"))
+            .expect("offline journal missing");
+        drop(store);
+        assert!(
+            !session.events().is_empty(),
+            "empty fixture cannot exercise projection"
+        );
+        eprintln!("offline journal: loaded {} events", session.events().len());
+        let route = ModelRoute::new("offline", "offline");
+        let projector = SessionProjector::new(&session, &route);
+        // Serialize one event at a time: do not materialize a second full history.
+        for event in session.events() {
+            let projected = projector.project(event);
+            let bytes = serde_json::to_vec(&projected).unwrap();
+            let decoded: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                decoded == projected,
+                "projection round trip failed at seq {}",
+                event.seq
+            );
+        }
+        eprintln!("offline journal: full event projection passed");
+        let workers = (0..4)
+            .map(|worker| {
+                let session = session.clone();
+                std::thread::spawn(move || {
+                    let route = ModelRoute::new("offline", "offline");
+                    let mut count = 0usize;
+                    for iteration in 0..500 {
+                        let tail = project_session_event_tail(&session, &route, 64, 256 * 1024);
+                        for event in tail.events {
+                            let bytes = serde_json::to_vec(&event).unwrap();
+                            let decoded: Value = serde_json::from_slice(&bytes).unwrap();
+                            assert!(decoded == event, "tail round trip failed");
+                            count += 1;
+                        }
+                        if iteration % 25 == 0 {
+                            let before =
+                                ((iteration + worker) * 97 % session.events().len()) as u64;
+                            let page = project_session_history(&session, &route, Some(before), 20);
+                            std::hint::black_box(serde_json::to_vec(&page.events).unwrap());
+                        }
+                    }
+                    count
+                })
+            })
+            .collect::<Vec<_>>();
+        let count: usize = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum();
+        eprintln!("offline journal: 4 workers, {count} tail events, 80 history pages passed; no live models or tools");
+    }
+
+    #[test]
+    fn completed_stream_chunks_are_folded_for_tail_and_omitted_from_history() {
+        let mut session = Session::new(SessionHeader::new("folded-stream-history")).unwrap();
+        session
+            .append_batch_at(
+                Revision::ZERO,
+                vec![
+                    EventData::TurnStart { turn: 1 }.into(),
+                    EventData::UserMessage {
+                        message: Message::user("question").with_id("fold-user"),
+                        surface_replace: None,
+                    }
+                    .into(),
+                    EventData::StepStart { turn: 1, step: 1 }.into(),
+                    EventData::AssistantChunk {
+                        turn: 1,
+                        step: 1,
+                        chunk: AssistantChunk::ReasoningDelta("old thought".to_owned()),
+                    }
+                    .into(),
+                    EventData::AssistantChunk {
+                        turn: 1,
+                        step: 1,
+                        chunk: AssistantChunk::TextDelta("old answer".to_owned()),
+                    }
+                    .into(),
+                    EventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message: {
+                            let mut message =
+                                Message::assistant("old answer").with_id("fold-answer");
+                            message.reasoning = "old thought".into();
+                            message
+                        },
+                        usage: None,
+                    }
+                    .into(),
+                    EventData::StepEnd { turn: 1, step: 1 }.into(),
+                    EventData::StepStart { turn: 1, step: 2 }.into(),
+                    EventData::AssistantChunk {
+                        turn: 1,
+                        step: 2,
+                        chunk: AssistantChunk::ReasoningDelta("still running".to_owned()),
+                    }
+                    .into(),
+                    EventData::AssistantChunk {
+                        turn: 1,
+                        step: 2,
+                        chunk: AssistantChunk::ReasoningDelta(" and merged".to_owned()),
+                    }
+                    .into(),
+                ],
+                1,
+            )
+            .unwrap();
+        let route = ModelRoute::new("test", "test-model");
+
+        let tail = project_session_event_tail(&session, &route, usize::MAX, usize::MAX);
+        assert_eq!(tail.events.len(), session.events().len());
+        assert_eq!(tail.base_seq, 0);
+        assert_eq!(tail.next_seq, session.next_seq());
+        assert_eq!(tail.events[3]["type"], "xharness/internal");
+        assert_eq!(tail.events[4]["type"], "xharness/internal");
+        assert_eq!(tail.events[8]["type"], "assistant/chunk");
+        assert_eq!(tail.events[9]["type"], "assistant/chunk");
+
+        let history = project_session_history(&session, &route, None, 100);
+        let history_events = &history.events;
+        assert_eq!(
+            history_events
+                .iter()
+                .filter(|event| event["type"] == "assistant/chunk")
+                .count(),
+            1,
+            "only the incomplete step keeps replayable stream fragments"
+        );
+        let open_chunk = history_events
+            .iter()
+            .find(|event| event["type"] == "assistant/chunk")
+            .unwrap();
+        assert_eq!(
+            open_chunk["data"]["chunk"]["text"],
+            "still running and merged"
+        );
+        assert!(history_events
+            .iter()
+            .any(|event| event["type"] == "assistant/message"));
+        assert!(history_events
+            .iter()
+            .all(|event| event["data"]["chunk"]["text"] != "old answer"));
+    }
+
+    #[tokio::test]
+    async fn restore_persists_orphan_approval_cancellation_once_without_resuming_tools() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        store.create(SessionHeader::new("orphan")).await.unwrap();
+        let call = ToolCall {
+            id: "c".into(),
+            name: "read".into(),
+            arguments_json: "{}".into(),
+            ..Default::default()
+        };
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = vec![call.clone()];
+        store
+            .append(
+                "orphan",
+                Revision::ZERO,
+                vec![
+                    EventData::TurnStart { turn: 1 }.into(),
+                    EventData::StepStart { turn: 1, step: 1 }.into(),
+                    EventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message: assistant,
+                        usage: None,
+                    }
+                    .into(),
+                    EventData::ToolCall {
+                        turn: 1,
+                        step: 1,
+                        call,
+                    }
+                    .into(),
+                    EventData::ApprovalAsked {
+                        id: "a".into(),
+                        tool_name: "read".into(),
+                        call_id: Some("c".into()),
+                        reason: None,
+                    }
+                    .into(),
+                    EventData::ToolResult {
+                        turn: 1,
+                        step: 1,
+                        result: ToolResultData::error("c", "timeout"),
+                    }
+                    .into(),
+                    EventData::StepEnd { turn: 1, step: 1 }.into(),
+                    EventData::TurnEnd {
+                        turn: 1,
+                        reason: TurnEndReason::Completed,
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let host = BasicHost::without_provider(config(&std::env::temp_dir()));
+        let report = host.restore_from_store(store.clone()).await.unwrap();
+        assert_eq!(report.resumed_pending_approvals, 0);
+        let s = store.load("orphan").await.unwrap().unwrap();
+        assert!(matches!(
+            s.events().last().unwrap().data(),
+            EventData::ApprovalDecided {
+                outcome: ApprovalOutcome::Cancelled,
+                ..
+            }
+        ));
+        assert!(host.state.read().await.pending.is_empty());
+        let revision = s.revision();
+        BasicHost::without_provider(config(&std::env::temp_dir()))
+            .restore_from_store(store.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load("orphan").await.unwrap().unwrap().revision(),
+            revision
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_history_remains_complete_after_tail_eviction_and_restart() {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut header = SessionHeader::new("bounded-history");
+        header.cwd = Some(cwd.to_string_lossy().into_owned());
+        store.create(header).await.unwrap();
+        let events = (1..=6)
+            .flat_map(|turn| {
+                closed_text_turn(turn, &format!("question-{turn}"), &format!("answer-{turn}"))
+            })
+            .collect::<Vec<_>>();
+        store
+            .append("bounded-history", Revision::ZERO, events)
+            .await
+            .unwrap();
+
+        for _restart in 0..2 {
+            let runtime = Arc::new(DurableLoopAgentRuntime::new(
+                "test",
+                "test-model",
+                None,
+                Arc::new(NoTools),
+                Arc::new(IdentityContextPolicy),
+                Arc::clone(&store),
+                Arc::new(MemoryLeaseManager::default()),
+                64,
+            ));
+            let mut host_config = config(&cwd);
+            host_config.session_event_cache_capacity = 5;
+            host_config.session_event_cache_bytes = usize::MAX;
+            let host = BasicHost::with_agent_runtime(host_config, runtime);
+            host.restore_from_store(Arc::clone(&store)).await.unwrap();
+            {
+                let state = host.state.read().await;
+                let record = &state.sessions["bounded-history"];
+                assert!(record.events.is_empty());
+                assert_eq!(record.event_base_seq, record.next_event_seq());
+                assert_eq!(record.event_cache_bytes, 0);
+                assert_eq!(record.last_event_seq(), Some(41));
+            }
+            let history = host
+                .call(
+                    RpcId::new(format!("history-{_restart}")),
+                    RpcMethod::SessionHistory,
+                    json!({"sessionId": "bounded-history", "maxMessages": 500}),
+                    CancellationToken::new(),
+                )
+                .await;
+            let RpcResult::Success { value: Some(value) } = history else {
+                panic!("history failed: {history:?}");
+            };
+            assert_eq!(value["events"].as_array().unwrap().len(), 42);
+            assert_eq!(value["projections"]["asOfSeq"], 41);
+            assert_eq!(value["hasMore"], false);
+        }
+    }
+
+    async fn cold_history_fixture(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        Arc<xharness_session_jsonl::JsonlSessionStore>,
+        Arc<BasicHost>,
+        Arc<CountedSnapshotRuntime>,
+        Value,
+    ) {
+        use xharness_session_jsonl::JsonlSessionStore;
+        let dir = std::env::temp_dir().join(format!(
+            "xharness-cold-display-{label}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(
+            JsonlSessionStore::new(&dir)
+                .unwrap()
+                .with_cache_limits(0, 0)
+                .for_runtime(),
+        );
+        let mut header = SessionHeader::new("cold");
+        header.cwd = Some(dir.to_string_lossy().into_owned());
+        store.create(header).await.unwrap();
+        let mut revision = Revision::ZERO;
+        for turn in 1..=8 {
+            let mut turn_events = closed_text_turn(turn, "reader request", "complete answer");
+            for event in &mut turn_events {
+                if let EventData::AssistantMessage { usage, .. } = event.data_mut() {
+                    *usage = Some(
+                        serde_json::json!({"inputTokens": turn * 10, "cacheReadTokens": 90, "cacheWriteTokens": 3, "outputTokens": 5}),
+                    );
+                }
+            }
+            revision = store
+                .append("cold", revision, turn_events)
+                .await
+                .unwrap()
+                .revision;
+        }
+        use xharness_session::{
+            GoalChange, GoalChangeKind, GoalPhase, GoalSnapshot, GoalSnapshotChange,
+            GoalSnapshotOperation,
+        };
+        let mut goals: Vec<SessionEvent> = [
+            (GoalSnapshotOperation::Create, GoalPhase::Active, 1),
+            (GoalSnapshotOperation::Complete, GoalPhase::Complete, 2),
+        ]
+        .into_iter()
+        .map(|(operation, phase, revision)| {
+            EventData::GoalChange {
+                change: GoalChange::Snapshot(GoalSnapshotChange {
+                    kind: GoalChangeKind::GoalChange,
+                    version: 1,
+                    operation,
+                    goal: GoalSnapshot {
+                        id: "cold-goal".into(),
+                        revision,
+                        objective: "preserve completed Goal".into(),
+                        phase,
+                        blocked_reason: None,
+                        max_goal_rounds: 8,
+                    },
+                    rounds_started: 0,
+                    created_at: 1,
+                    updated_at: revision,
+                }),
+            }
+            .into()
+        })
+        .collect();
+        goals.push(
+            EventData::SessionPlanUpdated {
+                plan: xharness_session::SessionPlan {
+                    revision: 1,
+                    items: vec![xharness_session::PlanItem {
+                        id: "verify".into(),
+                        title: "Preserve working plan".into(),
+                        status: xharness_session::PlanItemStatus::Completed,
+                    }],
+                },
+            }
+            .into(),
+        );
+        store.append("cold", revision, goals).await.unwrap();
+        let producer = BasicHost::with_agent_runtime(
+            config(&dir),
+            Arc::new(OfflineSnapshotRuntime {
+                store: store.clone(),
+            }),
+        );
+        producer.restore_from_store(store.clone()).await.unwrap();
+        assert!(producer.lazy_store.set(store.clone()).is_ok());
+        let expected = producer
+            .call(
+                RpcId::new("reference"),
+                RpcMethod::SessionHistory,
+                json!({"sessionId":"cold", "maxMessages":2}),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success {
+            value: Some(expected),
+        } = expected
+        else {
+            panic!("reference history failed")
+        };
+        // A fresh store and Host: no warm snapshot or recovered Agent can hide
+        // an accidental first-open replay. This runtime has no idle checkpoint.
+        let fresh = Arc::new(
+            JsonlSessionStore::new(&dir)
+                .unwrap()
+                .with_cache_limits(0, 0)
+                .for_runtime(),
+        );
+        let runtime = Arc::new(CountedSnapshotRuntime {
+            store: fresh.clone(),
+            loads: AtomicUsize::new(0),
+            idle_checkpoints: false,
+        });
+        let cold = BasicHost::with_agent_runtime(config(&dir), runtime.clone());
+        let (necessary, deferred) = cold.prepare_startup_catalog(fresh.clone()).await.unwrap();
+        assert!(necessary.is_empty() && deferred.is_empty());
+        assert!(cold.state.read().await.sessions["cold"].restoring);
+        assert!(cold.state.read().await.sessions["cold"].projection_values().get("goal").is_none(),
+            "cold mux/catalogue must not poison the Goal at the same sequence before the real baseline");
+        (dir, fresh, cold, runtime, expected)
+    }
+
+    #[tokio::test]
+    async fn cold_history_page_and_model_picker_do_not_hydrate_or_change_public_values() {
+        let (dir, store, host, runtime, expected) = cold_history_fixture("read").await;
+        let (history, models, skills) = tokio::join!(
+            host.call(
+                RpcId::new("cold-page"),
+                RpcMethod::SessionHistory,
+                json!({"sessionId":"cold", "maxMessages":2}),
+                CancellationToken::new()
+            ),
+            host.call(
+                RpcId::new("cold-models"),
+                RpcMethod::SessionModels,
+                json!({"sessionId":"cold", "refreshCapabilities":false}),
+                CancellationToken::new()
+            ),
+            host.call(
+                RpcId::new("cold-skills"),
+                RpcMethod::SkillList,
+                json!({"sessionId":"cold"}),
+                CancellationToken::new()
+            ),
+        );
+        let RpcResult::Success {
+            value: Some(actual),
+        } = history
+        else {
+            panic!("cold history failed: {history:?}")
+        };
+        let mut expected = expected;
+        expected["projections"]["values"]["sessionListMetadata"]["restoring"] = json!(true);
+        assert_eq!(
+            actual, expected,
+            "cold display retains business projections without claiming execution readiness"
+        );
+        assert!(matches!(models, RpcResult::Success { .. }));
+        assert!(matches!(skills, RpcResult::Success { .. }));
+        assert_eq!(
+            actual["projections"]["values"]["goal"]["goal"]["phase"],
+            "complete"
+        );
+        let mut page = actual;
+        let mut pages = 1;
+        while page["hasMore"] == true {
+            let before = page["events"][0]["event"]["seq"].as_u64().unwrap();
+            let next = host
+                .call(
+                    RpcId::new(format!("page-{pages}")),
+                    RpcMethod::SessionHistory,
+                    json!({"sessionId":"cold", "maxMessages":2,"beforeSeq":before}),
+                    CancellationToken::new(),
+                )
+                .await;
+            let RpcResult::Success { value: Some(next) } = next else {
+                panic!("older cold page failed")
+            };
+            assert!(next["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["event"]["seq"].as_u64().unwrap() < before));
+            page = next;
+            pages += 1;
+            assert!(pages < 32);
+        }
+        assert!(pages > 1);
+        assert_eq!(runtime.loads.load(Ordering::SeqCst), 0);
+        assert!(
+            host.state.read().await.sessions["cold"].restoring,
+            "viewing must not certify execution recovery"
+        );
+        assert_eq!(store.cache_stats().entries, 0);
+        // Mutation still crosses the original recovery gate.
+        let renamed = host
+            .call(
+                RpcId::new("rename"),
+                RpcMethod::SessionRename,
+                json!({"sessionId":"cold", "title":"explicit mutation"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(renamed, RpcResult::Success { .. }), "{renamed:?}");
+        assert!(!host.state.read().await.sessions["cold"].restoring);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_history_repairs_missing_indexes_without_runtime_recovery() {
+        for damage in ["missing", "corrupt", "unwritable"] {
+            let (dir, store, host, runtime, mut expected) = cold_history_fixture(damage).await;
+            let index = dir.join("cold.history-index");
+            std::fs::remove_file(&index).unwrap();
+            if damage == "corrupt" {
+                std::fs::write(&index, b"broken").unwrap();
+            }
+            if damage == "unwritable" {
+                std::fs::create_dir(&index).unwrap();
+            }
+            let result = host
+                .call(
+                    RpcId::new("repair-index"),
+                    RpcMethod::SessionHistory,
+                    json!({"sessionId":"cold", "maxMessages":2}),
+                    CancellationToken::new(),
+                )
+                .await;
+            let RpcResult::Success {
+                value: Some(actual),
+            } = result
+            else {
+                panic!("{result:?}")
+            };
+            expected["projections"]["values"]["sessionListMetadata"]["restoring"] = json!(true);
+            assert_eq!(actual, expected);
+            assert_eq!(runtime.loads.load(Ordering::SeqCst), 0);
+            assert_eq!(store.cache_stats().entries, 0);
+            assert!(host.state.read().await.sessions["cold"].restoring);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_catalog_metrics_match_full_replay_for_usage_and_task_plan_history() {
+        let (dir, store, _, _, expected) = cold_history_fixture("metrics-stream").await;
+        let path = dir.join("cold.catalog");
+        let mut catalog: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        catalog["entry"]
+            .as_object_mut()
+            .unwrap()
+            .remove("metricSnapshot");
+        std::fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let runtime = Arc::new(CountedSnapshotRuntime {
+            store: store.clone(),
+            loads: AtomicUsize::new(0),
+            idle_checkpoints: false,
+        });
+        let host = BasicHost::with_agent_runtime(config(&dir), runtime.clone());
+        host.prepare_startup_catalog(store.clone()).await.unwrap();
+        host.backfill_startup_metrics().await;
+        let state = host.state.read().await;
+        let actual = state.sessions["cold"].projection_values();
+        for key in [
+            "tokenUsage",
+            "dailyTokenUsage",
+            "sessionStats",
+            "contextPressure",
+        ] {
+            assert_eq!(actual[key], expected["projections"]["values"][key], "{key}");
+        }
+        assert!(state.startup_issues.is_empty());
+        assert!(state.sessions["cold"].restoring);
+        assert_eq!(runtime.loads.load(Ordering::SeqCst), 0);
+        assert_eq!(store.cache_stats().entries, 0);
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_history_invalid_acceleration_keeps_recovery_fallback() {
+        for damage in [
+            "missing-presentation",
+            "schema",
+            "catalog",
+            "needs-recovery",
+            "oversize",
+        ] {
+            let (dir, store, host, _runtime, expected) = cold_history_fixture(damage).await;
+            let path = dir.join(if matches!(damage, "missing-presentation" | "schema") {
+                "cold.history-presentation"
+            } else {
+                "cold.catalog"
+            });
+            let mut catalog: Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            match damage {
+                "missing-presentation" => {
+                    catalog.as_object_mut().unwrap().remove("presentation");
+                }
+                "schema" => catalog["presentation"]["schema"] = json!("future.schema"),
+                "catalog" => catalog["version"] = json!(999),
+                "index" => {
+                    std::fs::write(dir.join("cold.history-index"), b"corrupt").unwrap();
+                }
+                "needs-recovery" => catalog["entry"]["needsRecovery"] = json!(true),
+                "oversize" => {
+                    let entry = store.catalog_entry("cold").await.unwrap().unwrap();
+                    store.load("cold").await.unwrap();
+                    store
+                        .publish_catalog_presentation(
+                            entry,
+                            xharness_session::HistoryPresentation {
+                                schema: crate::state::HISTORY_PRESENTATION_SCHEMA.to_owned(),
+                                values: json!({"tooLarge": "x".repeat(1024*1024)}),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if !matches!(damage, "index" | "oversize") {
+                std::fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+            }
+            let result = host
+                .call(
+                    RpcId::new("fallback"),
+                    RpcMethod::SessionHistory,
+                    json!({"sessionId":"cold", "maxMessages":2}),
+                    CancellationToken::new(),
+                )
+                .await;
+            let RpcResult::Success {
+                value: Some(actual),
+            } = result
+            else {
+                panic!("{damage}: {result:?}")
+            };
+            assert_eq!(
+                actual, expected,
+                "{damage} must not truncate or fabricate history"
+            );
+            assert!(
+                !host.state.read().await.sessions["cold"].restoring,
+                "{damage} must enter recovery"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_history_legacy_checkpoint_seeds_display_for_the_next_restart_without_replay() {
+        use xharness_session_jsonl::JsonlSessionStore;
+        let (dir, store, _, _, expected) = cold_history_fixture("legacy-checkpoint").await;
+        let producer = BasicHost::with_agent_runtime(
+            config(&dir),
+            Arc::new(CountedSnapshotRuntime {
+                store: store.clone(),
+                loads: AtomicUsize::new(0),
+                idle_checkpoints: true,
+            }),
+        );
+        producer.restore_from_store(store).await.unwrap();
+        assert!(dir.join("cold.recovery-checkpoint").exists());
+        std::fs::remove_file(dir.join("cold.history-presentation")).unwrap();
+        for restart in 0..2 {
+            let store = Arc::new(
+                JsonlSessionStore::new(&dir)
+                    .unwrap()
+                    .with_cache_limits(0, 0)
+                    .for_runtime(),
+            );
+            let runtime = Arc::new(CountedSnapshotRuntime {
+                store: store.clone(),
+                loads: AtomicUsize::new(0),
+                idle_checkpoints: true,
+            });
+            let host = BasicHost::with_agent_runtime(config(&dir), runtime.clone());
+            let (needed, deferred) = host.prepare_startup_catalog(store.clone()).await.unwrap();
+            assert!(needed.is_empty() && deferred.is_empty());
+            let result = host
+                .call(
+                    RpcId::new("checkpoint-page"),
+                    RpcMethod::SessionHistory,
+                    json!({"sessionId":"cold","maxMessages":2}),
+                    CancellationToken::new(),
+                )
+                .await;
+            let RpcResult::Success {
+                value: Some(actual),
+            } = result
+            else {
+                panic!("{result:?}")
+            };
+            let mut expected = expected.clone();
+            expected["projections"]["values"]["sessionListMetadata"]["restoring"] =
+                json!(restart == 1);
+            assert_eq!(actual, expected);
+            assert_eq!(
+                host.state.read().await.sessions["cold"].restoring,
+                restart == 1
+            );
+            assert_eq!(runtime.loads.load(Ordering::SeqCst), 0);
+            assert_eq!(store.cache_stats().entries, 0);
+            assert!(store
+                .cold_history_window("cold", crate::state::HISTORY_PRESENTATION_SCHEMA, None, 2)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct StartupReadProbe {
+        inner: Arc<dyn Store>,
+        loads: AtomicUsize,
+    }
+    #[async_trait]
+    impl Store for StartupReadProbe {
+        async fn list_headers(&self) -> Result<Vec<SessionHeader>, xharness_session::StoreError> {
+            panic!(
+                "Job discovery must not fully scan idle journals before checking their catalogue"
+            )
+        }
+        async fn scan_startup_candidates(
+            &self,
+        ) -> Result<
+            (Vec<SessionHeader>, Vec<xharness_session::UnreadableSession>),
+            xharness_session::StoreError,
+        > {
+            self.inner.scan_startup_candidates().await
+        }
+        async fn catalog_entry(
+            &self,
+            id: &str,
+        ) -> Result<Option<SessionCatalogEntry>, xharness_session::StoreError> {
+            self.inner.catalog_entry(id).await
+        }
+        async fn create(
+            &self,
+            header: SessionHeader,
+        ) -> Result<Session, xharness_session::StoreError> {
+            self.inner.create(header).await
+        }
+        async fn load(&self, id: &str) -> Result<Option<Session>, xharness_session::StoreError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.inner.load(id).await
+        }
+        async fn append(
+            &self,
+            id: &str,
+            expected: Revision,
+            events: Vec<SessionEvent>,
+        ) -> Result<xharness_session::AppendReceipt, xharness_session::StoreError> {
+            self.inner.append(id, expected, events).await
+        }
+        async fn inspect(
+            &self,
+            id: &str,
+        ) -> Result<Option<xharness_session::SessionInspection>, xharness_session::StoreError>
+        {
+            self.inner.inspect(id).await
+        }
+        async fn flush(&self, id: &str) -> Result<Revision, xharness_session::StoreError> {
+            self.inner.flush(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_history_job_discovery_skips_only_verified_idle_journals() {
+        use crate::job_continuation::{records, JobContinuationController};
+        for kind in ["idle", "missing", "stale", "pending", "corrupt-tail"] {
+            let (dir, store, host, _, _) = cold_history_fixture(kind).await;
+            if kind == "missing" {
+                std::fs::remove_file(dir.join("cold.catalog")).unwrap();
+            }
+            if kind == "pending" || kind == "stale" {
+                let mut pending_entry = store.catalog_entry("cold").await.unwrap().unwrap();
+                let session = store.load("cold").await.unwrap().unwrap();
+                store
+                    .append(
+                        "cold",
+                        session.revision(),
+                        vec![EventData::JobContinuation {
+                            record: Box::new(xharness_session::JobContinuationRecord {
+                                version: 1,
+                                id: "continuation".into(),
+                                job_id: "lost-job".into(),
+                                continuation: "observe terminal status".into(),
+                                state: xharness_session::JobContinuationState::Registered,
+                                completion: None,
+                            }),
+                        }
+                        .into()],
+                    )
+                    .await
+                    .unwrap();
+                if kind == "pending" {
+                    assert!(store.catalog_entry("cold").await.unwrap().is_none());
+                    pending_entry.next_seq = store.load("cold").await.unwrap().unwrap().next_seq();
+                    pending_entry.needs_recovery = true;
+                    store.publish_catalog_entry(pending_entry).await.unwrap();
+                }
+            }
+            if kind == "corrupt-tail" {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(dir.join("cold.jsonl"))
+                    .unwrap()
+                    .write_all(b"invalid committed record\n")
+                    .unwrap();
+            }
+            let probe = Arc::new(StartupReadProbe {
+                inner: store.clone(),
+                loads: AtomicUsize::new(0),
+            });
+            let controller = JobContinuationController::new(
+                Arc::new(xharness_jobs::JobRegistry::with_defaults()),
+                probe.clone(),
+                &host,
+            );
+            controller.pause_delivery();
+            let recovered = controller.recover().await;
+            if kind == "corrupt-tail" {
+                assert!(
+                    recovered.is_err(),
+                    "unreadable unknown work must be reported"
+                );
+            } else {
+                recovered.unwrap();
+            }
+            assert_eq!(
+                probe.loads.load(Ordering::SeqCst) == 0,
+                kind == "idle",
+                "{kind}"
+            );
+            if kind == "pending" || kind == "stale" {
+                assert_eq!(
+                    records(&store.load("cold").await.unwrap().unwrap())["lost-job"].state,
+                    xharness_session::JobContinuationState::Settled,
+                    "pending work is still recovered"
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_history_namespaced_mutations_recover_before_admission() {
+        for endpoint in ["commands/execute", "goals/clear"] {
+            let (dir, _, host, _, _) =
+                cold_history_fixture(endpoint.replace('/', "-").as_str()).await;
+            let listed = host
+                .call_dynamic(
+                    RpcId::new("list"),
+                    "commands/list",
+                    json!({"args":{"agentId":"cold"}}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(matches!(listed, Some(RpcResult::Success { .. })));
+            assert!(host.state.read().await.sessions["cold"].restoring);
+            let payload = if endpoint == "commands/execute" {
+                json!({"args":{"agentId":"cold","line":"/permission","images":[]}})
+            } else {
+                json!({"args":{"agentId":"cold","ref":{"id":"cold-goal","revision":2}}})
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                host.call_dynamic(
+                    RpcId::new("mutation"),
+                    endpoint,
+                    payload,
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("recovery must run before admission locks");
+            assert!(
+                matches!(result, Some(RpcResult::Success { .. })),
+                "{result:?}"
+            );
+            assert!(!host.state.read().await.sessions["cold"].restoring);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_history_races_with_rename_without_a_partial_cut_or_deadlock() {
+        let (dir, _, host, _, _) = cold_history_fixture("race").await;
+        let work = async {
+            let mut reads = tokio::task::JoinSet::new();
+            for n in 0..12 {
+                let host = host.clone();
+                reads.spawn(async move {
+                    host.call(
+                        RpcId::new(format!("reader-{n}")),
+                        RpcMethod::SessionHistory,
+                        json!({"sessionId":"cold", "maxMessages":2}),
+                        CancellationToken::new(),
+                    )
+                    .await
+                });
+            }
+            let mutation = host
+                .call(
+                    RpcId::new("race-rename"),
+                    RpcMethod::SessionRename,
+                    json!({"sessionId":"cold", "title":"new title"}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(matches!(mutation, RpcResult::Success { .. }));
+            while let Some(read) = reads.join_next().await {
+                assert!(matches!(read.unwrap(), RpcResult::Success { .. }));
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15), work)
+            .await
+            .expect("cold presentation/admission lock order deadlocked");
+        assert!(!host.state.read().await.sessions["cold"].restoring);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn indexed_history_rpc_equals_full_replay_and_all_invalid_indices_fall_back() {
+        use xharness_session_jsonl::JsonlSessionStore;
+        let dir = std::env::temp_dir().join(format!(
+            "xharness-indexed-rpc-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let store: Arc<dyn Store> = Arc::new(
+            JsonlSessionStore::new(&dir)
+                .unwrap()
+                .with_cache_limits(0, 0)
+                .for_runtime(),
+        );
+        let id = "indexed-rpc";
+        let mut header = SessionHeader::new(id);
+        header.cwd = Some(dir.to_string_lossy().into_owned());
+        store.create(header).await.unwrap();
+        let mut revision = Revision::ZERO;
+        for turn in 1..=4 {
+            revision = store
+                .append(id, revision, closed_text_turn(turn, "你好 🧪", "完整回答"))
+                .await
+                .unwrap()
+                .revision;
+        }
+        let durable = store.load(id).await.unwrap().unwrap();
+        let runtime = Arc::new(CountedSnapshotRuntime {
+            store: store.clone(),
+            loads: AtomicUsize::new(0),
+            idle_checkpoints: false,
+        });
+        let host = BasicHost::with_agent_runtime(config(&dir), runtime.clone());
+        host.restore_from_store(store.clone()).await.unwrap();
+        assert!(host.lazy_store.set(store.clone()).is_ok());
+        let reference = BasicHost::with_agent_runtime(
+            config(&dir),
+            Arc::new(OfflineSnapshotRuntime {
+                store: store.clone(),
+            }),
+        );
+        reference.restore_from_store(store.clone()).await.unwrap();
+        for before in (0..=durable.next_seq() + 1).map(Some).chain([None]) {
+            for max in [1, 3, 50] {
+                let mut args = json!({"sessionId":id, "maxMessages":max});
+                if let Some(seq) = before {
+                    args["beforeSeq"] = json!(seq);
+                }
+                runtime.loads.store(0, Ordering::SeqCst);
+                let indexed = host
+                    .call(
+                        RpcId::new("indexed"),
+                        RpcMethod::SessionHistory,
+                        args.clone(),
+                        CancellationToken::new(),
+                    )
+                    .await;
+                assert_eq!(
+                    runtime.loads.load(Ordering::SeqCst),
+                    0,
+                    "indexed page must avoid full replay"
+                );
+                let full = reference
+                    .call(
+                        RpcId::new("full"),
+                        RpcMethod::SessionHistory,
+                        args,
+                        CancellationToken::new(),
+                    )
+                    .await;
+                let (
+                    RpcResult::Success {
+                        value: Some(indexed),
+                    },
+                    RpcResult::Success { value: Some(full) },
+                ) = (indexed, full)
+                else {
+                    panic!("history RPC failed");
+                };
+                assert_eq!(indexed, full, "cursor {before:?}, size {max}");
+            }
+        }
+        let path = dir.join(format!("{id}.history-index"));
+        for corrupt in [false, true] {
+            if corrupt {
+                std::fs::write(&path, b"broken index").unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            runtime.loads.store(0, Ordering::SeqCst);
+            let history = host
+                .call(
+                    RpcId::new("fallback"),
+                    RpcMethod::SessionHistory,
+                    json!({"sessionId":id}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(matches!(history, RpcResult::Success { .. }));
+            assert!(
+                runtime.loads.load(Ordering::SeqCst) > 0,
+                "unusable index must invoke authoritative fallback"
+            );
+        }
+        // Even with a good index, an active turn retains the original synchronization path.
+        host.state
+            .write()
+            .await
+            .sessions
+            .get_mut(id)
+            .unwrap()
+            .running = true;
+        runtime.loads.store(0, Ordering::SeqCst);
+        let history = host
+            .call(
+                RpcId::new("active"),
+                RpcMethod::SessionHistory,
+                json!({"sessionId":id}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(history, RpcResult::Success { .. }));
+        assert!(runtime.loads.load(Ordering::SeqCst) > 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    async fn assert_indexed_projection_pages(store: &dyn Store, id: &str) {
+        let session = store.load(id).await.unwrap().unwrap();
+        let route = ModelRoute::new("test", "test-model");
+        for before in (0..=session.next_seq() + 1).map(Some).chain([None]) {
+            for max in [1, 2, 3, 50] {
+                let window = store
+                    .history_window(id, session.next_seq(), before, max)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let full =
+                    xharness_projection::project_session_history(&session, &route, before, max);
+                assert_eq!(
+                    xharness_projection::project_history_window(&window, &route),
+                    full.events,
+                    "{id}, {before:?}, {max}"
+                );
+                assert_eq!(window.has_more, full.has_more);
+                for event in &window.events {
+                    assert_eq!(
+                        xharness_projection::project_history_window_view(&window, event),
+                        xharness_projection::project_session_event_view(&session, event)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_history_keeps_cross_page_tool_prompt_compaction_and_chunk_context() {
+        use xharness_session_jsonl::JsonlSessionStore;
+        let dir = std::env::temp_dir().join(format!(
+            "xharness-indexed-context-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = JsonlSessionStore::new(&dir)
+            .unwrap()
+            .with_cache_limits(0, 0)
+            .for_runtime();
+        let tool = closed_tool_session(
+            "bash",
+            "{\"command\":\"echo ok\"}".to_owned(),
+            ToolResultData {
+                call_id: "indexed-call".to_owned(),
+                outcome: ToolOutcome::Success,
+                content: "ok".to_owned(),
+                metadata: Some(
+                    json!({"kind":"foreground", "exit_code":0, "stdout":"ok", "stderr":""}),
+                ),
+            },
+        );
+        store.create(tool.header().clone()).await.unwrap();
+        // Assistant and mirrored calls are one atomic batch; a result-only
+        // page must still seek the preceding batch for its terminal view.
+        let mut revision = store
+            .append(
+                &tool.header().id,
+                Revision::ZERO,
+                tool.events()[..6].iter().map(|e| e.event.clone()).collect(),
+            )
+            .await
+            .unwrap()
+            .revision;
+        for event in &tool.events()[6..] {
+            revision = store
+                .append(&tool.header().id, revision, vec![event.event.clone()])
+                .await
+                .unwrap()
+                .revision;
+        }
+        assert_indexed_projection_pages(&store, &tool.header().id).await;
+        let id = "indexed-prompt";
+        store.create(SessionHeader::new(id)).await.unwrap();
+        let mut input = xharness_session::InboxMessage::user("user-1", "你好");
+        input.source = Some(
+            json!({"content":[{"type":"text","text":"你好"},{"type":"attachment","name":"sample.png"}], "source":{"kind":"user"}, "rpcFingerprint":"fixture"}),
+        );
+        let mut events = vec![
+            EventData::AgentInboxSpliced {
+                target: xharness_session::InboxTarget::NextTurn,
+                start: 0,
+                removed_count: 0,
+                inserted: vec![input],
+                outcome: None,
+            }
+            .into(),
+            EventData::AgentInboxSpliced {
+                target: xharness_session::InboxTarget::NextTurn,
+                start: 0,
+                removed_count: 1,
+                inserted: vec![],
+                outcome: None,
+            }
+            .into(),
+        ];
+        let mut text = closed_text_turn(1, "你好", "answer");
+        text.insert(
+            4,
+            EventData::AssistantChunk {
+                turn: 1,
+                step: 1,
+                chunk: AssistantChunk::ReasoningDelta("thought".to_owned()),
+            }
+            .into(),
+        );
+        text.insert(
+            5,
+            EventData::AssistantChunk {
+                turn: 1,
+                step: 1,
+                chunk: AssistantChunk::TextDelta("answer".to_owned()),
+            }
+            .into(),
+        );
+        events.extend(text);
+        let mut revision = Revision::ZERO;
+        for event in events {
+            revision = store
+                .append(id, revision, vec![event])
+                .await
+                .unwrap()
+                .revision;
+        }
+        assert_indexed_projection_pages(&store, id).await;
+        let id = "indexed-interrupted";
+        store.create(SessionHeader::new(id)).await.unwrap();
+        let mut partial = closed_text_turn(1, "unfinished", "unused")[..4].to_vec();
+        for chunk in [
+            AssistantChunk::ReasoningDelta("思考一".to_owned()),
+            AssistantChunk::ReasoningDelta("思考二".to_owned()),
+            AssistantChunk::TextDelta("正文一".to_owned()),
+            AssistantChunk::TextDelta("正文二".to_owned()),
+        ] {
+            partial.push(
+                EventData::AssistantChunk {
+                    turn: 1,
+                    step: 1,
+                    chunk,
+                }
+                .into(),
+            );
+        }
+        store.append(id, Revision::ZERO, partial).await.unwrap();
+        assert_indexed_projection_pages(&store, id).await;
+        let id = "indexed-compaction";
+        store.create(SessionHeader::new(id)).await.unwrap();
+        let prefix = vec![
+            EventData::TurnStart { turn: 1 }.into(),
+            EventData::UserMessage {
+                message: Message::user("old"),
+                surface_replace: None,
+            }
+            .into(),
+            EventData::StepStart { turn: 1, step: 1 }.into(),
+            EventData::CompactionStart {
+                compaction_id: "compact-index".to_owned(),
+                source_command_id: Some("command-index".to_owned()),
+                turn: Some(1),
+            }
+            .into(),
+        ];
+        let receipt = store.append(id, Revision::ZERO, prefix).await.unwrap();
+        let range = SequenceRange { start: 1, end: 1 };
+        store
+            .append(
+                id,
+                receipt.revision,
+                vec![
+                    EventData::CompactionSummary {
+                        compaction_id: "compact-index".to_owned(),
+                        source_command_id: Some("command-index".to_owned()),
+                        summary: "summary".to_owned(),
+                        shadowed_range: range,
+                        shadowed_seqs: vec![1],
+                        shadowed_token_count: 10,
+                        provider: "test".to_owned(),
+                        model: "test-model".to_owned(),
+                        max_tokens: Some(64),
+                        usage: None,
+                    }
+                    .into(),
+                    EventData::UserMessage {
+                        message: Message::user("checkpoint"),
+                        surface_replace: Some(SurfaceReplace {
+                            compaction_id: "compact-index".to_owned(),
+                            shadowed_range: range,
+                            shadowed_seqs: vec![1],
+                        }),
+                    }
+                    .into(),
+                    EventData::CompactionEnd {
+                        compaction_id: "compact-index".to_owned(),
+                        source_command_id: Some("command-index".to_owned()),
+                        turn: Some(1),
+                        error: None,
+                        outcome: None,
+                        fingerprint: None,
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_indexed_projection_pages(&store, id).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Replays Host startup against an isolated journal copy 100 times. With
+    /// `XHARNESS_OFFLINE_JOURNAL` this exercises a private incident journal;
+    /// the original file is never opened by the Host or modified. CI uses the
+    /// synthetic fixture and Windows runner to keep the cold-start contract
+    /// continuously covered without checking private data into the repository.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "explicit isolated cold-start acceptance; run in diagnostics CI"]
+    async fn offline_authoritative_restore_100_cold_starts() {
+        use std::io::{BufRead, Read};
+        use xharness_session_jsonl::JsonlSessionStore;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "xharness-offline-cold-start-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let concrete = JsonlSessionStore::new(&root).unwrap().for_runtime();
+        let session_id = if let Some(input) = std::env::var_os("XHARNESS_OFFLINE_JOURNAL") {
+            let input = std::path::PathBuf::from(input);
+            assert!(
+                input.is_absolute() && input.is_file(),
+                "expected a local journal file"
+            );
+            let mut header_line = Vec::new();
+            std::io::BufReader::new(std::fs::File::open(&input).unwrap())
+                .take(1024 * 1024)
+                .read_until(b'\n', &mut header_line)
+                .unwrap();
+            let header: Value = serde_json::from_slice(&header_line)
+                .unwrap_or_else(|_| panic!("invalid offline journal header"));
+            let id = header["header"]["id"]
+                .as_str()
+                .expect("missing offline session ID")
+                .to_owned();
+            assert!(
+                !id.is_empty()
+                    && id.len() <= 200
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+                "offline session ID must be a simple file name"
+            );
+            std::fs::copy(&input, root.join(format!("{id}.jsonl"))).unwrap();
+            id
+        } else {
+            let id = "offline-cold-start-fixture";
+            concrete.create(SessionHeader::new(id)).await.unwrap();
+            let mut events = Vec::new();
+            for turn in 1..=128 {
+                events.extend(closed_text_turn(
+                    turn,
+                    "synthetic cold-start question",
+                    "synthetic cold-start answer",
+                ));
+            }
+            concrete.append(id, Revision::ZERO, events).await.unwrap();
+            id.to_owned()
+        };
+        let store: Arc<dyn Store> = Arc::new(concrete);
+
+        for iteration in 0..100 {
+            let runtime = Arc::new(OfflineSnapshotRuntime {
+                store: Arc::clone(&store),
+            });
+            let host = BasicHost::with_agent_runtime(config(&root), runtime);
+            let report = host.restore_from_store(Arc::clone(&store)).await.unwrap();
+            assert_eq!(report.restored_sessions, 1, "iteration {iteration}");
+            assert!(report.issues.is_empty(), "iteration {iteration}");
+            let state = host.state.read().await;
+            let record = state.sessions.get(&session_id).unwrap();
+            assert!(record.events.is_empty(), "iteration {iteration}");
+            assert_eq!(record.event_cache_bytes, 0, "iteration {iteration}");
+            assert_eq!(
+                record.event_base_seq,
+                record.next_event_seq(),
+                "iteration {iteration}"
+            );
+        }
+        eprintln!("offline authoritative restore: 100 cold starts passed; no models or tools");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_settings_and_mutation_receipts_survive_a_host_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "xharness-host-control-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let cwd = root.join("boot");
+        let custom = root.join("custom");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&custom).unwrap();
+        let session_store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let control_store: Arc<dyn ControlStore> =
+            Arc::new(JsonlControlStore::new(root.join("control")).unwrap());
+
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            None,
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&session_store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let live = BasicHost::with_agent_runtime_and_control_store(
+            config(&cwd),
+            runtime,
+            Arc::clone(&control_store),
+        );
+        live.restore_from_store(Arc::clone(&session_store))
+            .await
+            .unwrap();
+
+        let create_payload = json!({"path": custom.to_string_lossy()});
+        let left = {
+            let host = Arc::clone(&live);
+            let payload = create_payload.clone();
+            tokio::spawn(async move {
+                host.call(
+                    RpcId::new("workspace-create-once"),
+                    RpcMethod::WorkspaceCreate,
+                    payload,
+                    CancellationToken::new(),
+                )
+                .await
+            })
+        };
+        let right = {
+            let host = Arc::clone(&live);
+            let payload = create_payload.clone();
+            tokio::spawn(async move {
+                host.call(
+                    RpcId::new("workspace-create-once"),
+                    RpcMethod::WorkspaceCreate,
+                    payload,
+                    CancellationToken::new(),
+                )
+                .await
+            })
+        };
+        let [created, duplicate] = [left.await.unwrap(), right.await.unwrap()];
+        assert_eq!(created, duplicate);
+        let RpcResult::Success {
+            value: Some(created),
+        } = created
+        else {
+            panic!("workspace create failed: {created:?}");
+        };
+        let workspace_id = created["workspace"]["workspaceId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            control_store.load().await.unwrap().revision(),
+            ControlRevision(1)
+        );
+
+        let renamed = live
+            .call(
+                RpcId::new("workspace-rename-once"),
+                RpcMethod::WorkspaceRename,
+                json!({"workspaceId": workspace_id, "title": "Durable custom"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(renamed, RpcResult::Success { .. }));
+        let settings_payload = json!({
+            "ns": "ui-onboarding",
+            "section": {"welcomeNoticeVersion": "v2"},
+            "expectedRevision": 0,
+        });
+        let settings = live
+            .call(
+                RpcId::new("settings-once"),
+                RpcMethod::SettingsReplace,
+                settings_payload.clone(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(settings, RpcResult::Success { .. }));
+        assert_eq!(
+            control_store.load().await.unwrap().revision(),
+            ControlRevision(3)
+        );
+
+        drop(live);
+        std::fs::remove_dir_all(&custom).unwrap();
+        let restarted_runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            None,
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&session_store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let restarted = BasicHost::with_agent_runtime_and_control_store(
+            config(&cwd),
+            restarted_runtime,
+            Arc::clone(&control_store),
+        );
+        restarted
+            .restore_from_store(Arc::clone(&session_store))
+            .await
+            .unwrap();
+        let workspaces = restarted
+            .call(
+                RpcId::new("workspace-list-after-restart"),
+                RpcMethod::WorkspaceList,
+                json!({}),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success {
+            value: Some(workspaces),
+        } = workspaces
+        else {
+            panic!("workspace list failed: {workspaces:?}");
+        };
+        assert!(workspaces["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|workspace| {
+                workspace["workspaceId"] == workspace_id && workspace["title"] == "Durable custom"
+            }));
+        let described = restarted
+            .call(
+                RpcId::new("settings-after-restart"),
+                RpcMethod::SettingsDescribe,
+                json!({}),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success {
+            value: Some(described),
+        } = described
+        else {
+            panic!("settings describe failed: {described:?}");
+        };
+        assert!(described["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|namespace| {
+                namespace["ns"] == "ui-onboarding"
+                    && namespace["value"]["welcomeNoticeVersion"] == "v2"
+                    && namespace["revision"] == 1
+            }));
+
+        // Receipt lookup precedes path validation: the original success can
+        // be recovered even though the directory disappeared after commit.
+        let replay = restarted
+            .call(
+                RpcId::new("workspace-create-once"),
+                RpcMethod::WorkspaceCreate,
+                create_payload,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(replay, duplicate);
+        assert_eq!(
+            control_store.load().await.unwrap().revision(),
+            ControlRevision(3)
+        );
+        let conflict = restarted
+            .call(
+                RpcId::new("settings-once"),
+                RpcMethod::SettingsReplace,
+                json!({
+                    "ns": "ui-onboarding",
+                    "section": {"welcomeNoticeVersion": "different"},
+                    "expectedRevision": 0,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(conflict, RpcResult::Failure { .. }));
+        assert_eq!(
+            control_store.load().await.unwrap().revision(),
+            ControlRevision(3)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Shared harness for the workspace identity regressions. Builds a Host on
+    /// a boot cwd, creates the named sessions with custom cwds, and lets each
+    /// caller simulate restarts and unrelated Workspace mutations.
+    struct WorkspaceHarness {
+        _root: std::path::PathBuf,
+        boot: std::path::PathBuf,
+        custom: std::collections::BTreeMap<String, std::path::PathBuf>,
+        session_store: Arc<dyn Store>,
+        control_store: Arc<dyn ControlStore>,
+        control_file: std::path::PathBuf,
+    }
+
+    impl WorkspaceHarness {
+        fn new(label: &str, names: &[&str]) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "xharness-ws-{label}-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            let boot = root.join("boot");
+            std::fs::create_dir_all(&boot).unwrap();
+            let mut custom = std::collections::BTreeMap::new();
+            for name in names {
+                let dir = root.join(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                custom.insert((*name).to_owned(), dir);
+            }
+            let control_dir = root.join("control");
+            let control_file = control_dir.join("host-control.jsonl");
+            let control_store: Arc<dyn ControlStore> =
+                Arc::new(JsonlControlStore::new(&control_dir).unwrap());
+            let session_store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+            Self {
+                _root: root,
+                boot,
+                custom,
+                session_store,
+                control_store,
+                control_file,
+            }
+        }
+
+        fn build(&self) -> Arc<BasicHost> {
+            let runtime = Arc::new(DurableLoopAgentRuntime::new(
+                "test",
+                "test-model",
+                None,
+                Arc::new(NoTools),
+                Arc::new(IdentityContextPolicy),
+                Arc::clone(&self.session_store),
+                Arc::new(MemoryLeaseManager::default()),
+                64,
+            ));
+            BasicHost::with_agent_runtime_and_control_store(
+                config(&self.boot),
+                runtime,
+                Arc::clone(&self.control_store),
+            )
+        }
+
+        /// Boot once and create one session per configured custom directory.
+        async fn seed_sessions(&self) {
+            let host = self.build();
+            host.restore_from_store(Arc::clone(&self.session_store))
+                .await
+                .unwrap();
+            for (name, dir) in &self.custom {
+                let result = host
+                    .call(
+                        RpcId::new(format!("create-{name}")),
+                        RpcMethod::SessionCreate,
+                        json!({"sessionId": name, "cwd": dir.to_string_lossy()}),
+                        CancellationToken::new(),
+                    )
+                    .await;
+                assert!(
+                    matches!(result, RpcResult::Success { .. }),
+                    "session create failed: {result:?}"
+                );
+            }
+        }
+
+        /// Boot and return the ordered `(workspaceId, path, sessionIds)` rows.
+        async fn boot_and_list(&self) -> Arc<BasicHost> {
+            let host = self.build();
+            host.restore_from_store(Arc::clone(&self.session_store))
+                .await
+                .unwrap();
+            host
+        }
+
+        async fn create_workspace(&self, host: &Arc<BasicHost>, name: &str) -> String {
+            let dir = self.custom.get(name).cloned().unwrap_or_else(|| {
+                let dir = self
+                    .control_file
+                    .parent()
+                    .unwrap()
+                    .join(format!("scratch-{name}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                dir
+            });
+            let created = host
+                .call(
+                    RpcId::new(format!("create-ws-{name}")),
+                    RpcMethod::WorkspaceCreate,
+                    json!({"path": dir.to_string_lossy()}),
+                    CancellationToken::new(),
+                )
+                .await;
+            let RpcResult::Success { value: Some(value) } = created else {
+                panic!("workspace create failed: {created:?}");
+            };
+            value["workspace"]["workspaceId"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+
+        async fn delete_workspace(&self, host: &Arc<BasicHost>, id: &str) {
+            let removed = host
+                .call(
+                    RpcId::new(format!("delete-ws-{id}")),
+                    RpcMethod::WorkspaceDelete,
+                    json!({"workspaceId": id}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                matches!(removed, RpcResult::Success { .. }),
+                "workspace delete failed: {removed:?}"
+            );
+        }
+    }
+
+    async fn workspace_rows(host: &Arc<BasicHost>) -> Vec<(String, String, Vec<String>)> {
+        let listed = host
+            .call(
+                RpcId::new("workspace-list"),
+                RpcMethod::WorkspaceList,
+                json!({}),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success { value: Some(value) } = listed else {
+            panic!("workspace list failed: {listed:?}");
+        };
+        value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                let mut sessions = item["sessionIds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                sessions.sort();
+                (
+                    item["workspaceId"].as_str().unwrap().to_owned(),
+                    item["path"].as_str().unwrap().to_owned(),
+                    sessions,
+                )
+            })
+            .collect()
+    }
+
+    /// A session's Workspace identity must depend only on its directory, never
+    /// on how many other Workspaces happen to exist at that moment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovered_workspace_identity_survives_unrelated_workspace_changes() {
+        let harness = WorkspaceHarness::new("identity", &["dir-a", "dir-b"]);
+        harness.seed_sessions().await;
+
+        let host = harness.boot_and_list().await;
+        let before = workspace_rows(&host).await;
+        // An unrelated Workspace is created while the sessions stay untouched.
+        let scratch = harness.create_workspace(&host, "unrelated").await;
+        drop(host);
+
+        let host = harness.boot_and_list().await;
+        let after = workspace_rows(&host).await;
+        harness.delete_workspace(&host, &scratch).await;
+        drop(host);
+
+        let host = harness.boot_and_list().await;
+        let healed = workspace_rows(&host).await;
+
+        let dir_of = |rows: &[(String, String, Vec<String>)], session: &str| {
+            rows.iter()
+                .find(|(_, _, sessions)| sessions.iter().any(|s| s == session))
+                .map(|(id, path, _)| (id.clone(), path.clone()))
+        };
+        for session in ["dir-a", "dir-b"] {
+            let first = dir_of(&before, session);
+            assert_eq!(
+                dir_of(&after, session),
+                first,
+                "creating an unrelated Workspace rebound {session}"
+            );
+            assert_eq!(
+                dir_of(&healed, session),
+                first,
+                "deleting an unrelated Workspace rebound {session}"
+            );
+        }
+    }
+
+    /// The durable order must not be rewritten by an unrelated insert/delete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_order_survives_unrelated_insert_and_delete() {
+        let harness = WorkspaceHarness::new("order", &["dir-a", "dir-b"]);
+        harness.seed_sessions().await;
+
+        let host = harness.boot_and_list().await;
+        let before = workspace_rows(&host).await;
+        assert_eq!(before.len(), 3, "expected boot + two session workspaces");
+        let scratch = harness.create_workspace(&host, "unrelated").await;
+        drop(host);
+
+        let host = harness.boot_and_list().await;
+        harness.delete_workspace(&host, &scratch).await;
+        drop(host);
+
+        let host = harness.boot_and_list().await;
+        let after = workspace_rows(&host).await;
+        let order = |rows: &[(String, String, Vec<String>)]| {
+            rows.iter().map(|(id, _, _)| id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            order(&after),
+            order(&before),
+            "an unrelated insert/delete permuted the durable workspace order"
+        );
+    }
+
+    /// Every id the durable order references must have a definition in the
+    /// same log, so a replayed order can never land on another Workspace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restored_log_defines_every_referenced_workspace() {
+        let harness = WorkspaceHarness::new("defined", &["dir-a"]);
+        harness.seed_sessions().await;
+        let host = harness.boot_and_list().await;
+        let _ = harness.create_workspace(&host, "unrelated").await;
+        drop(host);
+
+        // A second boot must not need to append anything.
+        let host = harness.boot_and_list().await;
+        drop(host);
+
+        let log = std::fs::read_to_string(&harness.control_file).unwrap();
+        let defined = log
+            .split("\"workspace_defined\"")
+            .skip(1)
+            .filter_map(|chunk| {
+                let start = chunk.find("\"workspaceId\":\"")? + "\"workspaceId\":\"".len();
+                let end = chunk[start..].find('"')? + start;
+                Some(chunk[start..end].to_owned())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for line in log
+            .lines()
+            .filter(|line| line.contains("workspace_order_set"))
+        {
+            let Some(start) = line.find("\"workspace_ids\":[") else {
+                continue;
+            };
+            let rest = &line[start + "\"workspace_ids\":[".len()..];
+            let Some(end) = rest.find(']') else { continue };
+            for raw in rest[..end].split(',') {
+                let id = raw.trim().trim_matches('"');
+                if id.is_empty() {
+                    continue;
+                }
+                assert!(
+                    defined.contains(id),
+                    "durable order references undefined workspace {id:?}"
+                );
+            }
+        }
+    }
+
+    /// A dangling id left by an older build must never be adopted by a
+    /// Workspace discovered during this restore. Discovery names ids from the
+    /// directory itself, so a stale `workspace-recovered-N` entry can only be
+    /// discarded, never rebound to an unrelated directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dangling_legacy_id_is_never_adopted_by_new_discovery() {
+        let harness = WorkspaceHarness::new("adopt", &["dir-a", "dir-b"]);
+        harness.seed_sessions().await;
+        let host = harness.boot_and_list().await;
+        let _ = harness.create_workspace(&host, "unrelated").await;
+        drop(host);
+
+        let log = std::fs::read_to_string(&harness.control_file).unwrap();
+        let patched = log.replace(
+            "\"workspace_ids\":[",
+            "\"workspace_ids\":[\"workspace-recovered-1\",\"workspace-recovered-2\",",
+        );
+        assert_ne!(patched, log, "expected a durable order in the log");
+        std::fs::write(&harness.control_file, patched).unwrap();
+
+        let host = harness.boot_and_list().await;
+        let rows = workspace_rows(&host).await;
+        for (id, path, _) in &rows {
+            assert!(
+                !id.starts_with("workspace-recovered-"),
+                "stale legacy id {id:?} was adopted by {path}"
+            );
+        }
+        // The stale entries were dropped, and every surviving workspace still
+        // resolves to its own directory.
+        for session in ["dir-a", "dir-b"] {
+            let found = rows
+                .iter()
+                .find(|(_, _, sessions)| sessions.iter().any(|s| s == session));
+            assert!(found.is_some(), "{session} lost its workspace: {rows:?}");
+        }
+    }
+
+    /// A log already written by an older build may reference synthetic ids that
+    /// were never defined. Restoration must still succeed and must not lose the
+    /// sessions that live in those directories.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_log_with_dangling_workspace_ids_still_restores() {
+        let harness = WorkspaceHarness::new("legacy", &["dir-a"]);
+        harness.seed_sessions().await;
+        // A real mutation is what first materializes the control log.
+        let host = harness.boot_and_list().await;
+        let _ = harness.create_workspace(&host, "unrelated").await;
+        drop(host);
+        assert!(
+            harness.control_file.exists(),
+            "expected a control log after one mutation"
+        );
+
+        // Rewrite the log to look like the pre-fix output: a durable order that
+        // mentions a synthetic id which no workspace_defined event introduces.
+        let log = std::fs::read_to_string(&harness.control_file).unwrap();
+        let patched = log.replace(
+            "\"workspace_ids\":[",
+            "\"workspace_ids\":[\"workspace-recovered-9\",",
+        );
+        assert_ne!(patched, log, "expected the log to contain a durable order");
+        std::fs::write(&harness.control_file, patched).unwrap();
+
+        let host = harness.build();
+        let restored = host
+            .restore_from_store(Arc::clone(&harness.session_store))
+            .await;
+        assert!(
+            restored.is_ok(),
+            "a legacy dangling reference must not block startup: {restored:?}"
+        );
+        let rows = workspace_rows(&host).await;
+        assert!(
+            rows.iter()
+                .any(|(_, _, sessions)| sessions.iter().any(|s| s == "dir-a")),
+            "the session workspace was lost: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_rebuilds_history_events_messages_and_workspace_projection() {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut header = SessionHeader::new("history-session");
+        header.created_at_ms = 123;
+        header.cwd = Some(cwd.to_string_lossy().into_owned());
+        store.create(header).await.unwrap();
+        let mut request_header = RequestHeader::new("test", "test-model");
+        request_header.reasoning_effort = Some("high".to_owned());
+        request_header.system = Some("system prompt".to_owned());
+        request_header.tools = vec![json!({"name": "read", "description": "Read a file"})];
+        request_header.input = vec![Message::user("hello")];
+        request_header.options.insert(
+            "tokenBudget".to_owned(),
+            json!({"contextWindowTokens": 53_248}),
+        );
+        store
+            .append(
+                "history-session",
+                Revision::ZERO,
+                vec![
+                    SessionEvent::from(EventData::TurnStart { turn: 1 }),
+                    EventData::UserMessage {
+                        message: Message::user("hello").with_id("prompt-history"),
+                        surface_replace: None,
+                    }
+                    .into(),
+                    EventData::StepStart { turn: 1, step: 1 }.into(),
+                    EventData::RequestHeader {
+                        header: request_header,
+                    }
+                    .into(),
+                    EventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message: Message::assistant("world").with_id("answer-history"),
+                        usage: None,
+                    }
+                    .into(),
+                    EventData::StepEnd { turn: 1, step: 1 }.into(),
+                    EventData::TurnEnd {
+                        turn: 1,
+                        reason: TurnEndReason::Completed,
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let host = BasicHost::without_provider(config(&cwd));
+        let report = host.restore_from_store(Arc::clone(&store)).await.unwrap();
+        assert_eq!(report.discovered_sessions, 1);
+        assert_eq!(report.restored_sessions, 1);
+        assert!(report.issues.is_empty());
+
+        let state = host.state.read().await;
+        let session = state.sessions.get("history-session").unwrap();
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "hello");
+        assert_eq!(session.messages[1].content, "world");
+        assert_eq!(session.model.provider, "test");
+        assert_eq!(session.model.model, "test-model");
+        assert_eq!(session.model.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(session.next_turn, 1);
+        assert!(!session.blank);
+        assert_eq!(session.events.len(), 7);
+        assert_eq!(session.events[0]["type"], "turn/start");
+        assert_eq!(session.events[0]["data"]["turn"], 0);
+        let projected_header = session
+            .events
+            .iter()
+            .find(|event| event["type"] == "request/header")
+            .expect("request/header is projected for the Web client");
+        assert_eq!(
+            projected_header["data"]["header"]["config"],
+            json!({
+                "provider": "test",
+                "model": "test-model",
+                "reasoningEffort": "high",
+            })
+        );
+        assert_eq!(projected_header["data"]["reason"], "initial");
+        assert_eq!(projected_header["data"]["header"]["input"], json!([]));
+        assert_eq!(
+            projected_header["data"]["header"]["options"]["tokenBudget"]["contextWindowTokens"],
+            53_248
+        );
+        assert!(
+            session.summary().get("origin").is_none(),
+            "ordinary restored sessions must remain compatible with the Web session.list origin enum"
+        );
+        assert!(state
+            .workspaces
+            .values()
+            .any(|workspace| workspace.session_ids == ["history-session"]));
+    }
+
+    #[tokio::test]
+    async fn approval_and_retry_events_project_with_frozen_wire_names() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        store
+            .create(SessionHeader::new("control-projection"))
+            .await
+            .unwrap();
+        let call = ToolCall {
+            id: "execution-1".to_owned(),
+            provider_call_id: Some("provider-call-1".to_owned()),
+            index: 0,
+            name: "bash".to_owned(),
+            arguments_json: r#"{"command":"pwd"}"#.to_owned(),
+        };
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls.push(call.clone());
+        store
+            .append(
+                "control-projection",
+                Revision::ZERO,
+                vec![
+                    EventData::TurnStart { turn: 1 }.into(),
+                    EventData::UserMessage {
+                        message: Message::user("inspect"),
+                        surface_replace: None,
+                    }
+                    .into(),
+                    EventData::StepStart { turn: 1, step: 1 }.into(),
+                    EventData::RequestHeader {
+                        header: RequestHeader::new("test", "test-model"),
+                    }
+                    .into(),
+                    EventData::LlmRetry {
+                        retry_id: "retry-1".to_owned(),
+                        turn: 1,
+                        step: 1,
+                        provider: "test".to_owned(),
+                        mode: LlmRetryMode::Normal,
+                        policy_key: "normal:2".to_owned(),
+                        retry: 1,
+                        max_retries: Some(2),
+                        delay_ms: 0,
+                        failure: LlmFailure::transport("temporary"),
+                    }
+                    .into(),
+                    EventData::LlmRetryStarted {
+                        retry_id: "retry-1".to_owned(),
+                        turn: 1,
+                        step: 1,
+                        retry: 1,
+                    }
+                    .into(),
+                    EventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message: assistant,
+                        usage: None,
+                    }
+                    .into(),
+                    EventData::ToolCall {
+                        turn: 1,
+                        step: 1,
+                        call,
+                    }
+                    .into(),
+                    EventData::ApprovalAsked {
+                        id: "approval-1".to_owned(),
+                        tool_name: "bash".to_owned(),
+                        call_id: Some("execution-1".to_owned()),
+                        reason: Some("requires permission".to_owned()),
+                    }
+                    .into(),
+                    EventData::ApprovalDecided {
+                        id: "approval-1".to_owned(),
+                        outcome: ApprovalOutcome::Rejected,
+                    }
+                    .into(),
+                    EventData::ToolResult {
+                        turn: 1,
+                        step: 1,
+                        result: ToolResultData::error("execution-1", "rejected"),
+                    }
+                    .into(),
+                    EventData::StepEnd { turn: 1, step: 1 }.into(),
+                    EventData::TurnEnd {
+                        turn: 1,
+                        reason: TurnEndReason::Completed,
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let session = store.load("control-projection").await.unwrap().unwrap();
+        let route = ModelRoute {
+            provider: "test".to_owned(),
+            model: "test-model".to_owned(),
+            reasoning_effort: None,
+            context_window_tokens: None,
+        };
+        let projected = project_session_event_range(&session, &route, 0, session.events().len());
+        let controls = projected
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["type"].as_str(),
+                    Some("approval/asked" | "approval/decided" | "llm/retry" | "llm/retry-started")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            controls
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "llm/retry",
+                "llm/retry-started",
+                "approval/asked",
+                "approval/decided",
+            ]
+        );
+        assert_eq!(controls[0]["data"]["retryId"], "retry-1");
+        assert_eq!(controls[0]["data"]["turn"], 0);
+        assert_eq!(controls[1]["data"]["turn"], 0);
+        assert_eq!(controls[0]["data"]["step"], 1);
+        assert_eq!(controls[1]["data"]["retryId"], "retry-1");
+        assert_eq!(controls[1]["data"]["retry"], 1);
+        assert_eq!(controls[2]["data"]["toolName"], "bash");
+        assert_eq!(controls[2]["data"]["callId"], "execution-1");
+        assert_eq!(controls[3]["data"]["outcome"], "rejected");
+        assert!(controls
+            .iter()
+            .all(|event| event.get("surfaceOp").is_none()));
+
+        store
+            .append(
+                "control-projection",
+                session.revision(),
+                vec![
+                    EventData::TurnStart { turn: 2 }.into(),
+                    EventData::TurnEnd {
+                        turn: 2,
+                        reason: TurnEndReason::Completed,
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let session = store.load("control-projection").await.unwrap().unwrap();
+        let full = project_session_event_range(&session, &route, 0, session.events().len());
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/retry-turn-projection.json"
+        ))
+        .unwrap();
+        let associations = full
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["type"].as_str(),
+                    Some("turn/start" | "turn/end" | "llm/retry" | "llm/retry-started")
+                )
+            })
+            .map(|event| json!({"type": event["type"], "turn": event["data"]["turn"]}))
+            .collect::<Vec<_>>();
+        assert_eq!(json!(associations), expected);
+        // Every history split must have the same coordinates as the full replay.
+        for split in 0..=session.events().len() {
+            let mut pages = project_session_event_range(&session, &route, 0, split);
+            pages.extend(project_session_event_range(
+                &session,
+                &route,
+                split,
+                session.events().len(),
+            ));
+            assert_eq!(pages, full, "history split {split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_projects_a_replace_surface_operation_with_source_evidence() {
+        for command in [None, Some("manual-compact".to_owned())] {
+            let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+            store
+                .create(SessionHeader::new("compaction-projection"))
+                .await
+                .unwrap();
+            store
+                .append(
+                    "compaction-projection",
+                    Revision::ZERO,
+                    vec![
+                        EventData::TurnStart { turn: 1 }.into(),
+                        EventData::UserMessage {
+                            message: Message::user("large history"),
+                            surface_replace: None,
+                        }
+                        .into(),
+                        EventData::StepStart { turn: 1, step: 1 }.into(),
+                        EventData::CompactionStart {
+                            compaction_id: "compact-1".to_owned(),
+                            source_command_id: command.clone(),
+                            turn: Some(1),
+                        }
+                        .into(),
+                    ],
+                )
+                .await
+                .unwrap();
+            let prefix = store.load("compaction-projection").await.unwrap().unwrap();
+            let shadowed_range = SequenceRange { start: 1, end: 1 };
+            store
+                .append(
+                    "compaction-projection",
+                    Revision(1),
+                    vec![
+                        EventData::CompactionSummary {
+                            compaction_id: "compact-1".to_owned(),
+                            source_command_id: command.clone(),
+                            summary: "## 摘要\n保留任务 🧪".to_owned(),
+                            shadowed_range,
+                            shadowed_seqs: vec![1],
+                            shadowed_token_count: 128,
+                            provider: "test".to_owned(),
+                            model: "test-model".to_owned(),
+                            max_tokens: Some(64),
+                            usage: None,
+                        }
+                        .into(),
+                        EventData::UserMessage {
+                            message: Message::user("checkpoint"),
+                            surface_replace: Some(SurfaceReplace {
+                                compaction_id: "compact-1".to_owned(),
+                                shadowed_range,
+                                shadowed_seqs: vec![1],
+                            }),
+                        }
+                        .into(),
+                        EventData::CompactionEnd {
+                            compaction_id: "compact-1".to_owned(),
+                            source_command_id: command.clone(),
+                            turn: Some(1),
+                            error: None,
+                            outcome: None,
+                            fingerprint: None,
+                        }
+                        .into(),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let session = store.load("compaction-projection").await.unwrap().unwrap();
+            let route = ModelRoute {
+                provider: "test".to_owned(),
+                model: "test-model".to_owned(),
+                reasoning_effort: None,
+                context_window_tokens: None,
+            };
+            let projected =
+                project_session_event_range(&session, &route, 0, session.events().len());
+            let replacement = projected
+                .iter()
+                .find(|event| event["data"]["content"][0]["text"] == "checkpoint")
+                .expect("checkpoint event is projected");
+            assert_eq!(
+                replacement["surfaceOp"],
+                json!({"op": "replace", "start": 1, "end": 1})
+            );
+            assert_eq!(replacement["sourceEventSeqs"], json!([1]));
+            assert!(projected
+                .iter()
+                .any(|event| event["type"] == "compaction/start"));
+            assert!(projected
+                .iter()
+                .any(|event| event["type"] == "compaction/summary"));
+            assert!(projected
+                .iter()
+                .any(|event| event["type"] == "compaction/end"));
+
+            assert_eq!(replacement["data"]["source"]["kind"], "plugin");
+            assert_eq!(replacement["data"]["source"]["plugin"], "compact");
+            assert_eq!(replacement["data"]["source"]["compactionId"], "compact-1");
+            assert_eq!(
+                replacement["data"]["source"].get("sourceCommandId"),
+                command.as_ref().map(|_| json!("manual-compact")).as_ref()
+            );
+            let summary = projected
+                .iter()
+                .find(|e| e["type"] == "compaction/summary")
+                .unwrap();
+            assert_eq!(
+                summary["data"]["summary"],
+                json!([{"type":"text","text":"## 摘要\n保留任务 🧪"}])
+            );
+            assert_eq!(summary["data"]["shadowedTokenCount"], 128);
+            assert_eq!(
+                projected
+                    .iter()
+                    .find(|e| e["type"] == "compaction/start")
+                    .unwrap()["data"]["turn"],
+                0
+            );
+            assert_eq!(
+                project_session_event_range(&prefix, &route, 0, prefix.events().len()),
+                projected[..prefix.events().len()]
+            );
+            assert_eq!(
+                project_session_history_range(&session, &route, 0, session.events().len()),
+                projected
+            );
+            assert_eq!(
+                project_session_event_tail(&session, &route, 100, usize::MAX).events,
+                projected
+            );
+            // A page beginning at the replacement must retain the manual correlation.
+            let index = replacement["seq"].as_u64().unwrap() as usize;
+            assert_eq!(
+                project_session_event_range(&session, &route, index, index + 1)[0],
+                *replacement
+            );
+            let restored = Session::restore(
+                session.header().clone(),
+                session.revision(),
+                session.events().to_vec(),
+            )
+            .unwrap();
+            assert_eq!(
+                project_session_event_range(&restored, &route, 0, restored.events().len()),
+                projected
+            );
+            assert_eq!(
+                xharness_session::derive_messages(session.events())[0].content,
+                "checkpoint"
+            );
+            assert!(
+                matches!(session.events()[4].data(), EventData::CompactionSummary { summary, .. } if summary=="## 摘要\n保留任务 🧪")
+            );
+            println!(
+                "COMPACTION_UI_FIXTURE={}",
+                json!({"manual":command.is_some(),"events":projected})
+            );
+        }
+    }
+
+    #[test]
+    fn failed_or_cancelled_compaction_keeps_surface_and_never_publishes_checkpoint() {
+        for error in ["cancelled", "output token limit", "network timeout"] {
+            let mut session = Session::new(SessionHeader::new("compact-failed")).unwrap();
+            session
+                .append_batch_at(
+                    Revision::ZERO,
+                    vec![
+                        EventData::TurnStart { turn: 1 }.into(),
+                        EventData::UserMessage {
+                            message: Message::user("keep original"),
+                            surface_replace: None,
+                        }
+                        .into(),
+                        EventData::CompactionStart {
+                            compaction_id: "failed".into(),
+                            source_command_id: None,
+                            turn: Some(1),
+                        }
+                        .into(),
+                        EventData::CompactionEnd {
+                            compaction_id: "failed".into(),
+                            source_command_id: None,
+                            turn: Some(1),
+                            error: Some(error.into()),
+                            outcome: None,
+                            fingerprint: None,
+                        }
+                        .into(),
+                    ],
+                    1,
+                )
+                .unwrap();
+            let route = ModelRoute::new("test", "test-model");
+            let projected =
+                project_session_event_range(&session, &route, 0, session.events().len());
+            assert!(!projected
+                .iter()
+                .any(|e| e["surfaceOp"].is_object() || e["type"] == "compaction/summary"));
+            assert_eq!(projected.last().unwrap()["data"]["error"], error);
+            assert_eq!(
+                xharness_session::derive_messages(session.events())[0].content,
+                "keep original"
+            );
+            assert_eq!(
+                project_session_history_range(&session, &route, 0, session.events().len()),
+                projected
+            );
+            println!(
+                "COMPACTION_UI_FIXTURE={}",
+                json!({"error":error,"events":projected})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inbox_splice_projection_always_uses_the_web_camel_case_shape() {
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        store
+            .create(SessionHeader::new("inbox-splice-projection"))
+            .await
+            .unwrap();
+        store
+            .append(
+                "inbox-splice-projection",
+                Revision::ZERO,
+                vec![
+                    EventData::AgentInboxSpliced {
+                        target: InboxTarget::NextTurn,
+                        start: 0,
+                        removed_count: 0,
+                        inserted: vec![InboxMessage::user("input-1", "hello")],
+                        outcome: None,
+                    }
+                    .into(),
+                    EventData::AgentInboxSpliced {
+                        target: InboxTarget::NextTurn,
+                        start: 0,
+                        removed_count: 1,
+                        inserted: Vec::new(),
+                        outcome: None,
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let session = store
+            .load("inbox-splice-projection")
+            .await
+            .unwrap()
+            .unwrap();
+        let route = ModelRoute {
+            provider: "test".to_owned(),
+            model: "test-model".to_owned(),
+            reasoning_effort: None,
+            context_window_tokens: None,
+        };
+        let projected = project_session_event_range(&session, &route, 0, session.events().len());
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0]["data"]["removedCount"], 0);
+        assert_eq!(
+            projected[0]["data"]["inserted"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(projected[1]["data"]["removedCount"], 1);
+        assert_eq!(projected[1]["data"]["inserted"], json!([]));
+        assert!(projected
+            .iter()
+            .all(|event| event["data"].get("removed_count").is_none()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pause_policy_does_not_resume_an_incomplete_tool_call() {
+        crate::statecheck::assert_profile("crashed tool restored");
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut header = SessionHeader::new("paused-tool-restart");
+        header.cwd = Some(cwd.to_string_lossy().into_owned());
+        store.create(header).await.unwrap();
+        let call = ToolCall {
+            id: "execution-paused".to_owned(),
+            provider_call_id: Some("provider-paused".to_owned()),
+            index: 0,
+            name: "guarded".to_owned(),
+            arguments_json: "{}".to_owned(),
+        };
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls.push(call.clone());
+        store
+            .append(
+                "paused-tool-restart",
+                Revision::ZERO,
+                vec![
+                    EventData::TurnStart { turn: 1 }.into(),
+                    EventData::StepStart { turn: 1, step: 1 }.into(),
+                    EventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message: assistant,
+                        usage: None,
+                    }
+                    .into(),
+                    EventData::ToolCall {
+                        turn: 1,
+                        step: 1,
+                        call: call.clone(),
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn ModelProvider> = Arc::new(ApprovalRecoveryProvider {
+            requests: Arc::clone(&requests),
+        });
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider),
+            Arc::new(ApprovalRecoveryTools {
+                executions: Arc::clone(&executions),
+            }),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let host = BasicHost::with_agent_runtime(config(&cwd), runtime);
+        let report = host
+            .restore_from_store_with_policy(
+                Arc::clone(&store),
+                RecoveryPolicy::PauseIncompleteTools,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.paused_incomplete_tool_sessions, 1);
+        assert_eq!(report.resumed_pending_approvals, 0);
+        assert_eq!(report.resumed_pending_turns, 0);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(requests.lock().unwrap().is_empty());
+        let state = host.state.read().await;
+        let record = state.sessions.get("paused-tool-restart").unwrap();
+        assert!(record.dispatch_paused);
+        assert!(!record.running);
+        drop(state);
+        let durable = store.load("paused-tool-restart").await.unwrap().unwrap();
+        assert_eq!(
+            xharness_session::incomplete_tool_calls(durable.events()).len(),
+            1
+        );
+        assert!(!durable.events().iter().any(|event| matches!(
+            event.data(),
+            EventData::ToolResult { result, .. } if result.call_id == "execution-paused"
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_reattaches_pending_approval_and_executes_only_after_web_response() {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut header = SessionHeader::new("approval-restart");
+        header.cwd = Some(cwd.to_string_lossy().into_owned());
+        store.create(header).await.unwrap();
+        let call = ToolCall {
+            id: "execution-restart".to_owned(),
+            provider_call_id: Some("provider-restart".to_owned()),
+            index: 0,
+            name: "guarded".to_owned(),
+            arguments_json: "{}".to_owned(),
+        };
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls.push(call.clone());
+        store
+            .append(
+                "approval-restart",
+                Revision::ZERO,
+                vec![
+                    EventData::TurnStart { turn: 1 }.into(),
+                    EventData::UserMessage {
+                        message: Message::user("run guarded tool").with_id("original-prompt"),
+                        surface_replace: None,
+                    }
+                    .into(),
+                    EventData::StepStart { turn: 1, step: 1 }.into(),
+                    EventData::RequestHeader {
+                        header: RequestHeader::new("test", "test-model"),
+                    }
+                    .into(),
+                    EventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message: assistant,
+                        usage: None,
+                    }
+                    .into(),
+                    EventData::ToolCall {
+                        turn: 1,
+                        step: 1,
+                        call: call.clone(),
+                    }
+                    .into(),
+                    EventData::ApprovalAsked {
+                        id: "approval-restart-stable".to_owned(),
+                        tool_name: "guarded".to_owned(),
+                        call_id: Some(call.id.clone()),
+                        reason: Some("requires explicit approval".to_owned()),
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+        store.flush("approval-restart").await.unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn ModelProvider> = Arc::new(ApprovalRecoveryProvider {
+            requests: Arc::clone(&requests),
+        });
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider),
+            Arc::new(ApprovalRecoveryTools {
+                executions: Arc::clone(&executions),
+            }),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let host = BasicHost::with_agent_runtime(config(&cwd), runtime);
+        let mut mux = host.mux_events();
+        let report = host
+            .restore_from_store_with_policy(
+                Arc::clone(&store),
+                RecoveryPolicy::PauseIncompleteTools,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.resumed_pending_approvals, 1);
+        assert_eq!(report.paused_incomplete_tool_sessions, 0);
+        assert_eq!(report.resumed_pending_turns, 0);
+        assert!(report.issues.is_empty());
+
+        let approval = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = mux.next().await.expect("mux remained open");
+                if frame.payload["type"] == "approval/requested" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("recovered approval was not projected");
+        assert_eq!(approval.payload["approvalId"], "approval-restart-stable");
+        assert_eq!(approval.payload["callId"], "execution-restart");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(requests.lock().unwrap().is_empty());
+
+        let receipt = host
+            .respond(ClientResponse {
+                kind: ClientResponseKind::ClientResponse,
+                rpc_id: approval.rpc_id,
+                result: RpcResult::success(serde_json::json!({
+                    "sessionId": "approval-restart",
+                    "approvalId": "approval-restart-stable",
+                    "outcome": "allowed-once",
+                })),
+            })
+            .await;
+        assert_eq!(receipt, xharness_api::RpcReceipt::Accepted);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let session = store.load("approval-restart").await.unwrap().unwrap();
+                if session.events().iter().any(|event| {
+                    matches!(
+                        event.data(),
+                        EventData::TurnEnd {
+                            turn: 1,
+                            reason: TurnEndReason::Completed
+                        }
+                    )
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovered turn did not finish");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].step, 2);
+            assert_eq!(
+                requests[0].messages.last().unwrap().tool_call_id.as_deref(),
+                Some("provider-restart")
+            );
+        }
+
+        let session = store.load("approval-restart").await.unwrap().unwrap();
+        assert_eq!(session.pending_tool_approvals().len(), 0);
+        assert_eq!(
+            session
+                .events()
+                .iter()
+                .filter(|event| matches!(event.data(), EventData::ApprovalAsked { .. }))
+                .count(),
+            1
+        );
+        assert!(session.events().iter().any(|event| matches!(
+            event.data(),
+            EventData::ToolResult { result, .. }
+                if result.call_id == "execution-restart"
+                    && result.outcome == ToolOutcome::Success
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_reattaches_pending_question_and_reuses_the_web_composer_protocol() {
+        crate::statecheck::assert_profile("question answered");
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut header = SessionHeader::new("question-restart");
+        header.cwd = Some(cwd.to_string_lossy().into_owned());
+        store.create(header).await.unwrap();
+        let request = AskUserQuestionRequest {
+            questions: vec![QuestionSpec {
+                id: "target".to_owned(),
+                header: "目标".to_owned(),
+                question: "部署到哪里？".to_owned(),
+                options: vec![QuestionOption {
+                    id: "tokyo".to_owned(),
+                    label: "东京 (Recommended)".to_owned(),
+                    description: Some("公开服务".to_owned()),
+                    recommended: true,
+                }],
+                allow_custom: true,
+                destination: AnswerDestination::Context,
+                blocks_goal: true,
+            }],
+        };
+        let call = ToolCall {
+            id: "question-execution-restart".to_owned(),
+            provider_call_id: Some("provider-question-restart".to_owned()),
+            index: 0,
+            name: ASK_USER_QUESTION_TOOL.to_owned(),
+            arguments_json: serde_json::to_string(&request).unwrap(),
+        };
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls.push(call.clone());
+        store
+            .append(
+                "question-restart",
+                Revision::ZERO,
+                vec![
+                    EventData::TurnStart { turn: 1 }.into(),
+                    EventData::UserMessage {
+                        message: Message::user("ask me").with_id("original-question-prompt"),
+                        surface_replace: None,
+                    }
+                    .into(),
+                    EventData::StepStart { turn: 1, step: 1 }.into(),
+                    EventData::RequestHeader {
+                        header: RequestHeader::new("test", "test-model"),
+                    }
+                    .into(),
+                    EventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message: assistant,
+                        usage: None,
+                    }
+                    .into(),
+                    EventData::ToolCall {
+                        turn: 1,
+                        step: 1,
+                        call: call.clone(),
+                    }
+                    .into(),
+                    EventData::QuestionRequested {
+                        invocation: QuestionInvocation::new(call.id.clone(), request),
+                    }
+                    .into(),
+                ],
+            )
+            .await
+            .unwrap();
+        store.flush("question-restart").await.unwrap();
+
+        let questions = crate::DurableQuestionHub::new(Arc::clone(&store));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn ModelProvider> = Arc::new(ApprovalRecoveryProvider {
+            requests: Arc::clone(&requests),
+        });
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider),
+            Arc::new(QuestionRecoveryTools {
+                hub: Arc::clone(&questions),
+            }),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let host = BasicHost::with_agent_runtime_control_and_questions(
+            config(&cwd),
+            runtime,
+            Arc::new(MemoryControlStore::default()),
+            questions,
+        );
+        let mut mux = host.mux_events();
+        let report = host
+            .restore_from_store_with_policy(
+                Arc::clone(&store),
+                RecoveryPolicy::PauseIncompleteTools,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.resumed_user_questions, 1);
+        assert_eq!(report.paused_incomplete_tool_sessions, 0);
+        assert!(report.issues.is_empty());
+
+        let question = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = mux.next().await.expect("mux remained open");
+                if frame.payload["type"] == "question/requested" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("recovered question was not projected");
+        assert_eq!(
+            question.rpc_id.as_str(),
+            "question:question-execution-restart"
+        );
+        assert_eq!(question.payload["sessionId"], "question-restart");
+        assert_eq!(question.payload["questions"][0]["question"], "部署到哪里？");
+
+        let receipt = host
+            .respond(ClientResponse {
+                kind: ClientResponseKind::ClientResponse,
+                rpc_id: question.rpc_id,
+                result: RpcResult::success(json!({
+                    "sessionId": "question-restart",
+                    "answer": {"answers": [{
+                        "id": "target",
+                        "selected": ["东京 (Recommended)"],
+                    }]},
+                })),
+            })
+            .await;
+        assert_eq!(receipt, xharness_api::RpcReceipt::Accepted);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let session = store.load("question-restart").await.unwrap().unwrap();
+                if session.events().iter().any(|event| {
+                    matches!(
+                        event.data(),
+                        EventData::TurnEnd {
+                            turn: 1,
+                            reason: TurnEndReason::Completed
+                        }
+                    )
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovered question turn did not finish");
+        let session = store.load("question-restart").await.unwrap().unwrap();
+        assert!(session.recoverable_user_questions().is_empty());
+        assert!(session.events().iter().any(|event| matches!(
+            event.data(),
+            EventData::ToolResult { result, .. }
+                if result.call_id == "question-execution-restart"
+                    && result.outcome == ToolOutcome::Success
+        )));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn permission_command_and_receipt_survive_a_host_restart() {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let make_runtime = |store: Arc<dyn Store>| {
+            let mut models = ModelRegistry::new();
+            models
+                .register(
+                    RegisteredModel::new(
+                        ModelDescriptor::new("test", "Test", "selected-model", "Selected model")
+                            .with_context_window(xharness_core::ContextWindowCapability::reported(
+                                131_072,
+                            ))
+                            .with_reasoning(
+                                ModelReasoning::new(vec![ModelReasoningEffort::new(
+                                    "high", "High",
+                                )])
+                                .with_default("high"),
+                            ),
+                        Arc::new(ApprovalRecoveryProvider {
+                            requests: Arc::new(Mutex::new(Vec::new())),
+                        }),
+                    )
+                    .with_token_guard(Some(
+                        xharness_token::TokenGuard::conservative(xharness_token::TokenBudget {
+                            context_window_tokens: 131_072,
+                            reserved_output_tokens: 8192,
+                            minimum_output_tokens: 4096,
+                            safety_margin_tokens: 1024,
+                        })
+                        .unwrap(),
+                    )),
+                )
+                .unwrap();
+            Arc::new(
+                DurableLoopAgentRuntime::from_registry(
+                    ModelRoute::new("test", "selected-model"),
+                    models,
+                    Arc::new(NoTools),
+                    Arc::new(IdentityContextPolicy),
+                    store,
+                    Arc::new(MemoryLeaseManager::default()),
+                    64,
+                )
+                .unwrap(),
+            )
+        };
+        let runtime = make_runtime(Arc::clone(&store));
+        let live = BasicHost::with_agent_runtime(config(&cwd), runtime);
+        let created = live
+            .call(
+                RpcId::new("policy-create"),
+                RpcMethod::SessionCreate,
+                json!({"sessionId": "policy-session", "cwd": cwd}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(created, RpcResult::Success { .. }));
+        let switched = live
+            .call_dynamic(
+                RpcId::new("policy-command"),
+                "commands/execute",
+                json!({
+                    "args": {
+                        "agentId": "policy-session",
+                        "line": "/permission danger-full-access",
+                        "images": [],
+                    }
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(switched, RpcResult::Success { .. }));
+        let renamed = live
+            .call(
+                RpcId::new("policy-rename"),
+                RpcMethod::SessionRename,
+                json!({"sessionId": "policy-session", "title": "  Durable   policy  "}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(renamed, RpcResult::Success { .. }));
+        let selected = live
+            .call(
+                RpcId::new("policy-preset"),
+                RpcMethod::AgentPresetSelect,
+                json!({"sessionId": "policy-session", "agentPreset": "coding"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(selected, RpcResult::Success { .. }));
+        let selected_model = live
+            .call(
+                RpcId::new("policy-model"),
+                RpcMethod::SessionSelectModel,
+                json!({
+                    "sessionId": "policy-session",
+                    "provider": "test",
+                    "model": "selected-model",
+                    "reasoningEffort": "high",
+                    "contextWindowTokens": 32768,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(selected_model, RpcResult::Success { .. }));
+        let plan = live
+            .call_dynamic(
+                RpcId::new("policy-plan"),
+                "commands/execute",
+                json!({
+                    "args": {
+                        "agentId": "policy-session",
+                        "line": "/plan",
+                        "images": [],
+                    }
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(plan, RpcResult::Success { .. }));
+
+        let durable = store.load("policy-session").await.unwrap().unwrap();
+        assert_eq!(
+            restored_permission(&durable),
+            PermissionPreset::DangerFullAccess
+        );
+        assert_eq!(
+            durable
+                .events()
+                .iter()
+                .map(|event| match event.data() {
+                    EventData::AgentPresetSelected { .. } => "agent-preset/selected",
+                    EventData::SessionModelSelected { .. } => "session/model-selected",
+                    EventData::CommandRun { .. } => "command/run",
+                    EventData::PermissionPreset { .. } => "permission/preset",
+                    EventData::SandboxMode { .. } => "sandbox/mode",
+                    EventData::ApprovalPolicy { .. } => "approval/policy",
+                    EventData::CommandDone { .. } => "command/done",
+                    EventData::SessionTitle { .. } => "session/title",
+                    EventData::SessionMutationCommitted { .. } => {
+                        "xharness/mutation-committed"
+                    }
+                    EventData::PlanMode { .. } => "plan/mode",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>(),
+            [
+                "agent-preset/selected",
+                "permission/preset",
+                "sandbox/mode",
+                "approval/policy",
+                "command/run",
+                "permission/preset",
+                "sandbox/mode",
+                "approval/policy",
+                "command/done",
+                "session/title",
+                "xharness/mutation-committed",
+                "agent-preset/selected",
+                "xharness/mutation-committed",
+                "session/model-selected",
+                "xharness/mutation-committed",
+                "command/run",
+                "plan/mode",
+                "command/done",
+            ]
+        );
+
+        let restarted_runtime = make_runtime(Arc::clone(&store));
+        let restarted = BasicHost::with_agent_runtime(config(&cwd), restarted_runtime);
+        let report = restarted
+            .restore_from_store(Arc::clone(&store))
+            .await
+            .unwrap();
+        assert_eq!(report.restored_sessions, 1);
+        let replayed_rename = restarted
+            .call(
+                RpcId::new("policy-rename"),
+                RpcMethod::SessionRename,
+                json!({"sessionId": "policy-session", "title": "  Durable   policy  "}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(replayed_rename, renamed);
+        let replayed_preset = restarted
+            .call(
+                RpcId::new("policy-preset"),
+                RpcMethod::AgentPresetSelect,
+                json!({"sessionId": "policy-session", "agentPreset": "coding"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(replayed_preset, selected);
+        let replayed_model = restarted
+            .call(
+                RpcId::new("policy-model"),
+                RpcMethod::SessionSelectModel,
+                json!({
+                    "sessionId": "policy-session",
+                    "provider": "test",
+                    "model": "selected-model",
+                    "reasoningEffort": "high",
+                    "contextWindowTokens": 32768,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(replayed_model, selected_model);
+        let conflicting_model = restarted
+            .call(
+                RpcId::new("policy-model"),
+                RpcMethod::SessionSelectModel,
+                json!({
+                    "sessionId": "policy-session",
+                    "provider": "test",
+                    "model": "another-model",
+                    "reasoningEffort": "high",
+                    "contextWindowTokens": 32768,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(conflicting_model, RpcResult::Failure { .. }));
+        let receipt_count = store
+            .load("policy-session")
+            .await
+            .unwrap()
+            .unwrap()
+            .events()
+            .iter()
+            .filter(|event| matches!(event.data(), EventData::SessionMutationCommitted { .. }))
+            .count();
+        assert_eq!(receipt_count, 3);
+        let restarted_seq = {
+            let state = restarted.state.read().await;
+            let record = state.sessions.get("policy-session").unwrap();
+            assert_eq!(record.permission_preset, PermissionPreset::DangerFullAccess);
+            assert_eq!(record.title.as_deref(), Some("Durable policy"));
+            assert_eq!(record.agent_preset.as_deref(), Some("coding"));
+            assert_eq!(record.model.provider, "test");
+            assert_eq!(record.model.model, "selected-model");
+            assert_eq!(record.model.reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(record.model.context_window_tokens, Some(32_768));
+            assert!(record.plan_active);
+            assert_eq!(
+                record.projection_values()["plan"],
+                json!({"active": true, "pending": false})
+            );
+            assert!(
+                record.events.is_empty(),
+                "authoritative cold history must stay in the durable store"
+            );
+            record.next_event_seq()
+        };
+        let live_seq = live.state.read().await.sessions["policy-session"].next_event_seq();
+        assert_eq!(restarted_seq, live_seq);
+    }
+
+    #[test]
+    fn queue_sources_survive_partial_and_legacy_metadata() {
+        for metadata in [
+            json!({"source":{"kind":"agent-settlement","senderSessionId":"child"}}),
+            json!({"kind":"agent-settlement","senderSessionId":"child"}),
+            json!({"content":[],"source":{"kind":"agent-message"}}),
+            json!({"source":{"kind":"tool"},"content":"malformed"}),
+            json!({"source":{"kind":"future-runtime-event"}}),
+        ] {
+            let prompt = restored_prompt(&InboxMessage {
+                id: "receipt".into(),
+                message: Message::user("result").with_id("receipt"),
+                source: Some(metadata),
+            });
+            assert!(!prompt.user_mutable());
+            assert_eq!(prompt.ui_placement(), QueuePlacement::Context);
+        }
+        for source in [None, Some(json!({"source":{"kind":"user"}}))] {
+            let mut prompt = restored_prompt(&InboxMessage {
+                id: "legacy-user".into(),
+                message: Message::user("draft").with_id("legacy-user"),
+                source,
+            });
+            assert!(prompt.user_mutable());
+            assert_eq!(prompt.ui_placement(), QueuePlacement::Queued);
+            prompt.placement = QueuePlacement::Steering;
+            assert_eq!(prompt.ui_placement(), QueuePlacement::Steering);
+            assert_eq!(prompt.content[0]["text"], "draft");
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_queue_baseline_is_folded_from_both_durable_inbox_lists() {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut header = SessionHeader::new("queue-baseline");
+        header.cwd = Some(cwd.to_string_lossy().into_owned());
+        let inbox = DurableInbox::open(Arc::clone(&store), header)
+            .await
+            .unwrap();
+        inbox
+            .append(
+                InboxTarget::NextStep,
+                InboxMessage {
+                    id: "steering-1".to_owned(),
+                    message: Message::user("steer now").with_id("steering-1"),
+                    source: Some(json!({
+                        "content": [{"type": "text", "text": "steer now"}],
+                        "source": {"kind": "user"},
+                    })),
+                },
+            )
+            .await
+            .unwrap();
+        inbox
+            .append(
+                InboxTarget::NextStep,
+                InboxMessage {
+                    id: "context-1".to_owned(),
+                    message: Message::user("tool context").with_id("context-1"),
+                    source: Some(json!({
+                        "content": [{"type": "text", "text": "tool context"}],
+                        "source": {"kind": "tool", "callId": "call-1"},
+                    })),
+                },
+            )
+            .await
+            .unwrap();
+
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            None,
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let host = BasicHost::with_agent_runtime(config(&cwd), runtime);
+        host.restore_from_store(Arc::clone(&store)).await.unwrap();
+
+        let mut mux = host.mux_events();
+        let baseline = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = mux.next().await.expect("mux remained open");
+                if frame.payload["type"] == "session/queue" {
+                    break frame.payload;
+                }
+            }
+        })
+        .await
+        .expect("queue baseline was not replayed");
+        assert_eq!(baseline["sessionId"], "queue-baseline");
+        assert_eq!(baseline["items"][0]["id"], "steering-1");
+        assert_eq!(baseline["items"][0]["placement"], "steering");
+        assert_eq!(baseline["items"][1]["id"], "context-1");
+        assert_eq!(baseline["items"][1]["placement"], "context");
+
+        inbox.remove("steering-1").await.unwrap().unwrap();
+        host.sync_authoritative_session("queue-baseline")
+            .await
+            .unwrap();
+        let after_remove = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = mux.next().await.expect("mux remained open");
+                if frame.payload["type"] == "session/queue" {
+                    break frame.payload;
+                }
+            }
+        })
+        .await
+        .expect("queue removal was not projected");
+        assert_eq!(after_remove["items"].as_array().unwrap().len(), 1);
+        assert_eq!(after_remove["items"][0]["id"], "context-1");
+
+        inbox
+            .append(
+                InboxTarget::NextTurn,
+                InboxMessage {
+                    id: "queued-1".to_owned(),
+                    message: Message::user("later").with_id("queued-1"),
+                    source: Some(json!({
+                        "content": [{"type": "text", "text": "later"}],
+                        "source": {"kind": "user"},
+                    })),
+                },
+            )
+            .await
+            .unwrap();
+        host.sync_authoritative_session("queue-baseline")
+            .await
+            .unwrap();
+        let after_append = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = mux.next().await.expect("mux remained open");
+                if frame.payload["type"] == "session/queue" {
+                    break frame.payload;
+                }
+            }
+        })
+        .await
+        .expect("queue append was not projected");
+        assert_eq!(after_append["items"][0]["id"], "queued-1");
+        assert_eq!(after_append["items"][0]["placement"], "queued");
+        assert_eq!(after_append["items"][1]["id"], "context-1");
+    }
+
+    #[tokio::test]
+    async fn goal_snapshot_revisions_and_projection_survive_a_host_restart() {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            None,
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let live = BasicHost::with_agent_runtime(config(&cwd), runtime);
+        assert!(live
+            .call(
+                RpcId::new("goal-session-create"),
+                RpcMethod::SessionCreate,
+                json!({"sessionId": "goal-session", "cwd": cwd}),
+                CancellationToken::new(),
+            )
+            .await
+            .is_ok());
+        let created = live
+            .call(
+                RpcId::new("goal-create"),
+                RpcMethod::GoalCreate,
+                json!({
+                    "sessionId": "goal-session",
+                    "objective": "Ship the durable agent",
+                    "executionEnabled": false,
+                    "maxGoalRounds": 8,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success {
+            value: Some(created),
+        } = created
+        else {
+            panic!("goal create failed: {created:?}");
+        };
+        let edited = live
+            .call(
+                RpcId::new("goal-edit"),
+                RpcMethod::GoalEdit,
+                json!({
+                    "sessionId": "goal-session",
+                    "ref": created["ref"],
+                    "objective": "Ship the durable Rust agent",
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success {
+            value: Some(edited),
+        } = edited
+        else {
+            panic!("goal edit failed: {edited:?}");
+        };
+        let pause_payload = json!({"sessionId": "goal-session", "ref": edited["ref"]});
+        let paused = live
+            .call(
+                RpcId::new("goal-pause"),
+                RpcMethod::GoalPause,
+                pause_payload.clone(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(paused.is_ok());
+
+        let durable = store.load("goal-session").await.unwrap().unwrap();
+        let goal = restored_goal(&durable).expect("current durable goal");
+        assert_eq!(goal.revision, 3);
+        assert_eq!(goal.phase, xharness_session::GoalPhase::Paused);
+        assert_eq!(goal.objective, "Ship the durable Rust agent");
+        assert_eq!(
+            durable
+                .events()
+                .iter()
+                .filter(|event| matches!(event.data(), EventData::GoalChange { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            durable
+                .events()
+                .iter()
+                .filter(|event| {
+                    matches!(event.data(), EventData::SessionMutationCommitted { .. })
+                })
+                .count(),
+            3
+        );
+        let history = live
+            .call(
+                RpcId::new("goal-history"),
+                RpcMethod::SessionHistory,
+                json!({"sessionId": "goal-session", "maxMessages": 500}),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success {
+            value: Some(history),
+        } = history
+        else {
+            panic!("goal history failed: {history:?}");
+        };
+        let encoded_history = serde_json::to_string(&history).unwrap();
+        assert!(encoded_history.contains("session-mutation-receipt"));
+        assert!(!encoded_history.contains("goal-pause"));
+        assert!(!encoded_history.contains("\"fingerprint\""));
+        assert!(!encoded_history.contains("\"response\""));
+
+        let restarted_runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            None,
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let restarted = BasicHost::with_agent_runtime(config(&cwd), restarted_runtime);
+        restarted
+            .restore_from_store(Arc::clone(&store))
+            .await
+            .unwrap();
+        {
+            let state = restarted.state.read().await;
+            let restored = state.goals.get("goal-session").expect("restored goal");
+            assert_eq!(restored.revision, 3);
+            assert_eq!(restored.phase, xharness_session::GoalPhase::Paused);
+            assert_eq!(
+                restored.projection()["goal"]["objective"],
+                "Ship the durable Rust agent"
+            );
+        }
+
+        let replayed = restarted
+            .call(
+                RpcId::new("goal-pause"),
+                RpcMethod::GoalPause,
+                pause_payload,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(replayed, paused);
+        let conflict = restarted
+            .call(
+                RpcId::new("goal-pause"),
+                RpcMethod::GoalPause,
+                json!({
+                    "sessionId": "goal-session",
+                    "ref": {"id": edited["ref"]["id"], "revision": 999},
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(conflict, RpcResult::Failure { .. }));
+        let after_replay = store.load("goal-session").await.unwrap().unwrap();
+        assert_eq!(
+            after_replay
+                .events()
+                .iter()
+                .filter(|event| matches!(event.data(), EventData::GoalChange { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_reattaches_and_runs_pending_input_exactly_once() {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut header = SessionHeader::new("pending-session");
+        header.cwd = Some(cwd.to_string_lossy().into_owned());
+        let inbox = DurableInbox::open(Arc::clone(&store), header)
+            .await
+            .unwrap();
+        inbox
+            .append(
+                InboxTarget::NextTurn,
+                InboxMessage::user("pending-input", "resume this"),
+            )
+            .await
+            .unwrap();
+
+        let release = Arc::new(Notify::new());
+        let provider = Arc::new(GatedProvider {
+            calls: AtomicUsize::new(0),
+            release: Arc::clone(&release),
+            answers: Mutex::new(VecDeque::from(["done".to_owned()])),
+        });
+        let provider_dyn: Arc<dyn ModelProvider> = provider.clone();
+        let config = config(&cwd);
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider_dyn),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let host = BasicHost::with_agent_runtime(config, runtime);
+        let report = host.restore_from_store(Arc::clone(&store)).await.unwrap();
+        assert_eq!(report.resumed_pending_turns, 1);
+        assert!(report.issues.is_empty());
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let completed = store
+                    .load("pending-session")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event.data(), EventData::TurnEnd { .. }));
+                if completed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restored turn must complete");
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let session = store.load("pending-session").await.unwrap().unwrap();
+        assert_eq!(
+            session
+                .events()
+                .iter()
+                .filter_map(|event| match event.data() {
+                    EventData::AgentInboxSpliced { inserted, .. } => Some(
+                        inserted
+                            .iter()
+                            .filter(|message| message.id == "pending-input")
+                            .count(),
+                    ),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            1,
+            "startup resume must not append the durable input again"
+        );
+        assert_eq!(
+            session
+                .derive_messages()
+                .iter()
+                .filter(|message| message.id.as_deref() == Some("pending-input"))
+                .count(),
+            1
+        );
+        assert_eq!(session.derive_messages().last().unwrap().content, "done");
+    }
+
+    #[tokio::test]
+    async fn restore_rebuilds_prompt_receipts_before_runtime_resume() {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let mut header = SessionHeader::new("receipt-session");
+        header.cwd = Some(cwd.to_string_lossy().into_owned());
+        let inbox = DurableInbox::open(Arc::clone(&store), header)
+            .await
+            .unwrap();
+        let content = vec![json!({"type": "text", "text": "admitted before crash"})];
+        let fingerprint = crate::rpc::prompt_fingerprint("queue", &content, None);
+        let mut input = InboxMessage::user("receipt-rpc", "admitted before crash");
+        input.source = Some(json!({
+            "content": content,
+            "source": {"kind": "user", "rpcId": "receipt-rpc"},
+            "rpcFingerprint": fingerprint,
+            "rpcSessionId": "receipt-session",
+        }));
+        inbox.append(InboxTarget::NextTurn, input).await.unwrap();
+
+        // No provider is configured. Restoration reports that pending work is
+        // not runnable, but admission receipts must still become queryable.
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            None,
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let host = BasicHost::with_agent_runtime(config(&cwd), runtime);
+        let report = host.restore_from_store(Arc::clone(&store)).await.unwrap();
+        assert_eq!(report.restored_sessions, 1);
+        assert_eq!(report.issues.len(), 1);
+
+        // The control gateway reconciles admission without replaying a prompt
+        // or relying on the bounded public message projection.
+        let payload = json!({
+            "sessionId": "receipt-session", "mode": "queue",
+            "content": [{"type": "text", "text": "admitted before crash"}],
+        });
+        assert!(matches!(
+            host.prompt_receipt("receipt-session", &RpcId::new("receipt-rpc"), &payload)
+                .await
+                .unwrap(),
+            Some(RpcResult::Success { .. })
+        ));
+        assert!(host
+            .prompt_receipt("receipt-session", &RpcId::new("not-admitted"), &payload)
+            .await
+            .unwrap()
+            .is_none());
+        let mut conflict_payload = payload.clone();
+        conflict_payload["content"][0]["text"] = json!("changed");
+        assert!(host
+            .prompt_receipt(
+                "receipt-session",
+                &RpcId::new("receipt-rpc"),
+                &conflict_payload
+            )
+            .await
+            .is_err());
+        assert!(host
+            .prompt_receipt("another-session", &RpcId::new("receipt-rpc"), &payload)
+            .await
+            .is_err());
+
+        let replay = host
+            .call(
+                RpcId::new("receipt-rpc"),
+                RpcMethod::SessionPrompt,
+                json!({
+                    "sessionId": "receipt-session",
+                    "mode": "queue",
+                    "content": [{"type": "text", "text": "admitted before crash"}],
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(replay, RpcResult::Success { .. }));
+
+        let conflict = host
+            .call(
+                RpcId::new("receipt-rpc"),
+                RpcMethod::SessionPrompt,
+                json!({
+                    "sessionId": "receipt-session",
+                    "mode": "queue",
+                    "content": [{"type": "text", "text": "different payload"}],
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            conflict,
+            RpcResult::Failure {
+                error: xharness_api::RpcError {
+                    code: xharness_api::RpcErrorCode::SessionConflict,
+                    ..
+                }
+            }
+        ));
+
+        let restored = store.load("receipt-session").await.unwrap().unwrap();
+        assert_eq!(
+            restored
+                .events()
+                .iter()
+                .filter_map(|event| match event.data() {
+                    EventData::AgentInboxSpliced { inserted, .. } => Some(
+                        inserted
+                            .iter()
+                            .filter(|message| message.id == "receipt-rpc")
+                            .count(),
+                    ),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            1,
+            "a response-loss retry must not append a second durable input"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_and_restarted_history_use_the_same_authoritative_projection() {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let release = Arc::new(Notify::new());
+        let provider = Arc::new(GatedProvider {
+            calls: AtomicUsize::new(0),
+            release: Arc::clone(&release),
+            answers: Mutex::new(VecDeque::from(["stable answer".to_owned()])),
+        });
+        let provider_dyn: Arc<dyn ModelProvider> = provider.clone();
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider_dyn),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let live = BasicHost::with_agent_runtime(config(&cwd), runtime);
+        let mut mux = live.mux_events();
+        let created = live
+            .call(
+                RpcId::new("projection-create"),
+                RpcMethod::SessionCreate,
+                json!({"sessionId": "projection-session", "cwd": cwd}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(created, RpcResult::Success { .. }));
+        let admitted = live
+            .call(
+                RpcId::new("projection-prompt"),
+                RpcMethod::SessionPrompt,
+                json!({
+                    "sessionId": "projection-session",
+                    "mode": "queue",
+                    "clientTimeZone": "Asia/Shanghai",
+                    "content": [{"type": "text", "text": "stable question"}],
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(admitted, RpcResult::Success { .. }));
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let completed = store
+                    .load("projection-session")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event.data(), EventData::TurnEnd { .. }));
+                if completed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("live turn completes");
+        let seen_metric_frames = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_stream = Arc::clone(&seen_metric_frames);
+        let live_metrics = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut token_usage = None;
+            let mut session_stats = None;
+            let mut performance = None;
+            loop {
+                let frame = mux.next().await.expect("mux remained open");
+                if frame.payload["type"] != "session/projection"
+                    || frame.payload["sessionId"] != "projection-session"
+                {
+                    continue;
+                }
+                seen_in_stream.lock().unwrap().push(frame.payload.clone());
+                match frame.payload["key"].as_str() {
+                    Some("tokenUsage") => token_usage = Some(frame.payload["value"].clone()),
+                    Some("sessionStats") if frame.payload["value"]["steps"].as_u64() == Some(1) => {
+                        session_stats = Some(frame.payload["value"].clone())
+                    }
+                    Some("performanceTimeline")
+                        if frame.payload["value"]["turns"]
+                            .as_array()
+                            .and_then(|turns| turns.last())
+                            .is_some_and(|turn| !turn["endMs"].is_null()) =>
+                    {
+                        performance = Some(frame.payload["value"].clone())
+                    }
+                    _ => {}
+                }
+                if let (Some(token_usage), Some(session_stats), Some(performance)) =
+                    (&token_usage, &session_stats, &performance)
+                {
+                    break (
+                        token_usage.clone(),
+                        session_stats.clone(),
+                        performance.clone(),
+                    );
+                }
+            }
+        })
+        .await;
+        let (live_token_usage, live_session_stats, live_performance) =
+            live_metrics.unwrap_or_else(|_| {
+                panic!(
+                    "live metric projection frames were not published: {:?}",
+                    seen_metric_frames.lock().unwrap()
+                )
+            });
+        assert_eq!(
+            live_token_usage,
+            json!({
+                "uncachedInputTokens": 10,
+                "outputTokens": 5,
+                "cacheReadTokens": 90,
+                "cacheWriteTokens": 2,
+            })
+        );
+        assert_eq!(live_session_stats["turns"], 1);
+        assert_eq!(live_session_stats["steps"], 1);
+        let live_history = live
+            .call(
+                RpcId::new("projection-live-history"),
+                RpcMethod::SessionHistory,
+                json!({"sessionId": "projection-session", "maxMessages": 500}),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success {
+            value: Some(live_history),
+        } = live_history
+        else {
+            panic!("live history failed: {live_history:?}");
+        };
+
+        let restarted_runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            None,
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let restarted = BasicHost::with_agent_runtime(config(&cwd), restarted_runtime);
+        let report = restarted
+            .restore_from_store(Arc::clone(&store))
+            .await
+            .unwrap();
+        assert!(report.issues.is_empty());
+        let restarted_history = restarted
+            .call(
+                RpcId::new("projection-restarted-history"),
+                RpcMethod::SessionHistory,
+                json!({"sessionId": "projection-session", "maxMessages": 500}),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success {
+            value: Some(restarted_history),
+        } = restarted_history
+        else {
+            panic!("restarted history failed: {restarted_history:?}");
+        };
+        assert_eq!(live_history["events"], restarted_history["events"]);
+        assert_eq!(
+            live_history["projections"],
+            restarted_history["projections"]
+        );
+        assert_eq!(
+            live_history["projections"]["values"]["tokenUsage"],
+            json!({
+                "uncachedInputTokens": 10,
+                "outputTokens": 5,
+                "cacheReadTokens": 90,
+                "cacheWriteTokens": 2,
+            })
+        );
+        assert_eq!(
+            live_history["projections"]["values"]["sessionStats"]["turns"],
+            1
+        );
+        assert_eq!(
+            live_history["projections"]["values"]["sessionStats"]["steps"],
+            1
+        );
+        assert_eq!(
+            live_history["projections"]["values"]["sessionStats"]["ttftSteps"],
+            1
+        );
+        assert_eq!(
+            live_history["projections"]["values"]["performanceTimeline"],
+            live_performance
+        );
+        assert!(live_performance["turns"][0]["samples"]
+            .as_array()
+            .is_some_and(|samples| !samples.is_empty()));
+        assert_eq!(
+            live_performance["turns"][0]["requests"][0]["reportedOutputTokens"],
+            5
+        );
+        assert_eq!(
+            live_performance["turns"][0]["requests"][0]["reportedReasoningTokens"],
+            3
+        );
+        assert!(
+            live.state
+                .read()
+                .await
+                .sessions
+                .get("projection-session")
+                .unwrap()
+                .summary()["projections"]["values"]
+                .get("performanceTimeline")
+                .is_none(),
+            "session lists must not carry the full sampling window"
+        );
+        let assistant = live_history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"]["type"] == "assistant/message")
+            .unwrap();
+        assert_eq!(
+            assistant["event"]["data"]["usage"],
+            json!({
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "cacheReadTokens": 90,
+                "cacheWriteTokens": 2,
+                "reasoningTokens": 3,
+            })
+        );
+        assert!(assistant["event"]["data"]["usage"]
+            .get("input_tokens")
+            .is_none());
+        let user = live_history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"]["type"] == "user/message")
+            .unwrap();
+        assert_eq!(
+            user["event"]["data"]["content"][0]["text"],
+            "stable question"
+        );
+        assert_eq!(
+            user["event"]["data"]["source"]["clientTimeZone"],
+            "Asia/Shanghai"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_input_is_published_before_provider_ttft() {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let release = Arc::new(Notify::new());
+        let provider = Arc::new(GatedProvider {
+            calls: AtomicUsize::new(0),
+            release: Arc::clone(&release),
+            answers: Mutex::new(VecDeque::from(["late answer".to_owned()])),
+        });
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider.clone()),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let host = BasicHost::with_agent_runtime(config(&cwd), runtime);
+        let mut mux = host.mux_events();
+        let created = host
+            .call(
+                RpcId::new("input-before-ttft-create"),
+                RpcMethod::SessionCreate,
+                json!({"sessionId": "input-before-ttft", "cwd": cwd}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(created, RpcResult::Success { .. }));
+        let admitted = host
+            .call(
+                RpcId::new("input-before-ttft-prompt"),
+                RpcMethod::SessionPrompt,
+                json!({
+                    "sessionId": "input-before-ttft",
+                    "mode": "queue",
+                    "content": [{"type": "text", "text": "publish before TTFT"}],
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(admitted, RpcResult::Success { .. }));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while provider.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider request started and remained blocked before TTFT");
+
+        let (saw_dequeue, saw_user) = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut saw_dequeue = false;
+            let mut saw_user = false;
+            loop {
+                let frame = mux.next().await.expect("mux remained open");
+                if frame.payload["type"] != "session/event"
+                    || frame.payload["sessionId"] != "input-before-ttft"
+                {
+                    continue;
+                }
+                match frame.payload["event"]["type"].as_str() {
+                    Some("agent/inbox/spliced")
+                        if frame.payload["event"]["data"]["removedCount"] == 1
+                            && frame.payload["event"]["data"]["inserted"] == json!([]) =>
+                    {
+                        saw_dequeue = true;
+                    }
+                    Some("user/message")
+                        if frame.payload["event"]["data"]["content"][0]["text"]
+                            == "publish before TTFT" =>
+                    {
+                        saw_user = true;
+                    }
+                    Some("assistant/chunk") => {
+                        panic!("assistant output cannot exist while the provider is TTFT-blocked")
+                    }
+                    _ => {}
+                }
+                if saw_dequeue && saw_user {
+                    break (saw_dequeue, saw_user);
+                }
+            }
+        })
+        .await
+        .expect("claimed input was held behind provider TTFT");
+        assert!(saw_dequeue && saw_user);
+
+        let before_ttft = store.load("input-before-ttft").await.unwrap().unwrap();
+        assert!(before_ttft.events().iter().any(|event| {
+            matches!(
+                event.data(),
+                EventData::UserMessage { message, .. }
+                    if message.content == "publish before TTFT"
+            )
+        }));
+        assert!(before_ttft
+            .events()
+            .iter()
+            .all(|event| !matches!(event.data(), EventData::AssistantChunk { .. })));
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let session = store.load("input-before-ttft").await.unwrap().unwrap();
+                if session
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event.data(), EventData::TurnEnd { .. }))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable turn completed after releasing the provider");
+    }
+
+    #[tokio::test]
+    async fn authoritative_stream_checkpoint_is_published_before_model_completion() {
+        // Exercise both the independent quiet-stream deadline and fragment cap.
+        for fragments in [1, 64] {
+            check_authoritative_stream_checkpoint(fragments).await;
+        }
+    }
+
+    async fn check_authoritative_stream_checkpoint(fragments: usize) {
+        let cwd = std::env::temp_dir();
+        let store: Arc<dyn Store> = Arc::new(MemorySessionStore::default());
+        let delta_announced = Arc::new(Notify::new());
+        let finish_release = Arc::new(Notify::new());
+        let provider: Arc<dyn ModelProvider> = Arc::new(LiveDeltaProvider {
+            fragments,
+            delta_announced: Arc::clone(&delta_announced),
+            finish_release: Arc::clone(&finish_release),
+        });
+        let runtime = Arc::new(DurableLoopAgentRuntime::new(
+            "test",
+            "test-model",
+            Some(provider),
+            Arc::new(NoTools),
+            Arc::new(IdentityContextPolicy),
+            Arc::clone(&store),
+            Arc::new(MemoryLeaseManager::default()),
+            64,
+        ));
+        let host = BasicHost::with_agent_runtime(config(&cwd), runtime);
+        let mut mux = host.mux_events();
+        let created = host
+            .call(
+                RpcId::new("live-stream-create"),
+                RpcMethod::SessionCreate,
+                json!({"sessionId": "live-stream-session", "cwd": cwd}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(created, RpcResult::Success { .. }));
+        let admitted = host
+            .call(
+                RpcId::new("live-stream-prompt"),
+                RpcMethod::SessionPrompt,
+                json!({
+                    "sessionId": "live-stream-session",
+                    "mode": "queue",
+                    "content": [{"type": "text", "text": "stream now"}],
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(admitted, RpcResult::Success { .. }));
+
+        tokio::time::timeout(Duration::from_secs(2), delta_announced.notified())
+            .await
+            .expect("provider produced its first delta");
+        let live = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = mux.next().await.expect("mux remained open");
+                if frame.payload["type"] == "session/event"
+                    && frame.payload["sessionId"] == "live-stream-session"
+                    && frame.payload["event"]["type"] == "assistant/chunk"
+                    && frame.payload["event"]["data"]["chunk"]["type"] == "text-delta"
+                {
+                    break frame.payload;
+                }
+            }
+        })
+        .await
+        .expect("live delta was held behind the durable completion batch");
+        let expected_first_batch = (0..fragments)
+            .map(|index| format!("live-{index}"))
+            .collect::<String>();
+        assert_eq!(live["event"]["data"]["chunk"]["text"], expected_first_batch);
+        let live_seq = live["event"]["seq"].as_u64().unwrap();
+        let before_finish = store.load("live-stream-session").await.unwrap().unwrap();
+        assert_eq!(
+            before_finish
+                .events()
+                .iter()
+                .filter(|event| matches!(event.data(), EventData::AssistantChunk { .. }))
+                .count(),
+            1
+        );
+        assert!(before_finish
+            .events()
+            .iter()
+            .all(|event| !matches!(event.data(), EventData::AssistantMessage { .. })));
+
+        finish_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let session = store.load("live-stream-session").await.unwrap().unwrap();
+                if session
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event.data(), EventData::TurnEnd { .. }))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable turn completed");
+        let durable = store.load("live-stream-session").await.unwrap().unwrap();
+        let durable_seq = durable
+            .events()
+            .iter()
+            .find_map(|event| match event.data() {
+                EventData::AssistantChunk {
+                    chunk: AssistantChunk::TextDelta(text),
+                    ..
+                } if text == &expected_first_batch => Some(event.seq),
+                _ => None,
+            })
+            .expect("durable delta exists after the semantic boundary");
+        assert_eq!(live_seq, durable_seq);
+    }
+
+    #[test]
+    fn max_tokens_is_projected_as_the_upstream_first_class_turn_reason() {
+        assert_eq!(
+            web_turn_end(&TurnEndReason::MaxTokens),
+            json!({"kind": "max-tokens"})
+        );
+    }
+
+    #[test]
+    fn bash_call_and_foreground_result_project_expandable_terminal_views() {
+        let session = closed_tool_session(
+            "bash",
+            json!({
+                "command": "printf ok",
+                "cwd": "subdir",
+                "description": "run the smoke test"
+            })
+            .to_string(),
+            ToolResultData {
+                call_id: "bash-1".to_owned(),
+                outcome: ToolOutcome::Success,
+                content: "model-facing result".to_owned(),
+                metadata: Some(json!({
+                    "kind": "foreground",
+                    "stdout": "out",
+                    "stderr": "err",
+                    "exit_code": 7,
+                    "signal": null,
+                    "stdout_truncated": true,
+                    "stderr_truncated": false
+                })),
+            },
+        );
+        let call = session
+            .events()
+            .iter()
+            .find(|event| matches!(event.data(), EventData::ToolCall { .. }))
+            .unwrap();
+        assert_eq!(
+            project_session_event_view(&session, call),
+            Some(json!({
+                "for": "call",
+                "view": {
+                    "card": "terminal",
+                    "title": "printf ok",
+                    "cwd": "subdir",
+                    "description": "run the smoke test"
+                }
+            }))
+        );
+
+        let result = session
+            .events()
+            .iter()
+            .find(|event| matches!(event.data(), EventData::ToolResult { .. }))
+            .unwrap();
+        assert_eq!(
+            project_session_event_view(&session, result),
+            Some(json!({
+                "for": "result",
+                "view": {
+                    "card": "terminal",
+                    "output": "out\nerr\n[stdout truncated]\n",
+                    "exitCode": 7
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn pwsh_call_and_foreground_result_use_the_same_terminal_view_contract() {
+        let session = closed_tool_session(
+            "pwsh",
+            json!({"command": "Write-Output ok"}).to_string(),
+            ToolResultData {
+                call_id: "pwsh-1".to_owned(),
+                outcome: ToolOutcome::Success,
+                content: "model-facing result".to_owned(),
+                metadata: Some(json!({
+                    "kind": "foreground",
+                    "stdout": "ok\n",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "signal": null
+                })),
+            },
+        );
+        let call = session
+            .events()
+            .iter()
+            .find(|event| matches!(event.data(), EventData::ToolCall { .. }))
+            .unwrap();
+        let result = session
+            .events()
+            .iter()
+            .find(|event| matches!(event.data(), EventData::ToolResult { .. }))
+            .unwrap();
+
+        assert_eq!(
+            project_session_event_view(&session, call),
+            Some(json!({
+                "for": "call",
+                "view": {"card": "terminal", "title": "Write-Output ok"}
+            }))
+        );
+        assert_eq!(
+            project_session_event_view(&session, result),
+            Some(json!({
+                "for": "result",
+                "view": {"card": "terminal", "output": "ok\n", "exitCode": 0}
+            }))
+        );
+    }
+
+    #[test]
+    fn terminal_view_projection_is_fail_closed_for_non_foreground_or_bad_shapes() {
+        for (index, metadata) in [
+            json!({"kind": "background", "stdout": "not a terminal result"}),
+            json!({"kind": "foreground", "stdout": 42}),
+            json!({"stdout": "missing kind"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session = closed_tool_session(
+                "bash",
+                r#"{"command":"true"}"#.to_owned(),
+                ToolResultData {
+                    call_id: format!("call-{index}"),
+                    outcome: ToolOutcome::Success,
+                    content: String::new(),
+                    metadata: Some(metadata),
+                },
+            );
+            let result = session
+                .events()
+                .iter()
+                .find(|event| matches!(event.data(), EventData::ToolResult { .. }))
+                .unwrap();
+            assert_eq!(project_session_event_view(&session, result), None);
+        }
+
+        let invalid_session = closed_tool_session(
+            "bash",
+            "{not-json".to_owned(),
+            ToolResultData {
+                call_id: "bad-bash".to_owned(),
+                outcome: ToolOutcome::Error,
+                content: "invalid arguments".to_owned(),
+                metadata: None,
+            },
+        );
+        let invalid_call = invalid_session
+            .events()
+            .iter()
+            .find(|event| matches!(event.data(), EventData::ToolCall { .. }))
+            .unwrap();
+        assert_eq!(
+            project_session_event_view(&invalid_session, invalid_call),
+            None
+        );
+
+        // A custom tool may deliberately return the same metadata shape as
+        // A native shell. It must remain generic rather than acquiring terminal chrome.
+        let custom_session = closed_tool_session(
+            "custom",
+            "{}".to_owned(),
+            ToolResultData {
+                call_id: "custom-foreground".to_owned(),
+                outcome: ToolOutcome::Success,
+                content: "custom output".to_owned(),
+                metadata: Some(json!({
+                    "kind": "foreground",
+                    "stdout": "not bash",
+                    "stderr": "",
+                    "exit_code": 0
+                })),
+            },
+        );
+        let custom_result = custom_session
+            .events()
+            .iter()
+            .find(|event| matches!(event.data(), EventData::ToolResult { .. }))
+            .unwrap();
+        assert_eq!(
+            project_session_event_view(&custom_session, custom_result),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_result_view_restores_legacy_json_content_without_metadata() {
+        let session = closed_tool_session(
+            "bash",
+            r#"{"command":"printf legacy"}"#.to_owned(),
+            ToolResultData {
+                call_id: "legacy-bash".to_owned(),
+                outcome: ToolOutcome::Success,
+                content: json!({
+                    "kind": "foreground",
+                    "stdout": "legacy output\n",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "signal": null
+                })
+                .to_string(),
+                metadata: None,
+            },
+        );
+        let result = session
+            .events()
+            .iter()
+            .find(|event| matches!(event.data(), EventData::ToolResult { .. }))
+            .unwrap();
+        assert_eq!(
+            project_session_event_view(&session, result),
+            Some(json!({
+                "for": "result",
+                "view": {
+                    "card": "terminal",
+                    "output": "legacy output\n",
+                    "exitCode": 0
+                }
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_live_mux_and_history_both_carry_terminal_views() {
+        let cwd = std::env::temp_dir();
+        let host = BasicHost::without_provider(config(&cwd));
+        let created = host
+            .call(
+                RpcId::new("create-terminal-view-session"),
+                RpcMethod::SessionCreate,
+                json!({"cwd": cwd}),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success {
+            value: Some(created),
+        } = created
+        else {
+            panic!("session creation failed: {created:?}");
+        };
+        let session_id = created["sessionId"].as_str().unwrap().to_owned();
+        let mut mux = host.mux_events();
+
+        host.append_session_event(
+            &session_id,
+            "tool/call",
+            json!({
+                "turn": 0,
+                "step": 1,
+                "callId": "legacy-live-bash",
+                "name": "bash",
+                "arguments": r#"{"command":"printf live","description":"live projection"}"#,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let live_call = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let frame = mux.next().await.expect("mux remained open").payload;
+                if frame["type"] == "session/event"
+                    && frame["event"]["type"] == "tool/call"
+                    && frame["event"]["data"]["callId"] == "legacy-live-bash"
+                {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("live Bash call frame arrived");
+        assert_eq!(live_call["view"]["for"], "call");
+        assert_eq!(live_call["view"]["view"]["card"], "terminal");
+
+        let result_text = json!({
+            "kind": "foreground",
+            "stdout": "live output\n",
+            "stderr": "",
+            "exit_code": 0,
+            "signal": null
+        })
+        .to_string();
+        host.append_session_event(
+            &session_id,
+            "tool/result",
+            json!({
+                "turn": 0,
+                "step": 1,
+                "message": {
+                    "id": "legacy-live-result",
+                    "role": "user",
+                    "content": [{
+                        "type": "tool-result",
+                        "toolCallId": "legacy-live-bash",
+                        "content": [{"type": "text", "text": result_text}],
+                        "isError": false
+                    }],
+                    "source": {"kind": "tool", "callId": "legacy-live-bash"}
+                }
+            }),
+            Some("append"),
+        )
+        .await
+        .unwrap();
+        let live_result = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let frame = mux.next().await.expect("mux remained open").payload;
+                if frame["type"] == "session/event" && frame["event"]["type"] == "tool/result" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("live Bash result frame arrived");
+        assert_eq!(live_result["view"]["for"], "result");
+        assert_eq!(live_result["view"]["view"]["output"], "live output\n");
+
+        let history = host
+            .call(
+                RpcId::new("terminal-view-history"),
+                RpcMethod::SessionHistory,
+                json!({"sessionId": session_id, "maxMessages": 50}),
+                CancellationToken::new(),
+            )
+            .await;
+        let RpcResult::Success {
+            value: Some(history),
+        } = history
+        else {
+            panic!("history failed: {history:?}");
+        };
+        let items = history["events"].as_array().unwrap();
+        assert!(items.iter().any(|item| {
+            item["event"]["type"] == "tool/call" && item["view"]["view"]["card"] == "terminal"
+        }));
+        assert!(items.iter().any(|item| {
+            item["event"]["type"] == "tool/result"
+                && item["view"]["view"]["output"] == "live output\n"
+        }));
+    }
+}

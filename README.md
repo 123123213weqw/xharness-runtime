@@ -24,7 +24,7 @@ Apache-2.0。状态:**拆分验证中,尚未发布。**
 ## 溯源
 
 - 来源:`123123213weqw/x-harness-rs`
-- 基线提交:`7eed575632105e47ab35e48d1e801f8ecb43a1db`
+- 基线提交:`58d894140cb566865023481b49eed437b6ccb5fe`
 - 拆分日期:2026-10-25
 - 拆分方式:按 `xharness-core / xharness-agent / xharness-platform / xharness-provider-openai` 四根做依赖闭包 BFS,逐 crate 原样复制(源码零修改);`runtime/`、`scripts/fixtures/`、`config/providers.local-reasoning.example.json` 为测试所需的上游根目录资源,一并保留。
 - git 历史未随迁;需要时可对上游做 `git filter-repo` graft。
@@ -33,6 +33,10 @@ Apache-2.0。状态:**拆分验证中,尚未发布。**
 
 - CI 只覆盖 Linux + macOS;Windows 门控测试(如 `bundled_windows.rs`,依赖 `apps/desktop` 桌面资源)未随迁。
 - 上游的架构边界检查(`config/architecture-*.json` + `check-architecture.py`)属于 host 仓库治理,未随迁;本仓库以 `cargo check/test` 为底线。
+
+## 自动跟随上游
+
+`scripts/sync-upstream.sh` + `.github/workflows/sync-upstream.yml` 实现每日自动同步:克隆上游 → 按本仓库 members 清单重新抽取闭包 → `cargo check` → 有变更则以 `sync/upstream-<sha>` 分支开 PR。**同步永远走 PR + CI 审查,不自动合并**;上游若重命名/删除闭包内 crate,脚本会显式报错等人工处理。手动触发:Actions 页 workflow_dispatch,或本地 `bash scripts/sync-upstream.sh`。
 
 ## 验证
 

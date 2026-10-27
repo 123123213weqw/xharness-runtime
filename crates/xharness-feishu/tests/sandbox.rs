@@ -21,9 +21,32 @@ static SEQ: AtomicUsize = AtomicUsize::new(0);
 /// 更麻烦的是假通过：`network_is_denied_by_default` 在没有 bwrap 时也"通过"了，
 /// 因为沙箱根本起不来、命令必然失败 —— 它测的其实是"失败了"，不是"网络被拒绝"。
 /// 所以两个测试都必须在 bwrap 缺席时显式跳过。
-fn bwrap_available() -> bool {
-    std::process::Command::new("bwrap")
+fn sandbox_works() -> bool {
+    // 两次被 CI 教：先是没有 bubblewrap，装上之后 GitHub runner 又不允许创建
+    // netns（"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"）。
+    // 所以不能只查 --version，必须真的起一个最小沙箱。
+    let installed = std::process::Command::new("bwrap")
         .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !installed {
+        return false;
+    }
+    std::process::Command::new("bwrap")
+        .args([
+            "--die-with-parent",
+            "--unshare-all",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--",
+            "true",
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -34,8 +57,8 @@ fn bwrap_available() -> bool {
 /// 跳过时的统一说明，避免"静默通过"看起来像验过了。
 macro_rules! require_bwrap {
     () => {
-        if !bwrap_available() {
-            eprintln!("跳过：本机没有 bwrap，沙箱相关断言无法验证");
+        if !sandbox_works() {
+            eprintln!("跳过：bwrap 不可用（未安装或无法创建命名空间），沙箱断言无法验证");
             return;
         }
     };

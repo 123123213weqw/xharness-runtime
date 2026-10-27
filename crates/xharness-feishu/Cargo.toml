@@ -6,6 +6,8 @@ license = "Apache-2.0"
 description = "Feishu/Lark headless host: general-purpose agent turns over HTTP, reusing the gh crate's deployment helpers"
 
 [dependencies]
+# 直连失败时经可信代理重试，见 proxy_fetch.rs
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 xharness-host = { path = "../xharness-host" }
 xharness-core = { path = "../xharness-core" }
 xharness-session = { path = "../xharness-session" }
@@ -35,7 +37,6 @@ tokio.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-reqwest = { workspace = true, features = ["json"] }
 
 [[bin]]
 name = "bwrap-shim"

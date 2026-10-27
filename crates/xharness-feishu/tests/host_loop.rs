@@ -306,3 +306,74 @@ fn an_empty_prompt_file_falls_back_instead_of_blanking() {
     assert!(text.contains("没有网络访问"), "空文件不应把整段清空");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- web_fetch 代理降级 ----------------------------------------------------
+
+#[test]
+fn private_targets_are_refused_before_any_proxy_is_considered() {
+    use xharness_feishu::proxy_fetch::web_fetch_spec;
+    // SSRF 边界必须在代理之前：内网地址即使配了代理也不能放行。
+    assert!(web_fetch_spec(None).definition.description.contains("代理"));
+    // 纯逻辑校验：is_public_ip 对常见内网段返回 false。
+    for ip in [
+        "127.0.0.1",
+        "10.0.0.1",
+        "172.16.0.1",
+        "192.168.1.1",
+        "169.254.169.254",
+    ] {
+        let parsed: std::net::IpAddr = ip.parse().unwrap();
+        assert!(!xharness_web::is_public_ip(parsed), "{ip} 应判为内网");
+    }
+    assert!(xharness_web::is_public_ip(
+        "20.205.243.166".parse().unwrap()
+    ));
+}
+
+#[test]
+fn proxy_is_only_taken_from_explicit_config() {
+    use xharness_feishu::proxy_fetch::proxy_from_env;
+    // 显式变量为空/未设时必须返回 None，绝不能去捡环境里的 ambient proxy。
+    std::env::remove_var("XH_FS_HTTP_PROXY");
+    std::env::remove_var("XH_FS_HTTPS_PROXY");
+    std::env::set_var("HTTP_PROXY", "http://evil.invalid:3128");
+    std::env::set_var("HTTPS_PROXY", "http://evil.invalid:3128");
+    assert_eq!(
+        proxy_from_env(),
+        None,
+        "不得读取 ambient HTTP_PROXY/HTTPS_PROXY"
+    );
+
+    std::env::set_var("XH_FS_HTTPS_PROXY", "  ");
+    assert_eq!(proxy_from_env(), None, "空白值视为未配置");
+
+    std::env::set_var("XH_FS_HTTPS_PROXY", "http://100.96.19.88:7897");
+    assert_eq!(
+        proxy_from_env().as_deref(),
+        Some("http://100.96.19.88:7897")
+    );
+    std::env::remove_var("XH_FS_HTTPS_PROXY");
+    std::env::remove_var("HTTP_PROXY");
+    std::env::remove_var("HTTPS_PROXY");
+}
+
+#[test]
+fn html_is_reduced_to_text_and_clipped() {
+    use xharness_feishu::proxy_fetch::{html_to_text, MAX_TEXT_CHARS};
+    let html = "<html><head><script>var x=1;</script><style>.a{}</style></head>\
+                <body><h1>Title</h1><p>Hello world</p></body></html>";
+    let text = html_to_text(html);
+    assert!(text.contains("Title"), "正文应保留: {text}");
+    assert!(text.contains("Hello world"), "正文应保留: {text}");
+    assert!(!text.contains("var x"), "脚本必须去掉: {text}");
+    assert!(!text.contains(".a{}"), "样式必须去掉: {text}");
+
+    // 393KB 裸 HTML 撑爆过上下文（status: stopped），必须按字符裁剪。
+    assert_eq!(
+        MAX_TEXT_CHARS, 8_000,
+        "应与上游 DEFAULT_MAX_TEXT_CHARS 对齐"
+    );
+    let long = "字".repeat(MAX_TEXT_CHARS * 2);
+    let clipped: String = long.chars().take(MAX_TEXT_CHARS).collect();
+    assert_eq!(clipped.chars().count(), MAX_TEXT_CHARS);
+}

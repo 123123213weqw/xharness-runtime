@@ -24,6 +24,8 @@ use xharness_web::{DeepSeekSearchProvider, SearchProvider, WebRuntime};
 pub struct FeishuToolFactory {
     pub jobs: Arc<JobRegistry>,
     pub web: Arc<WebRuntime>,
+    /// 直连失败时用于重试的代理；`None` 表示只走直连。
+    pub proxy: Option<String>,
     /// 供测试断言工具确实被执行过。
     pub calls: Arc<Mutex<Vec<String>>>,
 }
@@ -59,6 +61,7 @@ impl Default for FeishuToolFactory {
         Self {
             jobs: Arc::new(JobRegistry::new(JobRegistryConfig::default())),
             web: Arc::new(WebRuntime::default()),
+            proxy: crate::proxy_fetch::proxy_from_env(),
             calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -99,7 +102,14 @@ impl SessionToolFactory for FeishuToolFactory {
             session_id,
             session_id,
         );
-        let mut specs = bundle.specs();
+        // 用带代理降级的版本替换 bundle 自带的 web_fetch：
+        // 上游 fetch_client 硬编码 .no_proxy()，在被墙网络里抓不到 github.com。
+        let mut specs: Vec<_> = bundle
+            .specs()
+            .into_iter()
+            .filter(|spec| spec.definition.name != "web_fetch")
+            .collect();
+        specs.push(crate::proxy_fetch::web_fetch_spec(self.proxy.clone()));
         // headless 没有审批 provider,非 full 档位会让每个工具都 ApprovalUnavailable。
         // 隔离由上面的 bwrap 沙箱保证,所以这里统一放开审批。
         let _ = permission;

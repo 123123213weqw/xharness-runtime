@@ -11,6 +11,7 @@
 pub mod factory;
 pub mod prompt;
 pub mod provider_mock;
+pub mod proxy_fetch;
 pub mod sandbox_shim;
 pub mod server;
 

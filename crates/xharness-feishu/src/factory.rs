@@ -18,7 +18,7 @@ use xharness_jobs::{JobRegistry, JobRegistryConfig};
 use xharness_platform::{NativePlatform, PlatformConfig};
 use xharness_sandbox::{NetworkAccess, SandboxMode};
 use xharness_tools::{ToolExecutor, ToolRegistry};
-use xharness_web::WebRuntime;
+use xharness_web::{DeepSeekSearchProvider, SearchProvider, WebRuntime};
 
 /// 每个 session 的 workspace 由调用方给出；这里只负责把工具挂上去。
 pub struct FeishuToolFactory {
@@ -26,6 +26,32 @@ pub struct FeishuToolFactory {
     pub web: Arc<WebRuntime>,
     /// 供测试断言工具确实被执行过。
     pub calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl FeishuToolFactory {
+    /// 接上搜索 provider。
+    ///
+    /// `web_search` / `web_fetch` 在 **host 进程内**执行，不走沙箱，所以即使
+    /// 沙箱断网它们也能用 —— 这也是它们比"给 bash 开网络"更安全的原因:
+    /// 请求受 `is_public_ip` 校验、跨源重定向被拒、内容类型受限。
+    ///
+    /// 没有 provider 时 `web_search` 会直接报 "no web search provider is
+    /// configured"（实测），所以这里显式区分两种情况。
+    pub fn with_deepseek_search(self, api_key: impl Into<String>) -> Self {
+        match DeepSeekSearchProvider::new(api_key) {
+            Ok(provider) => {
+                let provider: Arc<dyn SearchProvider> = Arc::new(provider);
+                Self {
+                    web: Arc::new(WebRuntime::default().with_search_provider(provider)),
+                    ..self
+                }
+            }
+            Err(error) => {
+                eprintln!("[xh-fs] 搜索 provider 初始化失败({error})，web_search 将不可用");
+                self
+            }
+        }
+    }
 }
 
 impl Default for FeishuToolFactory {

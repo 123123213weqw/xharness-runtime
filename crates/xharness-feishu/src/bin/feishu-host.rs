@@ -46,7 +46,22 @@ async fn main() {
         FileLeaseManager::new(std::path::Path::new(&state_dir).join("leases"))
             .expect("lease manager"),
     );
-    let factory = Arc::new(FeishuToolFactory::default());
+    // web_search / web_fetch 在 host 进程内执行，不走沙箱，因此即使沙箱断网
+    // 也能用。接上 DeepSeek 搜索后，查 GitHub 页面、搜资料都不需要给 bash 开网络。
+    let factory = {
+        let base = FeishuToolFactory::default();
+        let wired = match std::env::var("XH_FS_SEARCH_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => base.with_deepseek_search(key),
+            _ => match std::env::var("XH_FS_API_KEY") {
+                Ok(key) if !key.trim().is_empty() => base.with_deepseek_search(key),
+                _ => {
+                    eprintln!("[xh-fs] 未配置搜索 provider，web_search 不可用（web_fetch 仍可用）");
+                    base
+                }
+            },
+        };
+        Arc::new(wired)
+    };
 
     let (runtime, mut route) = match std::env::var("XH_FS_API_KEY") {
         Ok(api_key) if !api_key.trim().is_empty() => {

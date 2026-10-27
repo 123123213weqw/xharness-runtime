@@ -2629,6 +2629,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "xharness-feishu"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "xharness-agent",
+ "xharness-coding-tools",
+ "xharness-context",
+ "xharness-core",
+ "xharness-gh",
+ "xharness-host",
+ "xharness-jobs",
+ "xharness-platform",
+ "xharness-prompt",
+ "xharness-provider-openai",
+ "xharness-sandbox",
+ "xharness-session",
+ "xharness-session-jsonl",
+ "xharness-tools",
+ "xharness-web",
+]
+
+[[package]]
 name = "xharness-fs"
 version = "0.1.0"
 dependencies = [

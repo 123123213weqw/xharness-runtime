@@ -35,3 +35,7 @@ tokio.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 reqwest = { workspace = true, features = ["json"] }
+
+[[bin]]
+name = "bwrap-shim"
+path = "src/bin/bwrap-shim.rs"

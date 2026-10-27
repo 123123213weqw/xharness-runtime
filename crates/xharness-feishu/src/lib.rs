@@ -10,6 +10,7 @@
 
 pub mod factory;
 pub mod provider_mock;
+pub mod sandbox_shim;
 pub mod server;
 
 pub use factory::FeishuToolFactory;

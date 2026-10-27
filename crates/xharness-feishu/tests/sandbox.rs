@@ -156,3 +156,112 @@ async fn registered_tool_names(cwd: &std::path::Path) -> Vec<String> {
         .map(|s| s.definition.name.clone())
         .collect()
 }
+
+// ---- 挂载遮挡：验证明明是"沙箱里读不到"，而不是"该文件本来就不存在" ----
+
+#[test]
+fn secrets_under_home_are_masked_but_workspace_is_not() {
+    use xharness_feishu::sandbox_shim::masked_paths_with;
+
+    let home = std::path::Path::new("/home/wzu");
+    let workspace = std::path::Path::new("/home/wzu/fs-state/workspaces/fs-oc_x");
+    // 注入全部存在，验证列表完整性（真实环境只遮存在的见下一个测试）
+    let masked = masked_paths_with(Some(home), workspace, |_| true, |_| false);
+
+    // 必须遮的关键位置
+    for must in [
+        "/home/wzu/bots",
+        "/home/wzu/.ssh",
+        "/home/wzu/.aws",
+        "/etc/shadow",
+    ] {
+        assert!(
+            masked.iter().any(|p| p == std::path::Path::new(must)),
+            "{must} 应当被遮挡，实际: {masked:?}"
+        );
+    }
+
+    // workspace 自己不能被遮，否则 agent 无处可写
+    assert!(
+        !masked.iter().any(|p| p == workspace),
+        "workspace 被误遮: {masked:?}"
+    );
+}
+
+#[test]
+fn a_workspace_inside_a_masked_dir_removes_that_mask() {
+    use xharness_feishu::sandbox_shim::masked_paths_with;
+
+    // workspace 若正好在 fs-state 下，不能把 fs-state 整个遮掉
+    let home = std::path::Path::new("/home/wzu");
+    let workspace = std::path::Path::new("/home/wzu/fs-state/workspaces/fs-x");
+    // 注入全部存在，验证列表完整性（真实环境只遮存在的见下一个测试）
+    let masked = masked_paths_with(Some(home), workspace, |_| true, |_| false);
+    assert!(
+        !masked
+            .iter()
+            .any(|p| p == std::path::Path::new("/home/wzu/fs-state")),
+        "祖先目录被遮会让 workspace 一起消失: {masked:?}"
+    );
+}
+
+#[test]
+fn masking_works_without_a_home_directory() {
+    use xharness_feishu::sandbox_shim::masked_paths_with;
+    let masked = masked_paths_with(None, std::path::Path::new("/tmp/ws"), |_| true, |_| false);
+    // 没有 HOME 时仍要遮绝对路径
+    assert!(masked
+        .iter()
+        .any(|p| p == std::path::Path::new("/etc/shadow")));
+    assert!(!masked.iter().any(|p| p.starts_with("/home")));
+}
+
+#[test]
+fn nonexistent_paths_are_not_masked() {
+    use xharness_feishu::sandbox_shim::masking_arguments_with;
+
+    // 实测过：对不存在的目录用 --tmpfs，bwrap 会在只读父目录下 mkdir 并以
+    // "Read-only file system" 失败，整个沙箱命令都跑不起来。
+    let home = std::path::Path::new("/home/wzu");
+    let ws = std::path::Path::new("/tmp/ws");
+    let args = masking_arguments_with(
+        Some(home),
+        ws,
+        |p| p == std::path::Path::new("/home/wzu/bots"),
+        |_| false,
+    );
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        rendered.contains(&"/home/wzu/bots".to_owned()),
+        "{rendered:?}"
+    );
+    assert!(
+        !rendered.contains(&"/home/wzu/.aws".to_owned()),
+        "不存在的路径不应当被遮挡: {rendered:?}"
+    );
+}
+
+#[test]
+fn files_are_masked_with_dev_null_not_tmpfs() {
+    use xharness_feishu::sandbox_shim::masking_arguments_with;
+
+    // .npmrc 是文件：用 --tmpfs 挂在文件上会报 "Not a directory"，整条 bwrap 失败。
+    let home = std::path::Path::new("/home/wzu");
+    let ws = std::path::Path::new("/tmp/ws");
+    let args = masking_arguments_with(
+        Some(home),
+        ws,
+        |p| p == std::path::Path::new("/home/wzu/.npmrc"),
+        |p| p == std::path::Path::new("/home/wzu/.npmrc"),
+    );
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(rendered.contains(&"--ro-bind".to_owned()), "{rendered:?}");
+    assert!(rendered.contains(&"/dev/null".to_owned()), "{rendered:?}");
+    assert!(!rendered.contains(&"--tmpfs".to_owned()), "{rendered:?}");
+}

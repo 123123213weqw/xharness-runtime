@@ -169,6 +169,12 @@ pub async fn submit_inner(
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
+    // 同一个 chat 的 session 会跑很多轮，results 以 session_id 为键，
+    // 所以必须在启动新 turn 后清掉上一轮的结果——否则轮询端会立刻读到旧答案，
+    // 把上一轮的回答误当成这一轮的（实测过：问"口令是什么"回了上一轮的 "OK"）。
+    // 顺序很重要：先 start_turn 再清，避免清了之后 admit 失败导致结果丢失。
+    state.results.lock().unwrap().remove(&session_id);
+
     let results = Arc::clone(&state.results);
     let tracked = session_id.clone();
     tokio::spawn(async move {

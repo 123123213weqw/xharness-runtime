@@ -286,3 +286,49 @@ async fn user_message_does_not_contain_the_system_prompt() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- 提示词文件覆盖 ----------------------------------------------------------
+
+#[test]
+fn a_prompt_file_replaces_the_builtin_section() {
+    let dir = fresh_dir("promptfile");
+    std::fs::write(dir.join("behaviour.md"), "自定义行为规则：只回一个字。").unwrap();
+
+    let text = system_text_with(&dir, None);
+    assert!(text.contains("自定义行为规则"), "文件内容应当生效");
+    assert!(
+        !text.contains("不要凭想象描述结果"),
+        "被覆盖的段落不应残留内置内容"
+    );
+    // 没被覆盖的段落应当保留
+    assert!(text.contains("隔离沙箱"), "未覆盖的段落应当保持内置");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_missing_prompt_dir_falls_back_to_builtins() {
+    let text = system_text_with(std::path::Path::new("/nonexistent-prompt-dir"), None);
+    assert!(
+        text.contains("隔离沙箱"),
+        "读不到目录时必须回退，而不是让服务起不来"
+    );
+    assert!(text.contains("先看清再动手"));
+}
+
+#[test]
+fn an_empty_prompt_file_falls_back_instead_of_blanking_the_prompt() {
+    let dir = fresh_dir("promptempty");
+    std::fs::write(dir.join("environment.md"), "   \n  ").unwrap();
+    let text = system_text_with(&dir, None);
+    assert!(text.contains("隔离沙箱"), "空文件不应把整段清空");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 便于测试：绕开环境变量直接指定覆盖目录。
+fn system_text_with(dir: &std::path::Path, extra: Option<&str>) -> String {
+    use xharness_feishu::prompt::assemble_with;
+    assemble_with(extra, Some(&dir.to_string_lossy()))
+        .expect("assemble")
+        .system()
+        .to_owned()
+}

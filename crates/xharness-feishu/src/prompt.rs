@@ -6,6 +6,8 @@
 //!
 //! 这里把它放回真正的 system role，并补齐环境说明。
 
+use std::path::Path;
+
 use xharness_prompt::{PromptAssembler, PromptSection};
 
 /// 行为约束：怎么说话、怎么做事。
@@ -49,25 +51,70 @@ pub const SANDBOX: &str = "\
 - 你可以运行 shell 命令、读写文件、搜索代码。任务需要多步时，先看上一步的
   真实输出再决定下一步。";
 
+/// 用文件覆盖内置段落。
+///
+/// 改提示词不该需要重新编译 Rust：`XH_FS_PROMPT_DIR` 指向一个目录，其中
+/// `behaviour.md` / `environment.md` / `workflow.md` 存在时，用它替换对应的
+/// 内置常量。这样调措辞就是「改文件 + systemctl restart」，几秒钟的事。
+///
+/// 文件读不到时**回退到内置**而不是报错：提示词缺失不该让服务起不来。
+pub fn load_override(dir: &Path, name: &str, fallback: &str) -> String {
+    let path = dir.join(format!("{name}.md"));
+    match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => text,
+        Ok(_) => {
+            eprintln!("[xh-fs][prompt] {} 是空的，用内置版本", path.display());
+            fallback.to_owned()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fallback.to_owned(),
+        Err(error) => {
+            eprintln!(
+                "[xh-fs][prompt] 读取 {} 失败({error})，用内置版本",
+                path.display()
+            );
+            fallback.to_owned()
+        }
+    }
+}
+
 /// 组合出完整的 system prompt。
 ///
 /// `extra` 来自调用方（飞书侧的角色设定），拼在最后，让用户的定制覆盖默认措辞。
 pub fn assemble(extra: Option<&str>) -> Option<xharness_prompt::PromptAssembly> {
+    assemble_with(extra, std::env::var("XH_FS_PROMPT_DIR").ok().as_deref())
+}
+
+/// `override_dir` 存在时，用其中同名 .md 文件替换内置段落。
+pub fn assemble_with(
+    extra: Option<&str>,
+    override_dir: Option<&str>,
+) -> Option<xharness_prompt::PromptAssembly> {
+    let dir = override_dir.map(Path::new);
+    let behaviour = dir
+        .map(|d| load_override(d, "behaviour", BEHAVIOUR))
+        .unwrap_or_else(|| BEHAVIOUR.to_owned());
+    let environment = dir
+        .map(|d| load_override(d, "environment", SANDBOX))
+        .unwrap_or_else(|| SANDBOX.to_owned());
+    let workflow = dir
+        .map(|d| load_override(d, "workflow", WORKFLOW))
+        .unwrap_or_else(|| WORKFLOW.to_owned());
+
     let mut sections = vec![
         PromptSection {
             id: "sandbox/behaviour".to_owned(),
             version: "1".to_owned(),
-            content: BEHAVIOUR.to_owned(),
+            content: behaviour,
         },
         PromptSection {
             id: "sandbox/environment".to_owned(),
             version: "1".to_owned(),
-            content: SANDBOX.to_owned(),
+            content: environment,
         },
         PromptSection {
             id: "coding/workflow".to_owned(),
             version: "1".to_owned(),
-            content: WORKFLOW.to_owned(),
+            content: workflow,
         },
     ];
     if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {

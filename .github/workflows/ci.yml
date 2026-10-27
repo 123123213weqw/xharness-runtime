@@ -25,8 +25,10 @@ jobs:
         with:
           persist-credentials: false
       # coding-tools 的 glob/grep 真实依赖 ripgrep;2026-10 起 GitHub 镜像不再预装
+      # bubblewrap:沙箱测试真实依赖它。装着才验证得了 bash 越界与断网两条断言,
+      # 没装会走 require_bwrap! 跳过 —— 那等于没覆盖,所以 CI 必须装上。
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep bubblewrap
       - if: runner.os == 'macOS'
         run: brew install ripgrep
       - uses: dtolnay/rust-toolchain@1.99.0

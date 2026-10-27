@@ -51,8 +51,10 @@ jobs:
           # 同一基线已有未合并的 PR 时不要重复劳动:main 的基线要等 PR 合并才更新,
           # 否则每 6 小时都会重跑一次完整抽取 + fmt/clippy/test(单次约数分钟)。
           # 直接复用已有分支和 PR。
+          # 用管道形式而不是 ."startswith"(...)：后者在双引号里转义后是非法 jq，
+          # 会以 "failed to parse jq expression" 静默炸掉整个 job。
           PENDING=$(gh pr list --state open --json headRefName \
-            --jq "[.[] | select(.headRefName.\"startswith\"(\"sync/upstream-\"))] | length")
+            --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))] | length')
           echo "pending_sync_prs=$PENDING"
           if [ "$PENDING" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"

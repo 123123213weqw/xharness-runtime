@@ -66,12 +66,25 @@ jobs:
         run: bash scripts/sync-upstream.sh
 
       - name: Verify before opening a PR
+        id: verify
         if: steps.guard.outputs.skip == 'false' && steps.sync.outputs.changed == 'true'
-        # 与 ci.yml 同一条底线。在这里失败,PR 根本不会开,也就不会污染评审队列。
+        # 这条 job 必须自己跑完全部校验,不能指望 PR 上再触发 ci.yml:
+        # 由 GITHUB_TOKEN 创建的 PR 会把后续 workflow 跑成 action_required
+        # (等人工批准),等于 PR 永远没有 CI 结论。
         run: |
-          cargo fmt --check --all
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace --all-targets
+          set -euo pipefail
+          ok=true
+          for cmd in \
+            "cargo fmt --check --all" \
+            "cargo clippy --workspace --all-targets -- -D warnings" \
+            "cargo test --locked --workspace --all-targets"
+          do
+            echo "::group::$cmd"
+            if $cmd; then echo "PASS: $cmd"; else echo "FAIL: $cmd"; ok=false; fi
+            echo "::endgroup::"
+          done
+          echo "verified=$ok" >> "$GITHUB_OUTPUT"
+          [ "$ok" = "true" ] || { echo "::error::同步未通过校验,不创建 PR"; exit 1; }
 
       - name: Open pull request
         if: steps.guard.outputs.skip == 'false' && steps.sync.outputs.changed == 'true'

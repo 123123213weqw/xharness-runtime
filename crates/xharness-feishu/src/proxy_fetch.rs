@@ -24,12 +24,20 @@ use xharness_tools::{
     ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolHandlerError, ToolOutput, ToolSpec,
 };
 
-/// 只接受这几种文本类型，与上游保持一致（二进制交给别处处理）。
+/// 可接受的响应类型。
+///
+/// 比上游多了 `application/json`：实测经节点抓 github.com 的 HTML 只有约 26 KB/s
+/// （365KB 要 14–30 秒），而 `api.github.com` 的 JSON 是 0.7 秒、体积小一个数量级、
+/// 还是结构化数据。禁掉 JSON 等于逼 agent 走最慢的那条路。
+///
+/// 仍然排除图片/二进制/压缩包：那些没有文本表示，塞进上下文只会浪费 token。
 const ALLOWED_TYPES: &[&str] = &[
     "text/html",
     "text/plain",
     "text/markdown",
     "text/x-markdown",
+    "application/json",
+    "application/x-ndjson",
 ];
 
 /// 原文上限：超过就停止读取，避免把整个 5MB 页面拉进内存。
@@ -41,6 +49,9 @@ const MAX_BYTES: usize = 2 * 1024 * 1024;
 /// 直接把上下文撑爆，turn 以 `status: stopped` 结束 —— 模型一句话都没来得及说。
 /// 上游 `WebConfig::DEFAULT_MAX_TEXT_CHARS` 是 8000，按它对齐。
 pub const MAX_TEXT_CHARS: usize = 8_000;
+
+/// JSON 上限。结构化数据信息密度高，给宽一些。
+pub const MAX_JSON_CHARS: usize = 24_000;
 
 /// HTML 去掉脚本/样式后成文，否则 8000 字符里大半是 `function(e){...}`。
 pub fn html_to_text(html: &str) -> String {
@@ -191,7 +202,7 @@ async fn fetch_once(raw: &str, proxy: Option<&str>) -> Result<String, FetchError
 
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(45))
         .user_agent("xharness-feishu/0.1");
     builder = match proxy {
         // 显式配置的代理：它是信任边界的一部分，见模块注释。
@@ -247,10 +258,17 @@ async fn fetch_once(raw: &str, proxy: Option<&str>) -> Result<String, FetchError
     } else {
         raw
     };
+    // JSON 是结构化数据，8000 字符常常不够看一个仓库详情；HTML 转文本后 8000
+    // 已经能覆盖主要内容，再多只是噪音。
+    let limit = if content_type.contains("json") {
+        MAX_JSON_CHARS
+    } else {
+        MAX_TEXT_CHARS
+    };
     let total = text.chars().count();
-    let clipped: String = text.chars().take(MAX_TEXT_CHARS).collect();
-    Ok(if total > MAX_TEXT_CHARS {
-        format!("{clipped}\n\n[已截断：{MAX_TEXT_CHARS}/{total} 字符]")
+    let clipped: String = text.chars().take(limit).collect();
+    Ok(if total > limit {
+        format!("{clipped}\n\n[已截断：{limit}/{total} 字符]")
     } else {
         clipped
     })

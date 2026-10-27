@@ -70,14 +70,8 @@ pub fn session_id_for(chat_id: &str, workspace: Option<&str>) -> String {
     format!("fs-{cleaned}")
 }
 
-fn build_prompt(payload: &TaskPayload) -> String {
-    match &payload.system_prompt {
-        Some(system) if !system.trim().is_empty() => {
-            format!("{system}\n\n---\n\n{}", payload.text)
-        }
-        _ => payload.text.clone(),
-    }
-}
+// 用户消息就是用户说的话。system prompt 通过 `prompt` 字段单独传，
+// 不再拼进这里——拼进去会让它降级成 user 内容，且 systemTokens 为 0。
 
 pub fn router(state: Arc<FeishuHostState>) -> Router {
     Router::new()
@@ -139,7 +133,8 @@ pub async fn submit_inner(
         cwd: workspace.to_string_lossy().to_string(),
         route: state.route.clone(),
         permission: state.permission,
-        prompt: None,
+        // 真正的 system role。None 时上游会用默认；Some 时整段替换。
+        prompt: crate::prompt::assemble(payload.system_prompt.as_deref()),
         messages: vec![Message {
             // 幂等：同一 message_id 重推时落成同一条 durable 消息。
             id: Some(format!(
@@ -147,7 +142,7 @@ pub async fn submit_inner(
                 payload.chat_id, payload.message_id, tag
             )),
             role: MessageRole::User,
-            content: build_prompt(&payload),
+            content: payload.text.clone(),
             ..Default::default()
         }],
         input_metadata: Some(json!({

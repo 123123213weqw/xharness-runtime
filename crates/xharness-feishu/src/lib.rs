@@ -9,6 +9,7 @@
 //! 这里只负责"跑 turn"这一件事。这样渠道演进不会牵动 Rust，反之亦然。
 
 pub mod factory;
+pub mod prompt;
 pub mod provider_mock;
 pub mod sandbox_shim;
 pub mod server;

@@ -12,6 +12,7 @@ xharness-session = { path = "../xharness-session" }
 xharness-session-jsonl = { path = "../xharness-session-jsonl" }
 xharness-tools = { path = "../xharness-tools" }
 xharness-context = { path = "../xharness-context" }
+xharness-prompt = { path = "../xharness-prompt" }
 xharness-coding-tools = { path = "../xharness-coding-tools" }
 xharness-jobs = { path = "../xharness-jobs" }
 xharness-agent = { path = "../xharness-agent" }

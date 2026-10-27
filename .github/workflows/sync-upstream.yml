@@ -1,36 +1,112 @@
 name: sync-upstream
 
-# 上游已冻结于 58d8941,仅按需手动触发(workflow_dispatch 或本地脚本)。
+# 持续跟随上游:每 6 小时检查一次 x-harness-rs 是否有新提交。
+# 有变化就重新抽取闭包、过 cargo check,然后开一个 PR —— 不直接推 main,
+# 因为闭包里的任何上游改动都必须先经过 ci.yml 的 fmt/clippy/test 门。
 on:
+  schedule:
+    - cron: "17 */6 * * *"   # 避开整点,减少与其它定时任务的排队冲突
   workflow_dispatch:
 
 permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false   # 同步不能互相打断,否则分支状态会乱
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Already synced?
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          UPSTREAM=123123213weqw/x-harness-rs
+          LATEST=$(gh api "repos/$UPSTREAM/commits?per_page=1" --jq '.[0].sha')
+          # 只认「基线提交:`<sha>`」这一行——格式与 scripts/sync-upstream.sh
+          # 写回的一致（半角冒号）。读错会让 RECORDED 为空，于是每次都判定
+          # "有变化"、每 6 小时重复开 PR。README 正文里另有一处历史基线，
+          # 所以这里按行锁定，不做全文搜索。
+          MATCHES=$(grep -cE '^- 基线提交:`[0-9a-f]{40}`' README.md || true)
+          if [ "$MATCHES" != "1" ]; then
+            echo "::warning::README 里应有且仅有一行「- 基线提交:\`<sha>\`」，实际 $MATCHES 行"
+          fi
+          RECORDED=$(grep -oE '^- 基线提交:`[0-9a-f]{40}`' README.md | grep -oE '[0-9a-f]{40}' | head -1 || true)
+          echo "upstream=$LATEST"
+          echo "recorded=$RECORDED"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          if [ "$LATEST" = "$RECORDED" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "已是最新,无需同步"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: dtolnay/rust-toolchain@1.99.0
+        if: steps.guard.outputs.skip == 'false'
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - id: sync
+        if: steps.guard.outputs.skip == 'false'
+      - if: steps.guard.outputs.skip == 'false' && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Re-extract closure and cargo check
+        if: steps.guard.outputs.skip == 'false'
+        id: sync
         env:
           UPSTREAM_REPO: 123123213weqw/x-harness-rs
         run: bash scripts/sync-upstream.sh
-      - if: steps.sync.outputs.changed == 'true'
+
+      - name: Verify before opening a PR
+        if: steps.guard.outputs.skip == 'false' && steps.sync.outputs.changed == 'true'
+        # 与 ci.yml 同一条底线。在这里失败,PR 根本不会开,也就不会污染评审队列。
+        run: |
+          cargo fmt --check --all
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace --all-targets
+
+      - name: Open pull request
+        if: steps.guard.outputs.skip == 'false' && steps.sync.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_SHA: ${{ steps.sync.outputs.sha }}
           UPSTREAM_REPO: 123123213weqw/x-harness-rs
         run: |
+          set -euo pipefail
           BR="sync/upstream-${UPSTREAM_SHA::7}"
           git config user.name "sync-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BR"
           git add -A
-          git commit -m "chore: 同步上游 x-harness-rs@${UPSTREAM_SHA}"
+          git commit -m "chore: 同步上游 x-harness-rs@${UPSTREAM_SHA:0:7}"
           git push -f origin "$BR"
-          gh pr create --title "chore: 同步上游 x-harness-rs@${UPSTREAM_SHA::7}" \
-            --body "自动同步自 https://github.com/${UPSTREAM_REPO} 。基线 ${UPSTREAM_SHA} 。闭包重新抽取、cargo check 通过;等 CI(cargo fmt/test)绿后人工合并。" || true
+          # 同一基线可能已经开过 PR,重复运行不该报错。
+          if gh pr list --head "$BR" --json number --jq '.[0].number' | grep -q .; then
+            echo "PR 已存在,只更新了分支"
+          else
+            gh pr create \
+              --title "chore: 同步上游 x-harness-rs@${UPSTREAM_SHA:0:7}" \
+              --body "自动同步自 https://github.com/${UPSTREAM_REPO},基线 \`${UPSTREAM_SHA}\`。
+
+          闭包按 \`Cargo.toml\` 的 members 重新抽取,\`cargo fmt/clippy/test\` 已在本 job 内通过。
+          合并前请人工看一眼上游改了什么——尤其 session / 沙箱 / 鉴权相关。" \
+              --base main --head "$BR"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### sync-upstream"
+            echo "- 上游最新: \`${{ steps.guard.outputs.latest }}\`"
+            echo "- 已记录基线: 见 README"
+            echo "- 结果: ${{ steps.guard.outputs.skip == 'true' && '已最新,跳过' || (steps.sync.outputs.changed == 'true' && '已开 PR' || '已是最新') }}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -34,13 +34,29 @@ Apache-2.0。状态:**拆分验证中,尚未发布。**
 - CI 只覆盖 Linux + macOS;Windows 门控测试(如 `bundled_windows.rs`,依赖 `apps/desktop` 桌面资源)未随迁。
 - 上游的架构边界检查(`config/architecture-*.json` + `check-architecture.py`)属于 host 仓库治理,未随迁;本仓库以 `cargo check/test` 为底线。
 
-## 上游策略:冻结
+## 上游策略:持续同步
 
-运行时核心定位为基础设施,已冻结(基线 `58d8941`),不自动跟随上游——本地特殊设计因此没有同步冲突压力。同步机制保留为手动档:需要追上游时走 Actions 的 workflow_dispatch 或本地 `bash scripts/sync-upstream.sh`(按 members 清单重新抽取闭包 + cargo check,变更仍以 PR + CI 审查进入)。
+运行时核心跟随上游 `x-harness-rs`,**每 6 小时自动检查一次**(`.github/workflows/sync-upstream.yml`,`cron: 17 */6 * * *`,也可 `workflow_dispatch` 手动触发)。
 
-例外:上游若修复闭包内 crate 的安全类问题(session/沙箱/鉴权),值得手动同步一次;常规功能迭代不追。
+有变化时的完整路径:
+
+```
+上游新提交
+  → 按 Cargo.toml 的 members 重新抽取闭包(scripts/sync-upstream.sh)
+  → cargo fmt --check / clippy -D warnings / test   ← 与 ci.yml 同一条底线
+  → 通过才开 PR(sync/upstream-<sha7>);不通过 PR 根本不会出现
+  → ci.yml 双平台再跑一遍
+  → 人工合并
+```
+
+**不直接推 main。** 闭包里的任何上游改动都必须过 CI 门;自动同步的价值是"不用记得去同步",不是"跳过审查"。
+
+升级前请人工看一眼上游改了什么——尤其 `session` / 沙箱 / 鉴权相关,这些即使 CI 全绿也可能改变安全语义。
+
+闭包外的本地自有 crate(目前是 `xharness-gh`)同步时跳过,不受影响。
 
 ## Review 模式(PR)
+
 
 `/xh` 评论落在 PR 上时自动进入 review 模式:host clone 仓库、checkout PR head、生成 diff.patch 与 diff.stat 注入任务;评审输出按 **P0 必须修复 / P1 建议修复 / P2 可选** 分级,每条 finding 强制 `path:line` 引用与验证方式;结果评论附 host 生成的**复现信息块**(repo/PR/head/base SHA/diff stat/session id)。label:`xh:reviewed`,出现 P0 加 `xh:review-p0`。
 

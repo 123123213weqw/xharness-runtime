@@ -17,6 +17,7 @@ xharness-jobs = { path = "../xharness-jobs" }
 xharness-agent = { path = "../xharness-agent" }
 xharness-provider-openai = { path = "../xharness-provider-openai" }
 xharness-platform = { path = "../xharness-platform" }
+xharness-sandbox = { path = "../xharness-sandbox" }
 xharness-web = { path = "../xharness-web", default-features = false }
 
 # 复用 gh crate 的模型部署与离线 mock provider，避免两份 registry 装配逻辑漂移。

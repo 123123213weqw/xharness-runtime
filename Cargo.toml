@@ -11,6 +11,7 @@ members = [
     "crates/xharness-debug",
     "crates/xharness-diagnostics",
     "crates/xharness-fs",
+    "crates/xharness-feishu",
     "crates/xharness-gh",
     "crates/xharness-goal",
     "crates/xharness-host",

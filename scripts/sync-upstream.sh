@@ -23,7 +23,7 @@ print(' '.join(re.findall(r'\"crates/([a-z0-9-]+)\"', open('Cargo.toml').read())
 echo "闭包 $(echo "$MEMBERS" | wc -w | tr -d ' ') 个 crate: $MEMBERS"
 
 # 本仓库自有 crate(非上游闭包),同步时跳过
-OWNED_CRATES="xharness-gh"
+OWNED_CRATES="xharness-gh xharness-feishu"
 for c in $MEMBERS; do
   case " $OWNED_CRATES " in
     *" $c "*) continue ;;

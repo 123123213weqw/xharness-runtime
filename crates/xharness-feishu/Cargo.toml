@@ -1,0 +1,36 @@
+[package]
+name = "xharness-feishu"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Feishu/Lark headless host: general-purpose agent turns over HTTP, reusing the gh crate's deployment helpers"
+
+[dependencies]
+xharness-host = { path = "../xharness-host" }
+xharness-core = { path = "../xharness-core" }
+xharness-session = { path = "../xharness-session" }
+xharness-session-jsonl = { path = "../xharness-session-jsonl" }
+xharness-tools = { path = "../xharness-tools" }
+xharness-context = { path = "../xharness-context" }
+xharness-coding-tools = { path = "../xharness-coding-tools" }
+xharness-jobs = { path = "../xharness-jobs" }
+xharness-agent = { path = "../xharness-agent" }
+xharness-provider-openai = { path = "../xharness-provider-openai" }
+xharness-platform = { path = "../xharness-platform" }
+xharness-web = { path = "../xharness-web", default-features = false }
+
+# 复用 gh crate 的模型部署与离线 mock provider，避免两份 registry 装配逻辑漂移。
+xharness-gh = { path = "../xharness-gh" }
+
+async-trait.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+reqwest = { workspace = true, features = ["json"] }

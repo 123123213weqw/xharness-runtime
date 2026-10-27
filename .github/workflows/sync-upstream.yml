@@ -45,9 +45,22 @@ jobs:
           if [ "$LATEST" = "$RECORDED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "已是最新,无需同步"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          # 同一基线已有未合并的 PR 时不要重复劳动:main 的基线要等 PR 合并才更新,
+          # 否则每 6 小时都会重跑一次完整抽取 + fmt/clippy/test(单次约数分钟)。
+          # 直接复用已有分支和 PR。
+          PENDING=$(gh pr list --state open --json headRefName \
+            --jq "[.[] | select(.headRefName.\"startswith\"(\"sync/upstream-\"))] | length")
+          echo "pending_sync_prs=$PENDING"
+          if [ "$PENDING" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "已有待合并的同步 PR,本次跳过"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@1.99.0
         if: steps.guard.outputs.skip == 'false'

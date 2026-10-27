@@ -15,7 +15,6 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-
 /// 应当在沙箱内不可见的路径（相对 `$HOME`）。
 ///
 /// 这里列的是"放进去就等于泄密"的位置，不是全部隐藏 —— 隐藏整个 `$HOME`
@@ -31,17 +30,13 @@ const HIDDEN_UNDER_HOME: &[&str] = &[
     ".npmrc",
     ".pypirc",
     ".git-credentials",
-    "bots",          // 飞书 bot：.env 里有全套凭据
-    "score-api-ts",  // 另一个 .env：教学项目 key + 数据库 URL
-    "fs-state",      // 自己的会话/工作区仍要可见？见下：单独挂
+    "bots",         // 飞书 bot：.env 里有全套凭据
+    "score-api-ts", // 另一个 .env：教学项目 key + 数据库 URL
+    "fs-state",     // 自己的会话/工作区仍要可见？见下：单独挂
 ];
 
 /// 即使不在 `$HOME` 下也要遮的路径。
-const HIDDEN_ABSOLUTE: &[&str] = &[
-    "/etc/shadow",
-    "/etc/sudoers",
-    "/root",
-];
+const HIDDEN_ABSOLUTE: &[&str] = &["/etc/shadow", "/etc/sudoers", "/root"];
 
 /// 生成遮挡参数。`workspace` 会被重新挂回去，所以删掉与它冲突的项。
 pub fn masking_arguments(home: Option<&Path>, workspace: &Path) -> Vec<OsString> {

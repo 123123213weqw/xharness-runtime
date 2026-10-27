@@ -12,7 +12,6 @@ use xharness_tools::ToolRequest;
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
-
 /// 真正驱动沙箱的测试需要 bwrap；没有它时**必须跳过，而不是失败**。
 ///
 /// 这条是 CI 教出来的：GitHub runner 没装 bubblewrap，测试直接以
@@ -174,9 +173,8 @@ async fn registered_tool_names(cwd: &std::path::Path) -> Vec<String> {
     use xharness_platform::{NativePlatform, PlatformConfig};
     use xharness_web::WebRuntime;
 
-    let platform = Arc::new(
-        NativePlatform::new(PlatformConfig::new(cwd).full_access()).expect("platform"),
-    );
+    let platform =
+        Arc::new(NativePlatform::new(PlatformConfig::new(cwd).full_access()).expect("platform"));
     let bundle = CodingToolBundle::new(
         platform,
         Arc::new(JobRegistry::new(JobRegistryConfig::default())),
@@ -184,7 +182,11 @@ async fn registered_tool_names(cwd: &std::path::Path) -> Vec<String> {
         "probe",
         "probe",
     );
-    bundle.specs().iter().map(|s| s.definition.name.clone()).collect()
+    bundle
+        .specs()
+        .iter()
+        .map(|s| s.definition.name.clone())
+        .collect()
 }
 
 // ---- 挂载遮挡：验证明明是"沙箱里读不到"，而不是"该文件本来就不存在" ----
@@ -199,7 +201,12 @@ fn secrets_under_home_are_masked_but_workspace_is_not() {
     let masked = masked_paths_with(Some(home), workspace, |_| true, |_| false);
 
     // 必须遮的关键位置
-    for must in ["/home/wzu/bots", "/home/wzu/.ssh", "/home/wzu/.aws", "/etc/shadow"] {
+    for must in [
+        "/home/wzu/bots",
+        "/home/wzu/.ssh",
+        "/home/wzu/.aws",
+        "/etc/shadow",
+    ] {
         assert!(
             masked.iter().any(|p| p == std::path::Path::new(must)),
             "{must} 应当被遮挡，实际: {masked:?}"
@@ -223,7 +230,9 @@ fn a_workspace_inside_a_masked_dir_removes_that_mask() {
     // 注入全部存在，验证列表完整性（真实环境只遮存在的见下一个测试）
     let masked = masked_paths_with(Some(home), workspace, |_| true, |_| false);
     assert!(
-        !masked.iter().any(|p| p == std::path::Path::new("/home/wzu/fs-state")),
+        !masked
+            .iter()
+            .any(|p| p == std::path::Path::new("/home/wzu/fs-state")),
         "祖先目录被遮会让 workspace 一起消失: {masked:?}"
     );
 }
@@ -233,7 +242,9 @@ fn masking_works_without_a_home_directory() {
     use xharness_feishu::sandbox_shim::masked_paths_with;
     let masked = masked_paths_with(None, std::path::Path::new("/tmp/ws"), |_| true, |_| false);
     // 没有 HOME 时仍要遮绝对路径
-    assert!(masked.iter().any(|p| p == std::path::Path::new("/etc/shadow")));
+    assert!(masked
+        .iter()
+        .any(|p| p == std::path::Path::new("/etc/shadow")));
     assert!(!masked.iter().any(|p| p.starts_with("/home")));
 }
 
@@ -251,8 +262,14 @@ fn nonexistent_paths_are_not_masked() {
         |p| p == std::path::Path::new("/home/wzu/bots"),
         |_| false,
     );
-    let rendered: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-    assert!(rendered.contains(&"/home/wzu/bots".to_owned()), "{rendered:?}");
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        rendered.contains(&"/home/wzu/bots".to_owned()),
+        "{rendered:?}"
+    );
     assert!(
         !rendered.contains(&"/home/wzu/.aws".to_owned()),
         "不存在的路径不应当被遮挡: {rendered:?}"
@@ -272,7 +289,10 @@ fn files_are_masked_with_dev_null_not_tmpfs() {
         |p| p == std::path::Path::new("/home/wzu/.npmrc"),
         |p| p == std::path::Path::new("/home/wzu/.npmrc"),
     );
-    let rendered: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     assert!(rendered.contains(&"--ro-bind".to_owned()), "{rendered:?}");
     assert!(rendered.contains(&"/dev/null".to_owned()), "{rendered:?}");
     assert!(!rendered.contains(&"--tmpfs".to_owned()), "{rendered:?}");

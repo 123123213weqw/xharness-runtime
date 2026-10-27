@@ -24,7 +24,11 @@ async fn main() {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mask = masking_arguments(
         home.as_deref().map(Path::new),
-        Path::new(if workspace.is_empty() { "/nonexistent" } else { &workspace }),
+        Path::new(if workspace.is_empty() {
+            "/nonexistent"
+        } else {
+            &workspace
+        }),
     );
 
     // 遮挡必须落在 `--` 之前，否则会被当成目标程序的参数。

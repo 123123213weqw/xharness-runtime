@@ -10,10 +10,10 @@
 
 pub mod factory;
 pub mod prompt;
-pub mod sandbox_shim;
 pub mod provider_mock;
+pub mod sandbox_shim;
 pub mod server;
 
 pub use factory::FeishuToolFactory;
 pub use provider_mock::FeishuScriptedProvider;
-pub use server::{session_id_for, router, FeishuHostState, TaskOutcome, TaskPayload};
+pub use server::{router, session_id_for, FeishuHostState, TaskOutcome, TaskPayload};

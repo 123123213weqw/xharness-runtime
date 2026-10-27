@@ -59,7 +59,13 @@ pub fn session_id_for(chat_id: &str, workspace: Option<&str>) -> String {
     let raw = workspace.unwrap_or(chat_id);
     let cleaned: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("fs-{cleaned}")
 }
@@ -106,7 +112,10 @@ pub async fn submit_inner(
     let session_id = session_id_for(&payload.chat_id, payload.workspace.as_deref());
     let workspace = state.workspace_root.join(&session_id);
     std::fs::create_dir_all(&workspace).map_err(|error| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("创建 workspace 失败: {error}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("创建 workspace 失败: {error}"),
+        )
     })?;
 
     // 落一份任务快照，便于崩溃后人工核对（恢复仍以 done.marker 为准）。
@@ -115,7 +124,10 @@ pub async fn submit_inner(
         let _ = std::fs::write(&task_file, serialized);
     }
 
-    let tag = payload.message_tag.clone().unwrap_or_else(|| "v1".to_owned());
+    let tag = payload
+        .message_tag
+        .clone()
+        .unwrap_or_else(|| "v1".to_owned());
     let cwd = workspace.to_string_lossy().to_string();
     let request = AgentTurnRequest {
         session_id: session_id.clone(),
@@ -127,7 +139,10 @@ pub async fn submit_inner(
         prompt: crate::prompt::assemble(payload.system_prompt.as_deref(), &cwd),
         messages: vec![Message {
             // 幂等：同一 message_id 重推时落成同一条 durable 消息。
-            id: Some(format!("fs-{}/{}/{}", payload.chat_id, payload.message_id, tag)),
+            id: Some(format!(
+                "fs-{}/{}/{}",
+                payload.chat_id, payload.message_id, tag
+            )),
             role: MessageRole::User,
             content: payload.text.clone(),
             ..Default::default()
@@ -171,10 +186,13 @@ pub async fn submit_inner(
         } else {
             result.final_text.clone()
         };
-        results
-            .lock()
-            .unwrap()
-            .insert(tracked, TaskOutcome { status: status.to_owned(), final_text });
+        results.lock().unwrap().insert(
+            tracked,
+            TaskOutcome {
+                status: status.to_owned(),
+                final_text,
+            },
+        );
     });
 
     Ok(session_id)

@@ -225,7 +225,28 @@ fn the_feishu_layer_covers_what_the_upstream_cannot_know() {
     );
     assert!(text.contains("没有网络访问"), "没说明断网");
     assert!(text.contains("默认不要做全盘扫描"), "没限制全盘扫描");
-    assert!(text.contains("不要凭想象描述结果"), "没要求报告真实输出");
+    assert!(text.contains("原始错误输出"), "没要求贴原始错误");
+}
+
+#[test]
+fn the_feishu_section_does_not_repeat_the_shared_sections() {
+    // 上游做过 perf(host): trim repeated guidance，重复内容会抵消那次收益，
+    // 也让模型难以判断哪条更权威。
+    use xharness_feishu::prompt::{AGENT_PRESET, FEISHU_ENVIRONMENT};
+
+    for (concept, in_preset) in [("concise", "concisely"), ("evidence", "without evidence")] {
+        assert!(AGENT_PRESET.contains(in_preset), "前置假设变了: {concept}");
+        assert!(
+            !FEISHU_ENVIRONMENT.to_lowercase().contains(concept),
+            "feishu 段落重复了 agent/preset 的 {concept}"
+        );
+    }
+    // 中文版的对应词也不该出现
+    assert!(!FEISHU_ENVIRONMENT.contains("要简洁"), "重复表述简洁");
+    assert!(
+        !FEISHU_ENVIRONMENT.contains("不要凭想象"),
+        "重复表述不可编造"
+    );
 }
 
 #[test]

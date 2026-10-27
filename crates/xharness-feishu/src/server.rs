@@ -128,13 +128,15 @@ pub async fn submit_inner(
         .message_tag
         .clone()
         .unwrap_or_else(|| "v1".to_owned());
+    let cwd = workspace.to_string_lossy().to_string();
     let request = AgentTurnRequest {
         session_id: session_id.clone(),
-        cwd: workspace.to_string_lossy().to_string(),
+        cwd: cwd.clone(),
         route: state.route.clone(),
         permission: state.permission,
-        // 真正的 system role。None 时上游会用默认；Some 时整段替换。
-        prompt: crate::prompt::assemble(payload.system_prompt.as_deref()),
+        // 真正的 system role。内容与上游 Host 的 prompt_sections() 对齐，
+        // 见 crate::prompt 的模块注释。
+        prompt: crate::prompt::assemble(payload.system_prompt.as_deref(), &cwd),
         messages: vec![Message {
             // 幂等：同一 message_id 重推时落成同一条 durable 消息。
             id: Some(format!(

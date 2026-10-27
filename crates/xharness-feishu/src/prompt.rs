@@ -73,11 +73,7 @@ pub const FEISHU_ENVIRONMENT: &str = "\
 /// `cwd` 会写进 workspace/context，与上游同格式。
 /// `extra` 来自调用方（飞书侧的角色设定），拼在最后以便覆盖默认措辞。
 pub fn assemble(extra: Option<&str>, cwd: &str) -> Option<xharness_prompt::PromptAssembly> {
-    assemble_with(
-        extra,
-        cwd,
-        std::env::var("XH_FS_PROMPT_DIR").ok().as_deref(),
-    )
+    assemble_with(extra, cwd, std::env::var("XH_FS_PROMPT_DIR").ok().as_deref())
 }
 
 /// `override_dir` 存在时，用其中同名 .md 文件替换对应段落。
@@ -105,23 +101,11 @@ pub fn assemble_with(
 
     let mut sections = vec![
         PromptSection::new("agent/preset", "1", pick("agent-preset", AGENT_PRESET)),
-        PromptSection::new(
-            "permission/policy",
-            "1",
-            pick("permission-policy", PERMISSION_POLICY),
-        ),
+        PromptSection::new("permission/policy", "1", pick("permission-policy", PERMISSION_POLICY)),
         PromptSection::new("workspace/context", "1", workspace),
-        PromptSection::new(
-            "coding/workflow",
-            "2",
-            pick("coding-workflow", CODING_WORKFLOW),
-        ),
+        PromptSection::new("coding/workflow", "2", pick("coding-workflow", CODING_WORKFLOW)),
         PromptSection::new("tool/jobs", "6", pick("tool-jobs", TOOL_JOBS)),
-        PromptSection::new(
-            "feishu/environment",
-            "1",
-            pick("feishu-environment", FEISHU_ENVIRONMENT),
-        ),
+        PromptSection::new("feishu/environment", "1", pick("feishu-environment", FEISHU_ENVIRONMENT)),
     ];
     if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
         sections.push(PromptSection::new("caller/instructions", "1", extra));
@@ -140,10 +124,7 @@ pub fn load_override(dir: &Path, name: &str, fallback: &str) -> String {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => fallback.to_owned(),
         Err(error) => {
-            eprintln!(
-                "[xh-fs][prompt] 读取 {} 失败({error})，用内置版本",
-                path.display()
-            );
+            eprintln!("[xh-fs][prompt] 读取 {} 失败({error})，用内置版本", path.display());
             fallback.to_owned()
         }
     }

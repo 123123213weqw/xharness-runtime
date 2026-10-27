@@ -18,7 +18,7 @@ use xharness_jobs::{JobRegistry, JobRegistryConfig};
 use xharness_platform::{NativePlatform, PlatformConfig};
 use xharness_sandbox::{NetworkAccess, SandboxMode};
 use xharness_tools::{ToolExecutor, ToolRegistry};
-use xharness_web::{DeepSeekSearchProvider, SearchProvider, WebRuntime};
+use xharness_web::{DeepSeekSearchProvider, WebRuntime, SearchProvider};
 
 /// 每个 session 的 workspace 由调用方给出；这里只负责把工具挂上去。
 pub struct FeishuToolFactory {

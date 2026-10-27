@@ -73,10 +73,7 @@ fn payload(text: &str) -> TaskPayload {
 fn session_id_is_filesystem_safe() {
     assert_eq!(session_id_for("oc_abc123", None), "fs-oc_abc123");
     assert_eq!(session_id_for("a/b:c", None), "fs-a_b_c");
-    assert_eq!(
-        session_id_for("chat", Some("custom-name")),
-        "fs-custom-name"
-    );
+    assert_eq!(session_id_for("chat", Some("custom-name")), "fs-custom-name");
     // 路径分隔符必须被折叠，否则 workspace 目录可能逃逸出 state_root
     assert!(!session_id_for("../evil", None).contains('/'));
     assert!(!session_id_for("..\\evil", None).contains('\\'));
@@ -185,12 +182,7 @@ fn the_prompt_mirrors_the_upstream_sections() {
     // 段落 id 不会出现在 system 文本里（assembler 只拼 content），
     // 所以要从 audit 里断言——这才是能直接和上游 diff 的东西。
     let assembly = assemble(None, WS).expect("应当能组装");
-    let ids: Vec<&str> = assembly
-        .audit()
-        .sections
-        .iter()
-        .map(|s| s.id.as_str())
-        .collect();
+    let ids: Vec<&str> = assembly.audit().sections.iter().map(|s| s.id.as_str()).collect();
     for id in [
         "agent/preset",
         "permission/policy",
@@ -219,10 +211,7 @@ fn the_feishu_layer_covers_what_the_upstream_cannot_know() {
     use xharness_feishu::prompt::system_text;
     let text = system_text(None, WS).expect("assemble");
     // 这四条都是实测踩出来的，上游没有对应段落。
-    assert!(
-        text.contains("隔离") || text.contains("屏蔽"),
-        "没说明路径不可见"
-    );
+    assert!(text.contains("隔离") || text.contains("屏蔽"), "没说明路径不可见");
     assert!(text.contains("没有网络访问"), "没说明断网");
     assert!(text.contains("默认不要做全盘扫描"), "没限制全盘扫描");
     assert!(text.contains("原始错误输出"), "没要求贴原始错误");
@@ -234,7 +223,10 @@ fn the_feishu_section_does_not_repeat_the_shared_sections() {
     // 也让模型难以判断哪条更权威。
     use xharness_feishu::prompt::{AGENT_PRESET, FEISHU_ENVIRONMENT};
 
-    for (concept, in_preset) in [("concise", "concisely"), ("evidence", "without evidence")] {
+    for (concept, in_preset) in [
+        ("concise", "concisely"),
+        ("evidence", "without evidence"),
+    ] {
         assert!(AGENT_PRESET.contains(in_preset), "前置假设变了: {concept}");
         assert!(
             !FEISHU_ENVIRONMENT.to_lowercase().contains(concept),
@@ -243,10 +235,7 @@ fn the_feishu_section_does_not_repeat_the_shared_sections() {
     }
     // 中文版的对应词也不该出现
     assert!(!FEISHU_ENVIRONMENT.contains("要简洁"), "重复表述简洁");
-    assert!(
-        !FEISHU_ENVIRONMENT.contains("不要凭想象"),
-        "重复表述不可编造"
-    );
+    assert!(!FEISHU_ENVIRONMENT.contains("不要凭想象"), "重复表述不可编造");
 }
 
 #[test]
@@ -254,9 +243,7 @@ fn caller_instructions_are_appended_last() {
     use xharness_feishu::prompt::system_text;
     let text = system_text(Some("你是月光的小助手"), WS).expect("assemble");
     let last = text.find("你是月光的小助手").expect("caller section");
-    let workflow = text
-        .find("make the smallest coherent change")
-        .expect("workflow");
+    let workflow = text.find("make the smallest coherent change").expect("workflow");
     assert!(workflow < last, "调用方指令应当排在最后");
 }
 
@@ -306,3 +293,4 @@ fn an_empty_prompt_file_falls_back_instead_of_blanking() {
     assert!(text.contains("没有网络访问"), "空文件不应把整段清空");
     let _ = std::fs::remove_dir_all(&dir);
 }
+

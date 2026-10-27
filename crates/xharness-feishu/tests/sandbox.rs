@@ -12,6 +12,36 @@ use xharness_tools::ToolRequest;
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
+
+/// 真正驱动沙箱的测试需要 bwrap；没有它时**必须跳过，而不是失败**。
+///
+/// 这条是 CI 教出来的：GitHub runner 没装 bubblewrap，测试直接以
+/// "native sandbox is unavailable: cannot find bwrap in PATH" 失败，把上游同步
+/// 整条卡住了（sync-upstream 会跑全 workspace 测试）。
+///
+/// 更麻烦的是假通过：`network_is_denied_by_default` 在没有 bwrap 时也"通过"了，
+/// 因为沙箱根本起不来、命令必然失败 —— 它测的其实是"失败了"，不是"网络被拒绝"。
+/// 所以两个测试都必须在 bwrap 缺席时显式跳过。
+fn bwrap_available() -> bool {
+    std::process::Command::new("bwrap")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// 跳过时的统一说明，避免"静默通过"看起来像验过了。
+macro_rules! require_bwrap {
+    () => {
+        if !bwrap_available() {
+            eprintln!("跳过：本机没有 bwrap，沙箱相关断言无法验证");
+            return;
+        }
+    };
+}
+
 fn fresh_workspace(tag: &str) -> std::path::PathBuf {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("xh-fs-sbx-{tag}-{}-{n}", std::process::id()));
@@ -31,6 +61,7 @@ async fn executor_for(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn workspace_write_is_confined_to_the_workspace() {
+    require_bwrap!();
     let cwd = fresh_workspace("confined");
     let exec = executor_for(&cwd, PermissionPreset::WorkspaceWrite).await;
 
@@ -57,6 +88,7 @@ async fn workspace_write_is_confined_to_the_workspace() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn bash_cannot_write_outside_workspace_under_sandbox() {
+    require_bwrap!();
     let cwd = fresh_workspace("bash");
     let exec = executor_for(&cwd, PermissionPreset::WorkspaceWrite).await;
 
@@ -108,6 +140,7 @@ async fn bash_cannot_write_outside_workspace_under_sandbox() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn network_is_denied_by_default() {
+    require_bwrap!();
     let cwd = fresh_workspace("net");
     let exec = executor_for(&cwd, PermissionPreset::WorkspaceWrite).await;
     let names = registered_tool_names(&cwd).await;
@@ -141,8 +174,9 @@ async fn registered_tool_names(cwd: &std::path::Path) -> Vec<String> {
     use xharness_platform::{NativePlatform, PlatformConfig};
     use xharness_web::WebRuntime;
 
-    let platform =
-        Arc::new(NativePlatform::new(PlatformConfig::new(cwd).full_access()).expect("platform"));
+    let platform = Arc::new(
+        NativePlatform::new(PlatformConfig::new(cwd).full_access()).expect("platform"),
+    );
     let bundle = CodingToolBundle::new(
         platform,
         Arc::new(JobRegistry::new(JobRegistryConfig::default())),
@@ -150,11 +184,7 @@ async fn registered_tool_names(cwd: &std::path::Path) -> Vec<String> {
         "probe",
         "probe",
     );
-    bundle
-        .specs()
-        .iter()
-        .map(|s| s.definition.name.clone())
-        .collect()
+    bundle.specs().iter().map(|s| s.definition.name.clone()).collect()
 }
 
 // ---- 挂载遮挡：验证明明是"沙箱里读不到"，而不是"该文件本来就不存在" ----
@@ -169,12 +199,7 @@ fn secrets_under_home_are_masked_but_workspace_is_not() {
     let masked = masked_paths_with(Some(home), workspace, |_| true, |_| false);
 
     // 必须遮的关键位置
-    for must in [
-        "/home/wzu/bots",
-        "/home/wzu/.ssh",
-        "/home/wzu/.aws",
-        "/etc/shadow",
-    ] {
+    for must in ["/home/wzu/bots", "/home/wzu/.ssh", "/home/wzu/.aws", "/etc/shadow"] {
         assert!(
             masked.iter().any(|p| p == std::path::Path::new(must)),
             "{must} 应当被遮挡，实际: {masked:?}"
@@ -198,9 +223,7 @@ fn a_workspace_inside_a_masked_dir_removes_that_mask() {
     // 注入全部存在，验证列表完整性（真实环境只遮存在的见下一个测试）
     let masked = masked_paths_with(Some(home), workspace, |_| true, |_| false);
     assert!(
-        !masked
-            .iter()
-            .any(|p| p == std::path::Path::new("/home/wzu/fs-state")),
+        !masked.iter().any(|p| p == std::path::Path::new("/home/wzu/fs-state")),
         "祖先目录被遮会让 workspace 一起消失: {masked:?}"
     );
 }
@@ -210,9 +233,7 @@ fn masking_works_without_a_home_directory() {
     use xharness_feishu::sandbox_shim::masked_paths_with;
     let masked = masked_paths_with(None, std::path::Path::new("/tmp/ws"), |_| true, |_| false);
     // 没有 HOME 时仍要遮绝对路径
-    assert!(masked
-        .iter()
-        .any(|p| p == std::path::Path::new("/etc/shadow")));
+    assert!(masked.iter().any(|p| p == std::path::Path::new("/etc/shadow")));
     assert!(!masked.iter().any(|p| p.starts_with("/home")));
 }
 
@@ -230,14 +251,8 @@ fn nonexistent_paths_are_not_masked() {
         |p| p == std::path::Path::new("/home/wzu/bots"),
         |_| false,
     );
-    let rendered: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    assert!(
-        rendered.contains(&"/home/wzu/bots".to_owned()),
-        "{rendered:?}"
-    );
+    let rendered: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    assert!(rendered.contains(&"/home/wzu/bots".to_owned()), "{rendered:?}");
     assert!(
         !rendered.contains(&"/home/wzu/.aws".to_owned()),
         "不存在的路径不应当被遮挡: {rendered:?}"
@@ -257,10 +272,7 @@ fn files_are_masked_with_dev_null_not_tmpfs() {
         |p| p == std::path::Path::new("/home/wzu/.npmrc"),
         |p| p == std::path::Path::new("/home/wzu/.npmrc"),
     );
-    let rendered: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
+    let rendered: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
     assert!(rendered.contains(&"--ro-bind".to_owned()), "{rendered:?}");
     assert!(rendered.contains(&"/dev/null".to_owned()), "{rendered:?}");
     assert!(!rendered.contains(&"--tmpfs".to_owned()), "{rendered:?}");

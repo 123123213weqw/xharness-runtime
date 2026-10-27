@@ -17,7 +17,9 @@ use xharness_agent::FileLeaseManager;
 use xharness_context::ToolResultPruningContextPolicy;
 use xharness_feishu::{router, FeishuHostState, FeishuScriptedProvider, FeishuToolFactory};
 use xharness_gh::deployment::{build_registry, SingleModelDeployment};
-use xharness_host::{DurableLoopAgentRuntime, ModelRoute, PermissionPreset};
+use xharness_host::{
+    DurableLoopAgentRuntime, ModelRoute, PermissionPreset,
+};
 use xharness_provider_openai::OpenAiProtocol;
 use xharness_session_jsonl::JsonlSessionStore;
 

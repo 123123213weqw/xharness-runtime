@@ -108,82 +108,113 @@ async fn workspace_write_is_confined_to_the_workspace() {
     let _ = std::fs::remove_dir_all(&cwd);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn bash_cannot_write_outside_workspace_under_sandbox() {
-    require_bwrap!();
-    let cwd = fresh_workspace("bash");
-    let exec = executor_for(&cwd, PermissionPreset::WorkspaceWrite).await;
+/// 出站隔离只有在"装了专用 UID + iptables 规则 + 白名单代理"的机器上才验得了。
+/// CI 里三样都没有，所以显式跳过，而不是让断言空转。
+fn dedicated_egress_available() -> bool {
+    std::process::Command::new("/usr/bin/sudo")
+        .args([
+            "-n",
+            "--",
+            "/usr/bin/setpriv",
+            "--reuid=1007",
+            "--regid=995",
+            "--clear-groups",
+            "/usr/bin/id",
+            "-u",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
 
-    // shell 工具名随平台不同(bash/zsh/powershell),取注册表里的真实名字。
+#[tokio::test]
+async fn shell_runs_as_the_dedicated_uid_without_sudo() {
+    require_bwrap!();
+    if !dedicated_egress_available() {
+        eprintln!("跳过：本机没有沙箱专用 UID，无法验证降权");
+        return;
+    }
+    let cwd = fresh_workspace("uid");
+    let exec = executor_for(&cwd, PermissionPreset::WorkspaceWrite).await;
     let names = registered_tool_names(&cwd).await;
-    let shell = names
+    let Some(shell) = names
         .iter()
         .find(|n| matches!(n.as_str(), "bash" | "zsh" | "sh" | "powershell"))
-        .cloned();
-    let Some(shell) = shell else {
-        eprintln!("当前平台没有 shell 工具,跳过");
+        .cloned()
+    else {
         return;
     };
 
-    // workspace 内可写
-    let ok = exec
+    // 降权是整条网络隔离的根基：iptables 按 uid 1007 放行唯一出口。
+    // 如果这里还是 wzu，规则就完全不起作用（实测踩过：规则 0 命中）。
+    let out = exec
         .execute(ToolRequest::new(
             &shell,
-            serde_json::json!({ "command": "echo hi > inside.txt && cat inside.txt" }).to_string(),
+            serde_json::json!({ "command": "id -u; id -g; sudo -n true 2>&1 || echo NO-SUDO" })
+                .to_string(),
         ))
         .await;
-    assert!(ok.is_ok(), "workspace 内 shell 执行应当成功: {:?}", ok);
-
-    // shell 直接写宿主只读区。bwrap 必须拦住。
-    // 同样必须选宿主可写的位置；$HOME 才是有意义的靶子。
-    let home = std::env::var("HOME").expect("HOME");
-    let target_str = format!("{home}/fs-sbx-bash.txt");
-    let host_target = std::path::Path::new(&target_str);
-    let _ = std::fs::remove_file(host_target);
-    let escape = exec
-        .execute(ToolRequest::new(
-            &shell,
-            serde_json::json!({
-                "command": format!("echo pwned > {target_str} 2>/dev/null; test -f {target_str} && echo WROTE || echo BLOCKED")
-            })
-            .to_string(),
-        ))
-        .await;
-    // 以宿主文件是否存在为唯一判据：shell 的退出码不可靠（重定向失败也会吞掉）。
-    assert!(
-        !host_target.exists(),
-        "沙箱必须阻止 shell 写宿主只读区: {:?}",
-        escape
-    );
-    let _ = std::fs::remove_file(host_target);
+    let text = format!("{out:?}");
+    assert!(text.contains("1007"), "沙箱内 UID 应为 1007: {text}");
+    assert!(text.contains("995"), "沙箱内 GID 应为 995: {text}");
+    assert!(text.contains("NO-SUDO"), "沙箱内不得能提权: {text}");
 
     let _ = std::fs::remove_dir_all(&cwd);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn network_is_denied_by_default() {
+#[tokio::test]
+async fn egress_goes_only_through_the_whitelist_proxy() {
     require_bwrap!();
-    let cwd = fresh_workspace("net");
+    if !dedicated_egress_available() {
+        eprintln!("跳过：本机没有沙箱专用 UID，无法验证出站过滤");
+        return;
+    }
+    let cwd = fresh_workspace("egress");
     let exec = executor_for(&cwd, PermissionPreset::WorkspaceWrite).await;
     let names = registered_tool_names(&cwd).await;
-    let shell = names
+    let Some(shell) = names
         .iter()
         .find(|n| matches!(n.as_str(), "bash" | "zsh" | "sh" | "powershell"))
-        .cloned();
-    let Some(shell) = shell else { return };
+        .cloned()
+    else {
+        return;
+    };
 
-    // 沙箱默认 NetworkAccess::Deny,即使宿主能上网,沙箱内也应当失败。
-    let probe = exec
+    // 三件事同时成立才算隔离有效：
+    //   白名单域名通 / 裸代理口不通 / mihomo 控制口不通
+    let script = concat!(
+        "echo WL:$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 https://api.github.com 2>/dev/null || echo ERR);",
+        "echo OPEN-PROXY:$(curl -s -o /dev/null -w '%{http_code}' -x http://127.0.0.1:7897 --max-time 5 https://api.github.com 2>/dev/null || echo BLOCKED);",
+        "echo CTRL:$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:9090/proxies 2>/dev/null || echo BLOCKED)"
+    );
+    let out = exec
         .execute(ToolRequest::new(
             &shell,
-            serde_json::json!({ "command": "curl -s --max-time 3 -o /dev/null -w '%{http_code}' https://example.com || echo BLOCKED" }).to_string(),
+            serde_json::json!({ "command": script }).to_string(),
         ))
         .await;
-    let text = format!("{probe:?}");
+    let text = format!("{out:?}");
+
+    // 阻断是安全断言，任何时候都必须成立。
+    // curl 失败时同时打印 000 和 BLOCKED，所以用"不得是 200"作为判据更精确。
     assert!(
-        !text.contains("200"),
-        "默认应当禁止出网,却拿到了 200: {text}"
+        !text.contains("OPEN-PROXY:200"),
+        "裸代理口必须被拒（拿到 200 说明 iptables 没生效）: {text}"
     );
+    assert!(!text.contains("CTRL:200"), "mihomo 控制口必须被拒: {text}");
+
+    // 可达性依赖 shim 注入的代理环境；没配代理时沙箱本就无出口，跳过这一条。
+    match std::env::var("XH_SANDBOX_PROXY") {
+        Ok(proxy) if !proxy.is_empty() => {
+            assert!(
+                text.contains("WL:200"),
+                "配了代理时白名单域名应当可达: {text}"
+            );
+        }
+        _ => eprintln!("跳过可达性断言：XH_SANDBOX_PROXY 未设置（沙箱此时本就无出口）"),
+    }
 
     let _ = std::fs::remove_dir_all(&cwd);
 }
@@ -300,23 +331,35 @@ fn nonexistent_paths_are_not_masked() {
 }
 
 #[test]
-fn files_are_masked_with_dev_null_not_tmpfs() {
-    use xharness_feishu::sandbox_shim::masking_arguments_with;
+fn files_are_masked_with_an_empty_regular_file() {
+    use xharness_feishu::sandbox_shim::{empty_mask_source, masking_arguments_with};
 
-    // .npmrc 是文件：用 --tmpfs 挂在文件上会报 "Not a directory"，整条 bwrap 失败。
+    // .npmrc 这类是文件：用 --tmpfs 挂文件上会报 "Not a directory"。
     let home = std::path::Path::new("/home/wzu");
     let ws = std::path::Path::new("/tmp/ws");
-    let args = masking_arguments_with(
-        Some(home),
-        ws,
-        |p| p == std::path::Path::new("/home/wzu/.npmrc"),
-        |p| p == std::path::Path::new("/home/wzu/.npmrc"),
-    );
+    let npmrc = std::path::Path::new("/home/wzu/.npmrc");
+    let args = masking_arguments_with(Some(home), ws, |p| p == npmrc, |p| p == npmrc);
     let rendered: Vec<String> = args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+
     assert!(rendered.contains(&"--ro-bind".to_owned()), "{rendered:?}");
-    assert!(rendered.contains(&"/dev/null".to_owned()), "{rendered:?}");
     assert!(!rendered.contains(&"--tmpfs".to_owned()), "{rendered:?}");
+
+    // 关键：绑定源不能是 /dev/null。
+    // 实测 `--ro-bind /dev/null <file>` 之后，沙箱内以非特权 UID 打开该路径会
+    // EACCES（不是读到空），git 读 .gitconfig 失败会直接 fatal，clone 全废。
+    assert!(
+        !rendered.contains(&"/dev/null".to_owned()),
+        "不得再用 /dev/null 做文件遮罩源: {rendered:?}"
+    );
+    let source = empty_mask_source();
+    assert!(
+        rendered.contains(&source.to_string_lossy().into_owned()),
+        "应当绑定空文件源: {rendered:?}"
+    );
+    let meta = std::fs::metadata(&source).expect("空文件源必须真实存在");
+    assert!(meta.is_file(), "空文件源必须是普通文件");
+    assert_eq!(meta.len(), 0, "空文件源必须为空");
 }

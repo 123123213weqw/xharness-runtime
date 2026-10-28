@@ -88,7 +88,10 @@ impl SessionToolFactory for FeishuToolFactory {
         let config = if use_sandbox {
             PlatformConfig::new(cwd)
                 .sandbox_mode(SandboxMode::WorkspaceWrite)
-                .network(NetworkAccess::Deny)
+                // 允许网络，但出口只有白名单代理一个口：内核按 UID 1007
+                // 只放行 127.0.0.1:7898，其余（mihomo 7897、控制口 9090、
+                // 本服务 3082、Tailscale、LAN、公网直连）一律 REJECT。
+                .network(NetworkAccess::Allow)
         } else {
             // 显式逃生口,仅用于排查沙箱本身的问题。
             PlatformConfig::new(cwd).full_access()

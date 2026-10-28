@@ -30,6 +30,15 @@ const HIDDEN_UNDER_HOME: &[&str] = &[
     ".npmrc",
     ".pypirc",
     ".git-credentials",
+    // git 的全局配置常把代理写死（本机就是 127.0.0.1:17897），会覆盖沙箱注入的
+    // http_proxy，于是唯一出口被绕过、命令直接失败。它也可能含 url 改写和
+    // 凭据助手，沙箱里不需要。
+    ".gitconfig",
+    // pip 的 index 一般指向国内镜像（本机是 mirrors.huaweicloud.com），那是
+    // 白名单之外的域名。遮掉后回落到 PyPI，走白名单里的 pypi.org。
+    ".pip",
+    ".condarc",
+    ".cargo/credentials.toml",
     "bots",         // 飞书 bot：.env 里有全套凭据
     "score-api-ts", // 另一个 .env：教学项目 key + 数据库 URL
     "fs-state",     // 自己的会话/工作区仍要可见？见下：单独挂
@@ -39,6 +48,24 @@ const HIDDEN_UNDER_HOME: &[&str] = &[
 const HIDDEN_ABSOLUTE: &[&str] = &["/etc/shadow", "/etc/sudoers", "/root"];
 
 /// 生成遮挡参数。`workspace` 会被重新挂回去，所以删掉与它冲突的项。
+/// 供文件遮罩使用的空文件。
+///
+/// 不能用 `/dev/null` 当绑定源：沙箱内以非特权 UID 打开会 EACCES。
+/// 也不能放在 /tmp —— 沙箱会先把 /tmp 换成 tmpfs，绑定源随之消失。
+/// /var/tmp 既不被替换，也允许普通用户创建。
+pub fn empty_mask_source() -> OsString {
+    let path = Path::new("/var/tmp/.xh-empty-mask");
+    if !path.exists() {
+        let _ = std::fs::write(path, b"");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+        }
+    }
+    path.as_os_str().to_owned()
+}
+
 pub fn masking_arguments(home: Option<&Path>, workspace: &Path) -> Vec<OsString> {
     masking_arguments_with(home, workspace, |path| path.exists(), |path| path.is_file())
 }
@@ -65,8 +92,12 @@ pub fn masking_arguments_with(
         // "Not a directory"（.npmrc、.netrc 这类就是文件）。
         // 文件用空文件覆盖，读出来是空，但路径仍存在，不会让工具报奇怪的错。
         if is_file(path) {
+            // 实测：`--ro-bind /dev/null <file>` 得到的路径虽然存在且是 666 的
+            // 字符设备，但沙箱内的非特权 UID 打开会 EACCES（不是读到空）。
+            // git 对 .gitconfig 读失败是致命错误，直接把 clone 打断。
+            // 改成绑定一个真实的空文件：可读、内容为空、路径仍在。
             args.push(OsString::from("--ro-bind"));
-            args.push(OsString::from("/dev/null"));
+            args.push(empty_mask_source());
             args.push(path.as_os_str().to_owned());
         } else {
             args.push(OsString::from("--tmpfs"));

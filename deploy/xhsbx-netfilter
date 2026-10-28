@@ -1,0 +1,18 @@
+#!/bin/bash
+# 沙箱 UID 的出站过滤。幂等，可重复执行。
+# 注意：必须插在 OUTPUT 首位 —— ufw-before-output 会 ACCEPT 掉所有出站包，
+# 挂在链尾等于不生效（这是实测踩到的坑）。
+set -euo pipefail
+UID_SBX="${UID_SBX:-1007}"
+CHAIN=XHSBX_OUT
+
+iptables -N "$CHAIN" 2>/dev/null || true
+iptables -F "$CHAIN"
+iptables -A "$CHAIN" -d 127.0.0.1 -p tcp --dport 7898 -j ACCEPT
+iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A "$CHAIN" -j REJECT --reject-with icmp-port-unreachable
+
+while iptables -C OUTPUT -m owner --uid-owner "$UID_SBX" -j "$CHAIN" 2>/dev/null; do
+  iptables -D OUTPUT -m owner --uid-owner "$UID_SBX" -j "$CHAIN"
+done
+iptables -I OUTPUT 1 -m owner --uid-owner "$UID_SBX" -j "$CHAIN"

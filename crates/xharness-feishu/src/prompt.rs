@@ -44,6 +44,18 @@ For long immediate non-interactive work, prefer bash with run_in_background=true
 job_id, continue independent work, collect with job_output and stop unneeded work with \
 job_kill. Failure/killed/interrupted is not success. Use grep for workspace text.";
 
+/// 会话任务清单。
+///
+/// 语义借自 zcode 0.17 的 TodoWrite：清单是给用户看的工作计划，每次全量替换，
+/// 同一时刻只允许一项在跑。这里只放"什么时候该用"的边界，存储与校验在
+/// `crate::todo`——工具描述里已经写了怎么调用，提示词不重复一遍参数格式。
+pub const TOOL_TODO: &str = "\
+Maintain the session task list with todo_write / todo_read. For work that needs several \
+distinct steps, spans several turns, or is likely to be interrupted, write the plan first and \
+treat the list as the promise to the user. Each todo_write replaces the whole list: keep at \
+most one item in_progress, mark it completed as soon as it is verified, and drop items that \
+stopped mattering. Skip the list for a single-step task.";
+
 /// 飞书场景补充：上游没有这一层（它是桌面/CLI 场景）。
 ///
 /// **刻意只写上游没说过的东西。** 第一版这里是 1214 字节，其中「回复要简洁」
@@ -117,6 +129,7 @@ pub fn assemble_with(
             pick("coding-workflow", CODING_WORKFLOW),
         ),
         PromptSection::new("tool/jobs", "6", pick("tool-jobs", TOOL_JOBS)),
+        PromptSection::new("tool/todo", "1", pick("tool-todo", TOOL_TODO)),
         PromptSection::new(
             "feishu/environment",
             "1",

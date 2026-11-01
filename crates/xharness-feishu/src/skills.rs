@@ -44,9 +44,9 @@ const MAX_DEPTH: usize = 3;
 const MAX_NAME_CHARS: usize = 64;
 /// 清单里 description 的最大字符数。
 const MAX_DESCRIPTION_CHARS: usize = 500;
-/// 整份技能清单的字符预算（政策文本之外），对齐 Codex 的 catalog 预算思路：
+/// 整份技能清单的字节预算（政策文本之外），对齐 Codex 的 catalog 预算思路：
 /// 技能再多也不能把 system prompt 吃光。
-const MAX_LISTING_CHARS: usize = 10_000;
+const MAX_LISTING_BYTES: usize = 10_000;
 /// 读取用的逻辑 session id；`FsService` 只要求非空。
 const READ_SESSION: &str = "prompt-skills";
 /// prompt 段 id。
@@ -286,7 +286,7 @@ pub fn prompt_section(skills: &[Skill]) -> Option<PromptSection> {
     content.push_str("\n\n## Available Skills\n\n");
     for skill in skills {
         let line = format!("- **{}**: {}\n", skill.name, skill.description);
-        if content.len() + line.len() > POLICY.len() + MAX_LISTING_CHARS {
+        if content.len() + line.len() > POLICY.len() + MAX_LISTING_BYTES {
             content.push_str("- (more skills omitted to stay within the prompt budget)\n");
             break;
         }
@@ -350,16 +350,21 @@ async fn load(workspace: &Path, arguments: &Value) -> Result<ToolOutput, ToolHan
             "技能 {name:?} 不存在；可用技能: {available}"
         )));
     };
-    let base = workspace.join(&skill.relative_dir);
-    let base = std::fs::canonicalize(&base).unwrap_or(base);
+    // 输出 workspace 相对路径：WorkspaceWrite 下 FsService 拒绝绝对路径，模型
+    // 直接拿这个路径去 read/glob 才可用（沙箱内 workspace 映射在同一位置）。
+    let base = if skill.relative_dir.is_empty() {
+        "."
+    } else {
+        skill.relative_dir.as_str()
+    };
     Ok(ToolOutput::text(format!(
         "<skill_content name=\"{}\">\n# Skill: {}\n\n{}\n\nBase directory for this skill: {}\n\
          Relative paths in this skill (scripts/, references/, assets/) are relative to this base \
-         directory.\n</skill_content>",
+         directory; resolve them against the workspace root.\n</skill_content>",
         skill.name,
         skill.name,
         skill.body.trim(),
-        base.display()
+        base
     )))
 }
 
@@ -507,7 +512,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let section = prompt_section(&skills).expect("section");
-        assert!(section.content.len() <= POLICY.len() + MAX_LISTING_CHARS + 200);
+        assert!(section.content.len() <= POLICY.len() + MAX_LISTING_BYTES + 200);
         assert!(section.content.contains("more skills omitted"));
     }
 

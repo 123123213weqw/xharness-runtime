@@ -292,7 +292,8 @@ pub fn prompt_section(skills: &[Skill]) -> Option<PromptSection> {
         }
         content.push_str(&line);
     }
-    Some(PromptSection::new(SECTION_ID, "1", content))
+    // 技能清单是工作区动态内容：用内容哈希做版本，audit 才能反映改了什么。
+    Some(PromptSection::content_addressed(SECTION_ID, content))
 }
 
 /// 挂到 Feishu host 上的 `skill` 工具。

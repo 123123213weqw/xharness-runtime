@@ -70,21 +70,23 @@ pub const FEISHU_ENVIRONMENT: &str = "\
 
 /// 组合出完整的 system prompt。
 ///
-/// `cwd` 会写进 workspace/context，与上游同格式。
+/// `cwd` 会写进 workspace/context，与上游同格式；同时也是 AGENTS.md 与
+/// 工作区技能的发现根。
 /// `extra` 来自调用方（飞书侧的角色设定），拼在最后以便覆盖默认措辞。
-pub fn assemble(extra: Option<&str>, cwd: &str) -> Option<xharness_prompt::PromptAssembly> {
+pub async fn assemble(extra: Option<&str>, cwd: &str) -> Option<xharness_prompt::PromptAssembly> {
     assemble_with(
         extra,
         cwd,
         std::env::var("XH_FS_PROMPT_DIR").ok().as_deref(),
     )
+    .await
 }
 
 /// `override_dir` 存在时，用其中同名 .md 文件替换对应段落。
 ///
 /// 调提示词是高频动作、编译是低频能力，所以不该为了改一句话重编 Rust。
 /// 缺文件、空文件、读失败都回退内置 —— 提示词缺失不该让服务起不来。
-pub fn assemble_with(
+pub async fn assemble_with(
     extra: Option<&str>,
     cwd: &str,
     override_dir: Option<&str>,
@@ -123,6 +125,25 @@ pub fn assemble_with(
             pick("feishu-environment", FEISHU_ENVIRONMENT),
         ),
     ];
+    // 工作区项目指令（Codex / OpenCode 的 AGENTS.md 约定）。读取失败只记日志，
+    // 不让一份坏文件把整个 turn 拦掉；规则段始终在，内容段按文件存在与否决定。
+    let workspace = Path::new(cwd);
+    let loaded = match crate::instructions::load(workspace).await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("[xh-fs][prompt] 加载 AGENTS.md 失败({error})，按无项目指令处理");
+            None
+        }
+    };
+    sections.extend(crate::instructions::sections(&loaded, workspace));
+
+    // 工作区技能（OpenCode / Codex 的 SKILL.md 约定）。prompt 只放 name +
+    // description，正文由 skill 工具按需加载；没有技能就不加段，省 token。
+    let skills = crate::skills::discover(workspace).await;
+    if let Some(section) = crate::skills::prompt_section(&skills) {
+        sections.push(section);
+    }
+
     if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
         sections.push(PromptSection::new("caller/instructions", "1", extra));
     }
@@ -150,6 +171,6 @@ pub fn load_override(dir: &Path, name: &str, fallback: &str) -> String {
 }
 
 /// 供测试断言用的纯文本视图。
-pub fn system_text(extra: Option<&str>, cwd: &str) -> Option<String> {
-    assemble(extra, cwd).map(|a| a.system().to_owned())
+pub async fn system_text(extra: Option<&str>, cwd: &str) -> Option<String> {
+    assemble(extra, cwd).await.map(|a| a.system().to_owned())
 }

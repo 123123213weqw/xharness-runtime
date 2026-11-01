@@ -113,6 +113,9 @@ impl SessionToolFactory for FeishuToolFactory {
             .filter(|spec| spec.definition.name != "web_fetch")
             .collect();
         specs.push(crate::proxy_fetch::web_fetch_spec(self.proxy.clone()));
+        // 工作区技能：system prompt 只列 name/description，模型需要时再调 skill
+        // 读取正文。技能随 workspace 走，改完下一轮即可见，见 crate::skills。
+        specs.extend(crate::skills::specs(std::path::PathBuf::from(cwd)));
         // headless 没有审批 provider,非 full 档位会让每个工具都 ApprovalUnavailable。
         // 隔离由上面的 bwrap 沙箱保证,所以这里统一放开审批。
         let _ = permission;

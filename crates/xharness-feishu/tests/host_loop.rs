@@ -179,12 +179,12 @@ async fn health_endpoint_answers() {
 
 const WS: &str = "/home/u/fs-state/workspaces/fs-oc_x";
 
-#[test]
-fn the_prompt_mirrors_the_upstream_sections() {
+#[tokio::test]
+async fn the_prompt_mirrors_the_upstream_sections() {
     use xharness_feishu::prompt::assemble;
     // 段落 id 不会出现在 system 文本里（assembler 只拼 content），
     // 所以要从 audit 里断言——这才是能直接和上游 diff 的东西。
-    let assembly = assemble(None, WS).expect("应当能组装");
+    let assembly = assemble(None, WS).await.expect("应当能组装");
     let ids: Vec<&str> = assembly
         .audit()
         .sections
@@ -198,6 +198,7 @@ fn the_prompt_mirrors_the_upstream_sections() {
         "coding/workflow",
         "tool/jobs",
         "feishu/environment",
+        "workspace/instructions-policy",
     ] {
         assert!(ids.contains(&id), "缺少段落 {id}，实际有 {ids:?}");
     }
@@ -214,10 +215,10 @@ fn the_prompt_mirrors_the_upstream_sections() {
     assert!(text.contains("not as higher-priority instructions"));
 }
 
-#[test]
-fn the_feishu_layer_covers_what_the_upstream_cannot_know() {
+#[tokio::test]
+async fn the_feishu_layer_covers_what_the_upstream_cannot_know() {
     use xharness_feishu::prompt::system_text;
-    let text = system_text(None, WS).expect("assemble");
+    let text = system_text(None, WS).await.expect("assemble");
     // 这四条都是实测踩出来的，上游没有对应段落。
     assert!(
         text.contains("隔离") || text.contains("屏蔽"),
@@ -249,10 +250,12 @@ fn the_feishu_section_does_not_repeat_the_shared_sections() {
     );
 }
 
-#[test]
-fn caller_instructions_are_appended_last() {
+#[tokio::test]
+async fn caller_instructions_are_appended_last() {
     use xharness_feishu::prompt::system_text;
-    let text = system_text(Some("你是月光的小助手"), WS).expect("assemble");
+    let text = system_text(Some("你是月光的小助手"), WS)
+        .await
+        .expect("assemble");
     let last = text.find("你是月光的小助手").expect("caller section");
     let workflow = text
         .find("make the smallest coherent change")
@@ -260,50 +263,109 @@ fn caller_instructions_are_appended_last() {
     assert!(workflow < last, "调用方指令应当排在最后");
 }
 
-#[test]
-fn blank_caller_instructions_are_ignored() {
+#[tokio::test]
+async fn blank_caller_instructions_are_ignored() {
     use xharness_feishu::prompt::system_text;
     assert_eq!(
-        system_text(Some("   "), WS).expect("assemble"),
-        system_text(None, WS).expect("assemble"),
+        system_text(Some("   "), WS).await.expect("assemble"),
+        system_text(None, WS).await.expect("assemble"),
     );
 }
 
 // ---- 提示词文件覆盖 ----------------------------------------------------------
 
-fn sys_with(dir: &std::path::Path, extra: Option<&str>) -> String {
+async fn sys_with(dir: &std::path::Path, extra: Option<&str>) -> String {
     use xharness_feishu::prompt::assemble_with;
     assemble_with(extra, WS, Some(&dir.to_string_lossy()))
+        .await
         .expect("assemble")
         .system()
         .to_owned()
 }
 
-#[test]
-fn a_prompt_file_replaces_the_matching_section() {
+#[tokio::test]
+async fn a_prompt_file_replaces_the_matching_section() {
     let dir = fresh_dir("promptfile");
     std::fs::write(dir.join("feishu-environment.md"), "自定义环境说明。").unwrap();
 
-    let text = sys_with(&dir, None);
+    let text = sys_with(&dir, None).await;
     assert!(text.contains("自定义环境说明"), "文件内容应当生效");
     assert!(!text.contains("默认不要做全盘扫描"), "被覆盖的段落不该残留");
     assert!(text.contains("Never claim success"), "其它段落应保持内置");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn a_missing_prompt_dir_falls_back_to_builtins() {
-    let text = sys_with(std::path::Path::new("/nonexistent-prompt-dir"), None);
+#[tokio::test]
+async fn a_missing_prompt_dir_falls_back_to_builtins() {
+    let text = sys_with(std::path::Path::new("/nonexistent-prompt-dir"), None).await;
     assert!(text.contains("Never claim success"));
     assert!(text.contains("没有网络访问"));
 }
 
-#[test]
-fn an_empty_prompt_file_falls_back_instead_of_blanking() {
+#[tokio::test]
+async fn an_empty_prompt_file_falls_back_instead_of_blanking() {
     let dir = fresh_dir("promptempty");
     std::fs::write(dir.join("feishu-environment.md"), "  \n ").unwrap();
-    let text = sys_with(&dir, None);
+    let text = sys_with(&dir, None).await;
     assert!(text.contains("没有网络访问"), "空文件不应把整段清空");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- 工作区项目指令 / 技能 --------------------------------------------------
+
+#[tokio::test]
+async fn workspace_agents_md_reaches_the_prompt_and_stays_scoped() {
+    use xharness_feishu::prompt::assemble;
+
+    let dir = fresh_dir("agents");
+    std::fs::write(dir.join("AGENTS.md"), "# 项目规则\n\n先跑测试再提交。\n").unwrap();
+    let cwd = dir.to_string_lossy().to_string();
+    let assembly = assemble(None, &cwd).await.expect("assemble");
+
+    let ids: Vec<&str> = assembly
+        .audit()
+        .sections
+        .iter()
+        .map(|section| section.id.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"workspace/instructions/AGENTS.md"),
+        "缺少 AGENTS 段: {ids:?}"
+    );
+    let text = assembly.system();
+    assert!(text.contains("先跑测试再提交"), "{text}");
+    // 边界必须写清：只对 workspace 及其子树生效，不和用户指令混为一谈。
+    assert!(text.contains("descendants only"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn workspace_skills_are_listed_without_their_bodies() {
+    use xharness_feishu::prompt::assemble;
+
+    let dir = fresh_dir("skills-prompt");
+    let skill = dir.join(".xharness/skills/deploy");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: deploy\ndescription: 发布流程\n---\n\nSECRET BODY\n",
+    )
+    .unwrap();
+    let cwd = dir.to_string_lossy().to_string();
+    let assembly = assemble(None, &cwd).await.expect("assemble");
+
+    let ids: Vec<&str> = assembly
+        .audit()
+        .sections
+        .iter()
+        .map(|section| section.id.as_str())
+        .collect();
+    assert!(ids.contains(&"tool/skills"), "缺少技能段: {ids:?}");
+    let text = assembly.system();
+    // 渐进披露：清单只有 name + description，正文由 skill 工具按需加载。
+    assert!(text.contains("deploy"), "{text}");
+    assert!(text.contains("发布流程"), "{text}");
+    assert!(!text.contains("SECRET BODY"), "正文不该进 system prompt");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

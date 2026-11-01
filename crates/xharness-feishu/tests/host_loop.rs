@@ -215,6 +215,27 @@ fn the_prompt_mirrors_the_upstream_sections() {
 }
 
 #[test]
+fn the_task_list_section_is_present_and_teaches_the_boundary() {
+    use xharness_feishu::prompt::assemble;
+    let assembly = assemble(None, WS).expect("应当能组装");
+    let ids: Vec<&str> = assembly
+        .audit()
+        .sections
+        .iter()
+        .map(|s| s.id.as_str())
+        .collect();
+    assert!(ids.contains(&"tool/todo"), "缺少 tool/todo，实际有 {ids:?}");
+    let text = assembly.system();
+    // 工具名必须出现，否则模型不会把提示词和工具对上。
+    assert!(text.contains("todo_write") && text.contains("todo_read"));
+    // 边界：单步任务不建清单，避免把简单事拆成表演性计划。
+    assert!(text.contains("single-step"));
+    // 全量替换语义与"一项在跑"的约束。
+    assert!(text.contains("replaces the whole list"));
+    assert!(text.contains("one item in_progress"));
+}
+
+#[test]
 fn the_feishu_layer_covers_what_the_upstream_cannot_know() {
     use xharness_feishu::prompt::system_text;
     let text = system_text(None, WS).expect("assemble");
@@ -376,4 +397,38 @@ fn html_is_reduced_to_text_and_clipped() {
     let long = "字".repeat(MAX_TEXT_CHARS * 2);
     let clipped: String = long.chars().take(MAX_TEXT_CHARS).collect();
     assert_eq!(clipped.chars().count(), MAX_TEXT_CHARS);
+}
+
+// ---- 会话任务清单 ------------------------------------------------------------
+
+#[tokio::test]
+async fn the_feishu_bundle_registers_the_task_list_tools() {
+    use xharness_host::SessionToolFactory;
+
+    let dir = fresh_dir("tools");
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let factory = FeishuToolFactory::default();
+    let executor = factory
+        .executor(
+            "fs-test",
+            &workspace.to_string_lossy(),
+            PermissionPreset::DangerFullAccess,
+        )
+        .await
+        .expect("executor");
+    let names: Vec<String> = executor
+        .registry()
+        .definitions()
+        .await
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    for name in ["todo_write", "todo_read"] {
+        assert!(
+            names.iter().any(|candidate| candidate == name),
+            "缺少工具 {name}，实际有 {names:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

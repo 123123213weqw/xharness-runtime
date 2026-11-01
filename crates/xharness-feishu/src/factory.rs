@@ -113,6 +113,9 @@ impl SessionToolFactory for FeishuToolFactory {
             .filter(|spec| spec.definition.name != "web_fetch")
             .collect();
         specs.push(crate::proxy_fetch::web_fetch_spec(self.proxy.clone()));
+        // 会话任务清单（zcode 的 TodoRead/TodoWrite 语义）。状态落在 workspace，
+        // 一个 workspace 对应一个 durable session，重启后还能读回，见 crate::todo。
+        specs.extend(crate::todo::specs(cwd));
         // headless 没有审批 provider,非 full 档位会让每个工具都 ApprovalUnavailable。
         // 隔离由上面的 bwrap 沙箱保证,所以这里统一放开审批。
         let _ = permission;

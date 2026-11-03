@@ -19,5 +19,8 @@ apps/desktop/src-tauri/resources/powershell/
 __pycache__/
 *.py[cod]
 
+# Private local receipts and complete remote SDK compiler/test logs.
+.sdk-evidence/
+
 # Browser Use is an optional source-built plugin, not a checked-in bundle.
 /plugins/browser-use/dist/

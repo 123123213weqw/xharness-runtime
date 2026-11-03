@@ -4,6 +4,15 @@ XHarness 的 headless 运行时核心:从 [x-harness-rs](https://github.com/1231
 
 Apache-2.0。状态:**拆分验证中,尚未发布。**
 
+## 嵌入式 Rust SDK
+
+新增 [`xharness-sdk`](crates/xharness-sdk/README.md) 0.1：复用现有 durable
+Runtime，提供模型/工具注入、会话执行与单会话恢复、事件、取消和关闭。
+不另开仓库，不增加第二个 Loop/聊天存储，不启动业务来源或自动恢复扫描。
+当前是开发 API，尚未迁入 SuperAgent，也未发布到 crates.io 或部署生产。
+离线例子和测试均通过同一原生 Runtime；验证入口为
+`bash scripts/sdk/remote-validate.sh`，仅在独立 V100 目录编译测试。
+
 ## 包含什么
 
 | 组件 | 职责 |
@@ -19,7 +28,9 @@ Apache-2.0。状态:**拆分验证中,尚未发布。**
 
 ## 不包含什么(留在上游)
 
-`xharness-host`(会话控制面/RPC/UI 投影)、`xharness-server`(HTTP/WS/静态托管)、Tauri 桌面、移动端、Telegram/微信渠道、cloud、computer-use、keyring。需要 UI 或渠道时,请使用上游完整运行时。
+`xharness-server`(HTTP/WS/静态托管)、Tauri 桌面、移动端、Telegram/微信渠道、cloud、computer-use、keyring。需要 UI 或渠道时,请使用上游完整运行时。
+当前 Cargo 闭包已经包含 `xharness-host`，SDK 仍复用其中的原生执行接缝；
+“headless”指不启动 Web/桌面服务，不代表依赖图完全没有 host crate。
 
 ## 溯源
 

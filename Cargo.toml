@@ -24,6 +24,7 @@ members = [
     "crates/xharness-provider-openai",
     "crates/xharness-sandbox",
     "crates/xharness-schedule",
+    "crates/xharness-sdk",
     "crates/xharness-session",
     "crates/xharness-session-import",
     "crates/xharness-session-jsonl",

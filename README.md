@@ -12,6 +12,8 @@ Runtime，提供模型/工具注入、会话执行与单会话恢复、事件、
 当前是开发 API，尚未迁入 SuperAgent，也未发布到 crates.io 或部署生产。
 离线例子和测试均通过同一原生 Runtime；验证入口为
 `bash scripts/sdk/remote-validate.sh`，仅在独立 V100 目录编译测试。
+本批 8 项 SDK 测试及 984 项选定原生回归通过，11 项 ignored 不计通过；
+严格 SDK Clippy、文档和离线示例通过。见[验证范围与源码绑定](docs/sdk-verification.json)。
 
 ## 包含什么
 

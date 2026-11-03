@@ -88,7 +88,19 @@ Schema/handler 构造新 Runtime。默认不把运行中的调用改派到新版
 
 ## 版本跟随
 
-未来产品仓库通过 `git + rev = "<完整提交 SHA>"` 消费本 crate；同一产品若仍直接
-使用其他 XHarness crate，应统一到相同来源/提交，避免混用不同类型版本。
-在 SDK 提交被合并/发布前，不写一个不存在的发布版本。当前先在 Runtime 仓库
-完成源代码和离线验证，再进行产品迁移与独立的生产灰度。
+候选代码已上传 Runtime 原仓库的 `sdk/embedding-v1` 分支，尚未合并 main。
+可以固定已验证的源码提交试用，不需要另建仓库或等待 crates.io 发布：
+
+```toml
+[dependencies]
+xharness-sdk = { git = "https://github.com/123123213weqw/xharness-runtime", rev = "4e1b5cc457f5d629b9085f05c9666ca650f5e520" }
+```
+
+同一产品若仍直接使用其他 XHarness crate，应统一到相同来源/提交，避免混用
+不同类型版本。不能把 SuperAgent 当前含受控补丁的本地内核与另一提交的 SDK
+直接混装；应先把所需通用能力收拢回 Runtime，再进行产品迁移和独立生产灰度。
+
+本批 Linux/V100 验证为 8 项 SDK 测试及 984 项选定原生回归通过、0 失败，
+另有 11 项 ignored 未计为通过。SDK 严格 Clippy、文档和离线例子通过；
+不是全 workspace 或真实付费模型验收。来源、源码指纹和范围见
+[验证记录](../../docs/sdk-verification.json)。

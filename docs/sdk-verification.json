@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "status": "sdk-v0.1-candidate-verified-not-deployed",
+  "repository": "123123213weqw/xharness-runtime",
+  "branch": "sdk/embedding-v1",
+  "runtimeBaseCommit": "2147ff270fe55c2c739e5063a5bfacefd01dc38a",
+  "sourceCommit": "4e1b5cc457f5d629b9085f05c9666ca650f5e520",
+  "verifiedAtUtc": "2026-11-03T02:14:12.986851+00:00",
+  "newRepositoryCreated": false,
+  "nativeRuntimeSourceChanged": false,
+  "sourceFingerprint": "39bcdbd1e7db6f3a5cb9c7c96c82cee9443e9bfc6ba74a98b1ceab031eeb64ed",
+  "fingerprintAlgorithm": "sha256(sorted compact JSON of compileInputSha256)",
+  "compileInputSha256": {
+    "Cargo.lock": "67a71dde5cafdd6b0c770d859d6d4fefe149087b208409f23b6c4d4c254ca01a",
+    "Cargo.toml": "46ca5d6336d85d56155a562f21fd5a5a07b579f0a66371a85ec324a6c1986c98",
+    "crates/xharness-sdk/Cargo.toml": "7fab3f2f564f0270c06f6b602524b89d4c9d510839d6184376ea381649c28537",
+    "crates/xharness-sdk/examples/offline_echo.rs": "e2ffdd4cf23beff2f2f7a1e54baaee46dac61742275accf5c73646403ad44738",
+    "crates/xharness-sdk/src/lib.rs": "e719f37fd62a38f0a418f766736e6600a65faa88e301f43036d096473f55c12c",
+    "crates/xharness-sdk/src/runtime.rs": "1e2edcc23e4662120ceebfd18befe2f560585fc00d83f1ad830d05596c60a35b",
+    "crates/xharness-sdk/tests/embedding.rs": "56b10136688860cd6342367dac4f15dd73785ab5f038033d5a2c880509a00131",
+    "scripts/sdk/remote-validate.sh": "93bc4d4504aa003d4b2680c23ef4055d8140aef9260f9c31952feeb4f77a16ab",
+    "scripts/sync-upstream.sh": "3cb12dab2069f4793c7ef3984798af16a00a45371763a1f6edc1f07ea9e9aac7"
+  },
+  "remoteSourceHashesMatched": true,
+  "validation": {
+    "host": "WZU_Server",
+    "platform": "Linux",
+    "rustToolchain": "1.99.0",
+    "localRustCompilation": false,
+    "command": "bash scripts/sdk/remote-validate.sh regression",
+    "sdkTestsPassed": 8,
+    "nativeRegressionTestsPassed": 984,
+    "testsPassed": 992,
+    "testsFailed": 0,
+    "testsIgnored": 11,
+    "testBinaries": 30,
+    "strictSdkClippyPassed": true,
+    "sdkCheckPassed": true,
+    "sdkRustdocWarningsDeniedPassed": true,
+    "offlineExampleCompleted": true,
+    "packages": [
+      "xharness-sdk",
+      "xharness-host",
+      "xharness-agent",
+      "xharness-core",
+      "xharness-session",
+      "xharness-session-jsonl",
+      "xharness-tools"
+    ],
+    "fullLogSha256": "4cb7582805f201bf4355533914eb464f63365df10f68ffdb53401c6bb6c4188b",
+    "fullLogLocation": "private local .sdk-evidence/*-regression/full.log"
+  },
+  "developmentFailures": [
+    {
+      "stage": "first strict Clippy run",
+      "cause": "test fixture unwrap calls violate the new SDK lint policy",
+      "resolution": "test setup and assertions now propagate errors with Result; no lint exceptions or fence relaxation",
+      "originalLogPreserved": true
+    }
+  ],
+  "dependencies": {
+    "newThirdPartyPackages": [],
+    "existingWorkspaceLockRepair": [
+      "xharness-feishu"
+    ],
+    "sdkDependsOnSuperAgent": false,
+    "internalHostDependencyStillPresent": true
+  },
+  "limits": [
+    "8 SDK cases use explicit offline model fixtures, not paid model acceptance",
+    "No full-workspace/macOS/Windows rerun",
+    "No SuperAgent dependency migration or native product patch upstreaming",
+    "No automatic tool-version migration or tool hot replacement",
+    "No stable 1.0 API or crates.io publication",
+    "No production service/config/state changes or automatic merge"
+  ]
+}
